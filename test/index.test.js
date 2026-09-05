@@ -199,37 +199,41 @@ test('includes synchronous input cloning in the deadline', async () => {
   )
 })
 
-test('rejects shared memory in input and output', async (t) => {
+test('rejects every supported shared-memory representation in input and output', async (t) => {
+  const sharedBuffer = new SharedArrayBuffer(8)
   const sharedMemory = new WebAssembly.Memory({
     initial: 1,
     maximum: 1,
     shared: true
   })
-
-  assert.throws(
-    () => runUntrustedCode('return input', { input: new SharedArrayBuffer(8) }),
-    /must not contain shared memory/
-  )
-  assert.throws(
-    () => runUntrustedCode('return input', { input: sharedMemory }),
-    /must not contain shared memory/
-  )
-
-  await t.test('SharedArrayBuffer result', async () => {
-    await assert.rejects(
-      runUntrustedCode('return new SharedArrayBuffer(8)', { timeoutMs: 5_000 }),
+  for (const input of [
+    sharedBuffer,
+    sharedMemory,
+    new Uint8Array(sharedBuffer),
+    new DataView(sharedBuffer)
+  ]) {
+    assert.throws(
+      () => runUntrustedCode('return input', { input }),
       /must not contain shared memory/
     )
-  })
+  }
 
-  await t.test('shared WebAssembly.Memory result', async () => {
-    await assert.rejects(
-      runUntrustedCode(`
-        return new WebAssembly.Memory({ initial: 1, maximum: 1, shared: true })
-      `, { timeoutMs: 5_000 }),
-      /must not contain shared memory/
-    )
-  })
+  const outputSources = {
+    SharedArrayBuffer: 'return new SharedArrayBuffer(8)',
+    'shared WebAssembly.Memory': `
+      return new WebAssembly.Memory({ initial: 1, maximum: 1, shared: true })
+    `,
+    'shared typed array': 'return new Uint8Array(new SharedArrayBuffer(8))',
+    'shared DataView': 'return new DataView(new SharedArrayBuffer(8))'
+  }
+  for (const [name, source] of Object.entries(outputSources)) {
+    await t.test(`${name} result`, async () => {
+      await assert.rejects(
+        runUntrustedCode(source, { timeoutMs: 5_000 }),
+        /must not contain shared memory/
+      )
+    })
+  }
 })
 
 test('reports syntax, runtime, and clone errors', async (t) => {

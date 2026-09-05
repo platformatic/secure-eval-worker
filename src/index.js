@@ -1,17 +1,22 @@
 import { Worker } from 'node:worker_threads'
 
-const DEFAULT_TIMEOUT_MS = 1_000
-const MAX_TIMEOUT_MS = 2_147_483_647
-const DEFAULT_MAX_SOURCE_BYTES = 64 * 1024
-const DEFAULT_RESOURCE_LIMITS = Object.freeze({
-  maxOldGenerationSizeMb: 32,
-  maxYoungGenerationSizeMb: 8,
-  codeRangeSizeMb: 16,
-  stackSizeMb: 4
-})
+import {
+  abortError,
+  assertNoSharedMemory,
+  DEFAULT_MAX_SOURCE_BYTES,
+  MAX_TIMEOUT_MS,
+  remoteError,
+  sanitizeEnvironment,
+  UntrustedCodeError,
+  validatePositiveInteger,
+  validateResourceLimits
+} from './internal.js'
 
-const ENVIRONMENT_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/
-const BLOCKED_ENVIRONMENT_NAME = /^(?:(?:NODE_OPTIONS|NODE_PATH|NODE_EXTRA_CA_CERTS|OPENSSL_CONF|SSLKEYLOGFILE|NPM_CONFIG_USERCONFIG)$|LD_|DYLD_)/i
+export { getHostFunctionContext } from './host-functions.js'
+export { sanitizeEnvironment, UntrustedCodeError } from './internal.js'
+export { createUntrustedWorker, UntrustedWorkerSession } from './session.js'
+
+const DEFAULT_TIMEOUT_MS = 1_000
 
 // This source is intentionally static. Untrusted values enter through the
 // structured-clone algorithm in workerData, never through string interpolation.
@@ -89,41 +94,6 @@ main().catch((error) => {
   send('bootstrap-error', cloneError(error))
 })
 `
-
-export class UntrustedCodeError extends Error {
-  constructor (message, options = {}) {
-    super(message, options)
-    this.name = 'UntrustedCodeError'
-    this.code = options.code ?? 'ERR_UNTRUSTED_CODE'
-    if (options.remoteStack) this.remoteStack = options.remoteStack
-    if (options.remoteCode) this.remoteCode = options.remoteCode
-  }
-}
-
-/**
- * Return a null-prototype copy suitable for WorkerOptions.env.
- * Runtime-control variables are rejected rather than silently passed through.
- */
-export function sanitizeEnvironment (environment = {}) {
-  if (environment === null || typeof environment !== 'object' || Array.isArray(environment)) {
-    throw new TypeError('environment must be an object')
-  }
-
-  const sanitized = Object.create(null)
-  for (const [name, value] of Object.entries(environment)) {
-    if (!ENVIRONMENT_NAME.test(name)) {
-      throw new TypeError(`Invalid environment variable name: ${name}`)
-    }
-    if (BLOCKED_ENVIRONMENT_NAME.test(name)) {
-      throw new TypeError(`Environment variable is not allowed: ${name}`)
-    }
-    if (typeof value !== 'string') {
-      throw new TypeError(`Environment variable ${name} must be a string`)
-    }
-    sanitized[name] = value
-  }
-  return sanitized
-}
 
 /**
  * Execute an async function body in a fresh, least-privilege worker.
@@ -297,88 +267,14 @@ function isProtocolMessage (message) {
     typeof message.type === 'string'
 }
 
-function remoteError (detail, code = 'ERR_UNTRUSTED_CODE') {
-  const name = detail && typeof detail.name === 'string' ? detail.name : 'Error'
-  const message = detail && typeof detail.message === 'string'
-    ? detail.message
-    : 'Untrusted code failed'
-  return new UntrustedCodeError(`${name}: ${message}`, {
-    code,
-    remoteStack: detail && typeof detail.stack === 'string' ? detail.stack : undefined,
-    remoteCode: detail && typeof detail.code === 'string' ? detail.code : undefined
-  })
-}
-
 function protocolError () {
   return new UntrustedCodeError('The worker sent an invalid protocol message', {
     code: 'ERR_UNTRUSTED_CODE_PROTOCOL'
   })
 }
 
-function abortError (reason) {
-  const error = new Error('Execution was aborted', { cause: reason })
-  error.name = 'AbortError'
-  error.code = 'ABORT_ERR'
-  return error
-}
-
 function timeoutError (timeoutMs) {
   return new UntrustedCodeError(`Execution exceeded ${timeoutMs} ms`, {
     code: 'ERR_UNTRUSTED_CODE_TIMEOUT'
   })
-}
-
-function assertNoSharedMemory (value, label) {
-  if (typeof SharedArrayBuffer !== 'undefined' && value instanceof SharedArrayBuffer) {
-    throw new TypeError(`${label} must not contain shared memory`)
-  }
-  if (value === null || typeof value !== 'object') return
-
-  const pending = [value]
-  const seen = new WeakSet()
-  while (pending.length > 0) {
-    const current = pending.pop()
-    if (current === null || typeof current !== 'object') continue
-    if (seen.has(current)) continue
-    seen.add(current)
-
-    if (typeof SharedArrayBuffer !== 'undefined' && current instanceof SharedArrayBuffer) {
-      throw new TypeError(`${label} must not contain shared memory`)
-    }
-    if (current instanceof WebAssembly.Memory) {
-      pending.push(current.buffer)
-    } else if (ArrayBuffer.isView(current)) {
-      pending.push(current.buffer)
-    } else if (current instanceof Map) {
-      for (const [key, entry] of current) pending.push(key, entry)
-    } else if (current instanceof Set) {
-      for (const entry of current) pending.push(entry)
-    } else {
-      for (const key of Reflect.ownKeys(current)) pending.push(current[key])
-    }
-  }
-}
-
-function validatePositiveInteger (value, name) {
-  if (!Number.isSafeInteger(value) || value <= 0) {
-    throw new RangeError(`${name} must be a positive integer`)
-  }
-}
-
-function validateResourceLimits (limits) {
-  if (limits === undefined) return { ...DEFAULT_RESOURCE_LIMITS }
-  if (limits === null || typeof limits !== 'object' || Array.isArray(limits)) {
-    throw new TypeError('resourceLimits must be an object')
-  }
-
-  const result = { ...DEFAULT_RESOURCE_LIMITS }
-  for (const name of Object.keys(DEFAULT_RESOURCE_LIMITS)) {
-    if (limits[name] !== undefined) {
-      if (typeof limits[name] !== 'number' || !Number.isFinite(limits[name]) || limits[name] <= 0) {
-        throw new RangeError(`resourceLimits.${name} must be a positive number`)
-      }
-      result[name] = limits[name]
-    }
-  }
-  return result
 }
