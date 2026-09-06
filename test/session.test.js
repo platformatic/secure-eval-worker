@@ -63,6 +63,22 @@ for (const [type, source] of [
   })
 }
 
+test('persistent setup return values are ignored', async () => {
+  for (const [type, source] of [
+    ['script', 'return () => {}'],
+    ['module', 'export default () => () => {}']
+  ]) {
+    const session = createUntrustedWorker(source, {
+      type,
+      startupTimeoutMs: 5_000,
+      messageTimeoutMs: 5_000,
+      lifetimeTimeoutMs: 5_000
+    })
+    assert.equal(await session.ready, undefined)
+    await session.terminate()
+  }
+})
+
 test('module evaluation and handlers run after permissions are dropped', async () => {
   const session = createUntrustedWorker(`
     const initialPermissions = {
@@ -128,10 +144,10 @@ test('sessions use an explicit sanitized environment', async () => {
   }
 })
 
-test('direct parentPort messages cannot spoof the private session protocol', async () => {
+test('does not expose the private session protocol through parentPort', async () => {
   const session = createUntrustedWorker(`
     const { parentPort } = await import('node:worker_threads')
-    parentPort.postMessage({ type: 'response', id: 1, value: 'spoofed' })
+    if (parentPort !== null) throw new Error('parentPort is exposed')
     onMessage((message) => 'real:' + message)
   `, {
     startupTimeoutMs: 5_000,
@@ -145,6 +161,68 @@ test('direct parentPort messages cannot spoof the private session protocol', asy
 })
 
 for (const type of ['script', 'module']) {
+  test(`${type} source cannot resolve trusted bootstrap bindings`, async () => {
+    const probe = `({
+      port: typeof port,
+      postToHost: typeof postToHost,
+      protocolSecret: typeof protocolSecret,
+      workerData: typeof workerData,
+      processBuiltin: typeof processBuiltin,
+      workerThreadsBuiltin: typeof workerThreadsBuiltin,
+      hardenDangerousBuiltins: typeof hardenDangerousBuiltins
+    })`
+    const source = type === 'script'
+      ? `if (typeof postToHost === 'function') postToHost({ type: 'ready', value: 'spoofed' }); onMessage(() => ${probe})`
+      : `export default ({ onMessage }) => { if (typeof postToHost === 'function') postToHost({ type: 'ready', value: 'spoofed' }); onMessage(() => ${probe}) }`
+    const session = createUntrustedWorker(source, {
+      type,
+      startupTimeoutMs: 5_000,
+      messageTimeoutMs: 5_000,
+      lifetimeTimeoutMs: 5_000
+    })
+
+    await session.ready
+    assert.deepEqual(await session.request(null), {
+      port: 'undefined',
+      postToHost: 'undefined',
+      protocolSecret: 'undefined',
+      workerData: 'undefined',
+      processBuiltin: 'undefined',
+      workerThreadsBuiltin: 'undefined',
+      hardenDangerousBuiltins: 'undefined'
+    })
+    await session.terminate()
+  })
+
+  test(`${type} source cannot discover the private port through async hooks`, async () => {
+    const probe = `
+      let result
+      try {
+        const asyncHooks = await import('node:async_hooks')
+        asyncHooks.createHook({ before () {
+          asyncHooks.executionAsyncResource()
+        } }).enable()
+        result = 'exposed'
+      } catch (error) {
+        result = error.code
+      }
+      onMessage(() => result)
+    `
+    const source = type === 'script'
+      ? probe
+      : `export default async ({ onMessage }) => { ${probe} }`
+    const session = createUntrustedWorker(source, {
+      type,
+      startupTimeoutMs: 5_000,
+      messageTimeoutMs: 5_000,
+      lifetimeTimeoutMs: 5_000
+    })
+
+    await session.ready
+    assert.equal(await session.request(null), 'ERR_ACCESS_DENIED')
+    await session.terminate()
+  })
+
   test(`${type} source cannot find the private port through active handles`, async () => {
     const attack = `
       for (const handle of process._getActiveHandles()) {
@@ -330,6 +408,42 @@ test('unexpected exit closes before invoking error listeners', async () => {
   assert.equal(closed.error.code, 'ERR_UNTRUSTED_WORKER_EXIT')
 })
 
+test('small protocol budgets retain a bounded fatal error path', async () => {
+  const session = createUntrustedWorker("throw new Error('x'.repeat(10_000))", {
+    maxMessageBytes: 128,
+    startupTimeoutMs: 5_000,
+    messageTimeoutMs: 5_000,
+    lifetimeTimeoutMs: 5_000
+  })
+
+  await assert.rejects(session.ready, /Worker protocol failure/)
+  await session.closed
+})
+
+test('hostile thrown proxies cannot break trusted error serialization', async () => {
+  const session = createUntrustedWorker(`
+    onMessage((message) => {
+      if (message === 'throw') {
+        const proxy = new Proxy({}, {
+          get () { throw proxy },
+          getPrototypeOf () { throw proxy }
+        })
+        throw proxy
+      }
+      return 'still running'
+    })
+  `, {
+    startupTimeoutMs: 5_000,
+    messageTimeoutMs: 5_000,
+    lifetimeTimeoutMs: 5_000
+  })
+
+  await session.ready
+  await assert.rejects(session.request('throw'), /Untrusted component/)
+  assert.equal(await session.request('continue'), 'still running')
+  await session.terminate()
+})
+
 test('request handler errors only reject the corresponding request', async () => {
   const session = createUntrustedWorker(`
     onMessage((message) => {
@@ -368,6 +482,48 @@ test('startup timeout terminates hanging scripts and modules', async (t) => {
       await session.closed
     })
   }
+})
+
+test('request deadlines include synchronous cloning and serialization', async () => {
+  const session = createUntrustedWorker('onMessage(value => value)', {
+    startupTimeoutMs: 5_000,
+    messageTimeoutMs: 5_000,
+    lifetimeTimeoutMs: 5_000
+  })
+  await session.ready
+  const value = {
+    get slow () {
+      const end = Date.now() + 50
+      while (Date.now() < end) {}
+      return 42
+    }
+  }
+
+  await assert.rejects(
+    session.request(value, { timeoutMs: 10 }),
+    (error) => error.code === 'ERR_UNTRUSTED_WORKER_MESSAGE_TIMEOUT'
+  )
+  await session.closed
+})
+
+test('postMessage rechecks session state after cloning', async () => {
+  const session = createUntrustedWorker('onMessage(() => null)', {
+    startupTimeoutMs: 5_000,
+    messageTimeoutMs: 5_000,
+    lifetimeTimeoutMs: 5_000
+  })
+  await session.ready
+
+  assert.throws(
+    () => session.postMessage({
+      get value () {
+        void session.terminate()
+        return 42
+      }
+    }),
+    (error) => error.code === 'ERR_UNTRUSTED_WORKER_CLOSED'
+  )
+  await session.closed
 })
 
 test('message timeout terminates a hanging handler and rejects pending requests', async () => {
@@ -528,6 +684,21 @@ test('validates session options', () => {
     () => createUntrustedWorker('', { resourceLimits: { typo: 1 } }),
     /Unknown resource limit/
   )
+  assert.throws(
+    () => createUntrustedWorker('', { maxMessageBytes: 127 }),
+    /must be at least 128/
+  )
+  for (const option of [
+    'maxInputBytes',
+    'maxMessageBytes',
+    'maxOutputMessages',
+    'maxOutputBytes'
+  ]) {
+    assert.throws(
+      () => createUntrustedWorker('', { [option]: 0 }),
+      /positive integer/
+    )
+  }
   const controller = new AbortController()
   controller.abort()
   assert.throws(

@@ -3,7 +3,8 @@ import { test } from 'node:test'
 
 import {
   createUntrustedWorker,
-  getHostFunctionContext
+  getHostFunctionContext,
+  HostFunctionError
 } from '../src/index.js'
 
 for (const type of ['script', 'module']) {
@@ -65,6 +66,30 @@ test('module setup receives the same host function object', async () => {
   await session.terminate()
 })
 
+test('rejects same-session reentrant requests from host functions', async () => {
+  let session
+  session = createUntrustedWorker(`onMessage(() => tools.reenter())`, {
+    hostFunctions: {
+      tools: {
+        reenter () {
+          assert.throws(
+            () => session.request('nested'),
+            (error) => error.code === 'ERR_UNTRUSTED_WORKER_REENTRANT_REQUEST'
+          )
+          return 'rejected safely'
+        }
+      }
+    },
+    startupTimeoutMs: 5_000,
+    messageTimeoutMs: 5_000,
+    lifetimeTimeoutMs: 5_000
+  })
+
+  await session.ready
+  assert.equal(await session.request('outer'), 'rejected safely')
+  await session.terminate()
+})
+
 test('host function context provides request metadata and cancellation', async () => {
   const contexts = []
   let observedAbort
@@ -103,12 +128,12 @@ test('host function context provides request metadata and cancellation', async (
   assert.throws(() => getHostFunctionContext(), /active host function/)
 })
 
-test('guest code receives sanitized host function errors and can continue', async () => {
+test('host errors are redacted unless explicitly marked public', async () => {
   const session = createUntrustedWorker(`
     onMessage(async (message) => {
-      if (message === 'fail') {
+      if (message === 'fail' || message === 'public') {
         try {
-          await tools.fail()
+          await tools[message]()
         } catch (error) {
           return { name: error.name, message: error.message, code: error.code }
         }
@@ -124,6 +149,9 @@ test('guest code receives sanitized host function errors and can continue', asyn
           error.stack += '\nHOST_PRIVATE_STACK_MARKER'
           throw error
         },
+        public: () => {
+          throw new HostFunctionError('Safe public explanation', { code: 'NOT_FOUND' })
+        },
         ok: () => 'still running'
       }
     },
@@ -134,12 +162,40 @@ test('guest code receives sanitized host function errors and can continue', asyn
 
   await session.ready
   assert.deepEqual(await session.request('fail'), {
-    name: 'TypeError',
-    message: 'expected failure',
-    code: 'EXPECTED'
+    name: 'HostFunctionError',
+    message: 'Host function failed',
+    code: 'ERR_UNTRUSTED_WORKER_HOST_FUNCTION'
+  })
+  assert.deepEqual(await session.request('public'), {
+    name: 'HostFunctionError',
+    message: 'Safe public explanation',
+    code: 'NOT_FOUND'
   })
   assert.equal(await session.request('ok'), 'still running')
   await session.terminate()
+})
+
+test('oversized host errors fail the session without an unhandled rejection', async () => {
+  const session = createUntrustedWorker(`onMessage(() => tools.fail())`, {
+    hostFunctions: {
+      tools: {
+        fail: () => {
+          throw new HostFunctionError('x'.repeat(10_000))
+        }
+      }
+    },
+    maxMessageBytes: 200,
+    startupTimeoutMs: 5_000,
+    messageTimeoutMs: 5_000,
+    lifetimeTimeoutMs: 5_000
+  })
+
+  await session.ready
+  await assert.rejects(
+    session.request(null),
+    (error) => error.code === 'ERR_UNTRUSTED_WORKER_PROTOCOL'
+  )
+  await session.closed
 })
 
 test('host function calls enforce total and in-flight limits', async (t) => {
@@ -161,11 +217,11 @@ test('host function calls enforce total and in-flight limits', async (t) => {
       lifetimeTimeoutMs: 5_000
     })
     await session.ready
-    assert.deepEqual(await session.request(null), {
-      first: 42,
-      code: 'ERR_UNTRUSTED_WORKER_HOST_FUNCTION_LIMIT'
-    })
-    await session.terminate()
+    await assert.rejects(
+      session.request(null),
+      (error) => error.code === 'ERR_UNTRUSTED_WORKER_HOST_FUNCTION_LIMIT'
+    )
+    await session.closed
   })
 
   await t.test('concurrent calls', async () => {
@@ -189,12 +245,42 @@ test('host function calls enforce total and in-flight limits', async (t) => {
       lifetimeTimeoutMs: 5_000
     })
     await session.ready
-    assert.deepEqual(await session.request(null), [
-      'ok',
-      'ERR_UNTRUSTED_WORKER_HOST_FUNCTION_LIMIT'
-    ])
-    await session.terminate()
+    await assert.rejects(
+      session.request(null),
+      (error) => error.code === 'ERR_UNTRUSTED_WORKER_HOST_FUNCTION_LIMIT'
+    )
+    await session.closed
   })
+})
+
+test('guest output budgets include attempted host calls', async () => {
+  let calls = 0
+  const session = createUntrustedWorker(`
+    onMessage(async () => {
+      const results = await Promise.allSettled([tools.value(), tools.value()])
+      return results.map((result) => result.status === 'fulfilled'
+        ? result.value
+        : result.reason.message)
+    })
+  `, {
+    hostFunctions: {
+      tools: {
+        value: () => {
+          calls++
+          return 42
+        }
+      }
+    },
+    maxOutputMessages: 1,
+    startupTimeoutMs: 5_000,
+    messageTimeoutMs: 5_000,
+    lifetimeTimeoutMs: 5_000
+  })
+
+  await session.ready
+  assert.deepEqual(await session.request(null), [42, 'Output limit exceeded'])
+  assert.equal(calls, 1)
+  await session.terminate()
 })
 
 test('every shared-memory representation is rejected in host arguments and results', async () => {
@@ -238,13 +324,17 @@ test('every shared-memory representation is rejected in host arguments and resul
     'argument-buffer',
     'argument-wasm',
     'argument-view',
-    'argument-data-view',
+    'argument-data-view'
+  ]) {
+    assert.match(await session.request(boundary), /must not contain shared memory/)
+  }
+  for (const boundary of [
     'result-buffer',
     'result-wasm',
     'result-view',
     'result-data-view'
   ]) {
-    assert.match(await session.request(boundary), /must not contain shared memory/)
+    assert.equal(await session.request(boundary), 'Host function failed')
   }
   await session.terminate()
 })
@@ -293,6 +383,101 @@ test('prototype poisoning cannot hide shared typed-array memory from the guest b
   await session.terminate()
 })
 
+test('cancellation deactivates host context and skips late result cloning', async () => {
+  let resolveHostFunction
+  let detachedContext
+  let resultGetterCalls = 0
+  const detached = new Promise((resolve) => { detachedContext = resolve })
+  const session = createUntrustedWorker(`await tools.wait()`, {
+    hostFunctions: {
+      tools: {
+        wait () {
+          const { abortSignal } = getHostFunctionContext()
+          abortSignal.addEventListener('abort', () => {
+            setImmediate(() => {
+              try {
+                getHostFunctionContext()
+                detachedContext('active')
+              } catch {
+                detachedContext('inactive')
+              }
+            })
+          }, { once: true })
+          return new Promise((resolve) => { resolveHostFunction = resolve })
+        }
+      }
+    },
+    startupTimeoutMs: 5_000,
+    messageTimeoutMs: 5_000,
+    lifetimeTimeoutMs: 5_000
+  })
+
+  while (!resolveHostFunction) await new Promise((resolve) => setImmediate(resolve))
+  const ready = assert.rejects(
+    session.ready,
+    (error) => error.code === 'ERR_UNTRUSTED_WORKER_TERMINATED'
+  )
+  await session.terminate()
+  await ready
+  resolveHostFunction({
+    get value () {
+      resultGetterCalls++
+      return 42
+    }
+  })
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(await detached, 'inactive')
+  assert.equal(resultGetterCalls, 0)
+})
+
+test('rejects platform objects whose contents are not authenticated by the codec', async () => {
+  const hostKey = await crypto.subtle.generateKey(
+    { name: 'HMAC', hash: 'SHA-256', length: 256 },
+    true,
+    ['sign', 'verify']
+  )
+  const session = createUntrustedWorker(`
+    onMessage(async (kind) => {
+      try {
+        if (kind === 'argument') await tools.echo(new Blob(['secret']))
+        if (kind === 'argument-key') {
+          const key = await crypto.subtle.generateKey(
+            { name: 'HMAC', hash: 'SHA-256', length: 256 },
+            true,
+            ['sign', 'verify']
+          )
+          await tools.echo(key)
+        }
+        if (kind === 'result') await tools.blob()
+        if (kind === 'result-key') await tools.key()
+      } catch (error) {
+        return error.message
+      }
+    })
+  `, {
+    hostFunctions: {
+      tools: {
+        echo: (value) => value,
+        blob: () => new Blob(['secret']),
+        key: () => hostKey
+      }
+    },
+    startupTimeoutMs: 5_000,
+    messageTimeoutMs: 5_000,
+    lifetimeTimeoutMs: 5_000
+  })
+
+  await session.ready
+  assert.match(await session.request('argument'), /unsupported/i)
+  assert.match(
+    await session.request('argument-key'),
+    /(?:unsupported|not supported|unserializable)/i
+  )
+  assert.equal(await session.request('result'), 'Host function failed')
+  assert.equal(await session.request('result-key'), 'Host function failed')
+  await session.terminate()
+})
+
 test('validates host function manifests without invoking accessors', () => {
   assert.throws(
     () => createUntrustedWorker('', { hostFunctions: { process: { read: () => null } } }),
@@ -301,6 +486,18 @@ test('validates host function manifests without invoking accessors', () => {
   assert.throws(
     () => createUntrustedWorker('', { hostFunctions: { tools: { then: () => null } } }),
     /Invalid host function function/
+  )
+  for (const namespace of ['send', 'onMessage', 'input', 'host', 'class', 'await']) {
+    assert.throws(
+      () => createUntrustedWorker('', { hostFunctions: { [namespace]: { call: () => null } } }),
+      /Reserved host function namespace/
+    )
+  }
+  const symbolManifest = { tools: { call: () => null } }
+  symbolManifest[Symbol('hidden')] = { call: () => null }
+  assert.throws(
+    () => createUntrustedWorker('', { hostFunctions: symbolManifest }),
+    /symbol properties/
   )
 
   let accessed = false

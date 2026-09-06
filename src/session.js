@@ -1,12 +1,13 @@
 import { Buffer } from 'node:buffer'
 import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto'
 import { EventEmitter } from 'node:events'
-import { serialize as v8Serialize } from 'node:v8'
+import { deserialize as v8Deserialize, serialize as v8Serialize } from 'node:v8'
 import { MessagePort, Worker } from 'node:worker_threads'
 
 import {
   abortError,
   assertNoSharedMemory,
+  assertSupportedProtocolValue,
   cloneWithoutSharedMemory,
   DEFAULT_MAX_SOURCE_BYTES,
   remoteError,
@@ -17,22 +18,69 @@ import {
   validatePositiveInteger,
   validateTimeout
 } from './internal.js'
-import { invokeHostFunction, validateHostFunctions } from './host-functions.js'
+import {
+  HostFunctionError,
+  invokeHostFunction,
+  isHostFunctionContextActiveForSession,
+  validateHostFunctions
+} from './host-functions.js'
 
 const DEFAULT_STARTUP_TIMEOUT_MS = 1_000
 const DEFAULT_MESSAGE_TIMEOUT_MS = 1_000
 const DEFAULT_LIFETIME_TIMEOUT_MS = 30_000
 const DEFAULT_MAX_HOST_FUNCTION_CALLS = 256
 const DEFAULT_MAX_IN_FLIGHT_HOST_FUNCTIONS = 32
+const DEFAULT_MAX_MESSAGE_BYTES = 1024 * 1024
+const MIN_MAX_MESSAGE_BYTES = 128
+const DEFAULT_MAX_INPUT_BYTES = 1024 * 1024
+const DEFAULT_MAX_OUTPUT_MESSAGES = 1024
+const DEFAULT_MAX_OUTPUT_BYTES = 16 * 1024 * 1024
+const safeArrayBufferIsView = ArrayBuffer.isView
+const hostTypedArrayByteLength = Object.getOwnPropertyDescriptor(
+  Object.getPrototypeOf(Uint8Array.prototype),
+  'byteLength'
+).get
+const hostReflectApply = Reflect.apply
+const sessionSecrets = new WeakMap()
+const ONE_SHOT = Symbol('oneShot')
 
 const SESSION_BOOTSTRAP = String.raw`
 'use strict'
+;(function trustedBootstrap() {
 
 const { createHmac, randomBytes } = require('node:crypto')
-const { serialize: v8Serialize } = require('node:v8')
-const { MessageChannel, parentPort, workerData } = require('node:worker_threads')
+const asyncHooksBuiltin = require('node:async_hooks')
+const fsBuiltin = require('node:fs')
+const fsPromisesBuiltin = require('node:fs/promises')
+const dgramBuiltin = require('node:dgram')
+const httpBuiltin = require('node:http')
+const http2Builtin = require('node:http2')
+const httpsBuiltin = require('node:https')
+const moduleBuiltin = require('node:module')
+const netBuiltin = require('node:net')
+const osBuiltin = require('node:os')
+const processBuiltin = require('node:process')
+const seaBuiltin = require('node:sea')
+const sqliteBuiltin = require('node:sqlite')
+const tlsBuiltin = require('node:tls')
+const ttyBuiltin = require('node:tty')
+const v8Builtin = require('node:v8')
+const workerThreadsBuiltin = require('node:worker_threads')
+const networkAliasBuiltins = [
+  require('_http_agent'),
+  require('_http_client'),
+  require('_http_common'),
+  require('_http_incoming'),
+  require('_http_outgoing'),
+  require('_http_server'),
+  require('_tls_common'),
+  require('_tls_wrap')
+]
+const { deserialize: v8Deserialize, serialize: v8Serialize } = v8Builtin
+const { MessageChannel, parentPort, workerData } = workerThreadsBuiltin
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor
 const safeStructuredClone = globalThis.structuredClone
+const safeV8Deserialize = v8Deserialize
 const safeV8Serialize = v8Serialize
 const reflectApply = Reflect.apply
 const SafePromise = Promise
@@ -43,6 +91,7 @@ const safeSetInterval = globalThis.setInterval
 const safeClearInterval = globalThis.clearInterval
 const reflectOwnKeys = Reflect.ownKeys
 const arrayBufferIsView = ArrayBuffer.isView
+const arrayIsArray = Array.isArray
 const weakSetHas = WeakSet.prototype.has
 const weakSetAdd = WeakSet.prototype.add
 const arrayPush = Array.prototype.push
@@ -54,6 +103,9 @@ const mapEntries = Map.prototype.entries
 const mapIteratorNext = Object.getPrototypeOf(new Map().entries()).next
 const setValues = Set.prototype.values
 const setIteratorNext = Object.getPrototypeOf(new Set().values()).next
+const arrayBufferByteLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength').get
+const dateTime = Date.prototype.getTime
+const regexpSource = Object.getOwnPropertyDescriptor(RegExp.prototype, 'source').get
 const sharedByteLength = typeof SharedArrayBuffer === 'undefined'
   ? undefined
   : Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, 'byteLength').get
@@ -62,6 +114,10 @@ const typedArrayBuffer = Object.getOwnPropertyDescriptor(
   'buffer'
 ).get
 const dataViewBuffer = Object.getOwnPropertyDescriptor(DataView.prototype, 'buffer').get
+const typedArrayByteLength = Object.getOwnPropertyDescriptor(
+  Object.getPrototypeOf(Uint8Array.prototype),
+  'byteLength'
+).get
 const wasmMemoryBuffer = Object.getOwnPropertyDescriptor(WebAssembly.Memory.prototype, 'buffer').get
 const hmacPrototype = Object.getPrototypeOf(createHmac('sha256', 'capture'))
 const hmacUpdate = hmacPrototype.update
@@ -70,7 +126,9 @@ const objectCreate = Object.create
 const objectDefineProperty = Object.defineProperty
 const objectFreeze = Object.freeze
 const objectGetPrototypeOf = Object.getPrototypeOf
+const objectGetOwnPropertyDescriptors = Object.getOwnPropertyDescriptors
 const objectPrototype = Object.prototype
+const stringSlice = String.prototype.slice
 
 let port
 let rawPostToHost
@@ -82,6 +140,8 @@ let keepAlive
 let handler
 let processing = SafePromise.resolve()
 let nextHostCallId = 1
+let outputMessages = 0
+let outputBytes = 0
 const pendingHostCalls = new Map()
 
 function isSharedArrayBuffer(value) {
@@ -108,6 +168,155 @@ function getViewBuffer(value) {
   } catch {
     return reflectApply(dataViewBuffer, value, [])
   }
+}
+
+function sandboxDenied(api) {
+  const error = new SafeError(api + ' is disabled for untrusted code')
+  error.code = 'ERR_ACCESS_DENIED'
+  error.permission = 'SandboxEscape'
+  throw error
+}
+
+function replaceProperty(target, name, value) {
+  const descriptor = Object.getOwnPropertyDescriptor(target, name)
+  if (!descriptor || descriptor.configurable || ('value' in descriptor && descriptor.writable)) {
+    objectDefineProperty(target, name, {
+      value,
+      enumerable: descriptor ? descriptor.enumerable : true,
+      configurable: false,
+      writable: false
+    })
+  }
+}
+
+function denyFunctions(target, prefix) {
+  for (const [name, descriptor] of Object.entries(objectGetOwnPropertyDescriptors(target))) {
+    // Several security-sensitive builtins expose callable constructors through
+    // configurable accessors rather than ordinary value properties.
+    if (!('value' in descriptor) || typeof descriptor.value === 'function') {
+      replaceProperty(target, name, function deniedBuiltin() {
+        return sandboxDenied(prefix + '.' + name)
+      })
+    }
+  }
+}
+
+function hardenDangerousBuiltins() {
+  // Existing numeric file descriptors bypass Node's Permission Model and are
+  // shared by every thread. Disable the complete fs and tty surfaces rather
+  // than trying to maintain an error-prone list of descriptor-taking APIs.
+  denyFunctions(asyncHooksBuiltin, 'node:async_hooks')
+  denyFunctions(fsBuiltin, 'node:fs')
+  denyFunctions(fsPromisesBuiltin, 'node:fs/promises')
+  denyFunctions(ttyBuiltin, 'node:tty')
+  denyFunctions(netBuiltin, 'node:net')
+  denyFunctions(tlsBuiltin, 'node:tls')
+  denyFunctions(dgramBuiltin, 'node:dgram')
+  denyFunctions(httpBuiltin, 'node:http')
+  denyFunctions(http2Builtin, 'node:http2')
+  denyFunctions(httpsBuiltin, 'node:https')
+  for (const builtin of networkAliasBuiltins) {
+    denyFunctions(builtin, 'internal network builtin')
+  }
+
+  // Asynchronous customization hooks execute in an InternalWorker, which does
+  // not inherit this realm's permission drop or builtin hardening.
+  for (const name of [
+    'register',
+    'registerHooks',
+    'enableCompileCache',
+    'flushCompileCache',
+    'getCompileCacheDir'
+  ]) {
+    replaceProperty(moduleBuiltin, name, () => sandboxDenied('node:module.' + name))
+  }
+
+  // node:sqlite performs filesystem access outside the fs permission scope.
+  denyFunctions(sqliteBuiltin, 'node:sqlite')
+
+  replaceProperty(processBuiltin, 'argv', objectFreeze(['node', '[secure-eval-worker]']))
+  // Undocumented native bindings bypass public-module taming and can operate
+  // directly on the process-wide descriptor table.
+  for (const name of ['binding', '_linkedBinding', 'dlopen']) {
+    replaceProperty(processBuiltin, name, () => sandboxDenied('process.' + name))
+  }
+  replaceProperty(processBuiltin, 'kill', () => sandboxDenied('process.kill'))
+  replaceProperty(processBuiltin, '_kill', () => sandboxDenied('process._kill'))
+  replaceProperty(processBuiltin, '_debugProcess', () => sandboxDenied('process._debugProcess'))
+  const deniedReport = objectCreate(null)
+  for (const name of ['getReport', 'writeReport']) {
+    objectDefineProperty(deniedReport, name, {
+      value: () => sandboxDenied('process.report.' + name),
+      enumerable: true
+    })
+  }
+  replaceProperty(processBuiltin, 'report', objectFreeze(deniedReport))
+
+  denyFunctions(osBuiltin, 'node:os')
+  for (const name of [
+    'getHeapSnapshot',
+    'setFlagsFromString',
+    'setHeapSnapshotNearHeapLimit',
+    'startCpuProfile',
+    'startHeapProfile',
+    'stopCoverage',
+    'takeCoverage',
+    'writeHeapSnapshot'
+  ]) {
+    replaceProperty(v8Builtin, name, () => sandboxDenied('node:v8.' + name))
+  }
+  denyFunctions(seaBuiltin, 'node:sea')
+
+  replaceProperty(workerThreadsBuiltin, 'BroadcastChannel', function DeniedBroadcastChannel() {
+    return sandboxDenied('node:worker_threads.BroadcastChannel')
+  })
+  replaceProperty(globalThis, 'BroadcastChannel', function DeniedBroadcastChannel() {
+    return sandboxDenied('BroadcastChannel')
+  })
+  replaceProperty(workerThreadsBuiltin, 'postMessageToThread', () => {
+    return sandboxDenied('node:worker_threads.postMessageToThread')
+  })
+  replaceProperty(workerThreadsBuiltin, 'getEnvironmentData', () => {
+    return sandboxDenied('node:worker_threads.getEnvironmentData')
+  })
+  replaceProperty(workerThreadsBuiltin, 'setEnvironmentData', () => {
+    return sandboxDenied('node:worker_threads.setEnvironmentData')
+  })
+  const deniedLocks = objectFreeze({
+    query: () => sandboxDenied('node:worker_threads.locks.query'),
+    request: () => sandboxDenied('node:worker_threads.locks.request')
+  })
+  replaceProperty(workerThreadsBuiltin, 'locks', deniedLocks)
+  if (globalThis.navigator) replaceProperty(globalThis.navigator, 'locks', deniedLocks)
+  replaceProperty(workerThreadsBuiltin, 'parentPort', null)
+  replaceProperty(workerThreadsBuiltin, 'workerData', undefined)
+
+  const discardOutput = (...args) => {
+    const callback = args[args.length - 1]
+    if (typeof callback === 'function') callback()
+    return false
+  }
+  for (const stream of [processBuiltin.stdout, processBuiltin.stderr]) {
+    if (!stream) continue
+    for (const name of ['write', '_write', '_writev', 'end']) {
+      replaceProperty(stream, name, discardOutput)
+    }
+    const prototype = objectGetPrototypeOf(stream)
+    for (const name of ['write', '_write', '_writev', 'end']) {
+      const descriptor = Object.getOwnPropertyDescriptor(prototype, name)
+      if (descriptor && 'value' in descriptor && typeof descriptor.value === 'function') {
+        replaceProperty(prototype, name, discardOutput)
+      }
+    }
+  }
+  replaceProperty(processBuiltin, '_rawDebug', () => {})
+  for (const name of ['assert', 'debug', 'dir', 'error', 'info', 'log', 'table', 'trace', 'warn']) {
+    replaceProperty(globalThis.console, name, () => {})
+  }
+
+  // Update named ESM exports to the hardened CommonJS export values. Calling
+  // syncBuiltinESMExports() again cannot recover the original functions.
+  moduleBuiltin.syncBuiltinESMExports()
 }
 
 function assertNoSharedMemory(value, label) {
@@ -174,47 +383,170 @@ function cloneValue(value, label) {
   return cloned
 }
 
-function protocolMac(sequence, body) {
+function assertSupportedProtocolValue(value) {
+  const pending = [value]
+  const seen = new WeakSet()
+  while (pending.length > 0) {
+    const current = reflectApply(arrayPop, pending, [])
+    if (current === null) continue
+    const kind = typeof current
+    if (kind === 'string' || kind === 'boolean' || kind === 'number' ||
+        kind === 'bigint' || kind === 'undefined') continue
+    if (kind !== 'object') throw new TypeError('Unsupported protocol value')
+    if (reflectApply(weakSetHas, seen, [current])) continue
+    reflectApply(weakSetAdd, seen, [current])
+
+    if (isSharedArrayBuffer(current)) throw new TypeError('Unsupported protocol value')
+    try {
+      reflectApply(arrayBufferByteLength, current, [])
+      continue
+    } catch {}
+    if (reflectApply(arrayBufferIsView, ArrayBuffer, [current])) continue
+    try {
+      reflectApply(dateTime, current, [])
+      continue
+    } catch {}
+    try {
+      reflectApply(regexpSource, current, [])
+      continue
+    } catch {}
+
+    let iterator
+    try {
+      iterator = reflectApply(mapEntries, current, [])
+    } catch {}
+    if (iterator) {
+      while (true) {
+        const item = reflectApply(mapIteratorNext, iterator, [])
+        if (item.done) break
+        reflectApply(arrayPush, pending, [item.value[0], item.value[1]])
+      }
+      continue
+    }
+    try {
+      iterator = reflectApply(setValues, current, [])
+    } catch {
+      iterator = undefined
+    }
+    if (iterator) {
+      while (true) {
+        const item = reflectApply(setIteratorNext, iterator, [])
+        if (item.done) break
+        reflectApply(arrayPush, pending, [item.value])
+      }
+      continue
+    }
+
+    const prototype = objectGetPrototypeOf(current)
+    if (!reflectApply(arrayIsArray, Array, [current]) &&
+        prototype !== objectPrototype && prototype !== null) {
+      throw new TypeError('Unsupported protocol value')
+    }
+    for (const key of reflectOwnKeys(current)) {
+      if (typeof key === 'symbol') throw new TypeError('Unsupported protocol value')
+      reflectApply(arrayPush, pending, [current[key]])
+    }
+  }
+}
+
+function serializeProtocolBody(body) {
+  assertSupportedProtocolValue(body)
+  const serialized = safeV8Serialize(body)
+  const byteLength = reflectApply(typedArrayByteLength, serialized, [])
+  if (byteLength > workerData.maxMessageBytes) {
+    throw new RangeError('Protocol message exceeds maxMessageBytes (' + workerData.maxMessageBytes + ')')
+  }
+  return serialized
+}
+
+function reportFatal(error) {
+  try {
+    postToHost({ type: 'fatal', error: cloneError(error) })
+  } catch {
+    try {
+      postToHost({
+        type: 'fatal',
+        error: { name: 'Error', message: 'Worker protocol failure' }
+      })
+    } catch {
+      closePort()
+    }
+  }
+}
+
+function protocolMac(direction, sequence, serialized) {
   const hmac = createHmac('sha256', protocolSecret)
-  reflectApply(hmacUpdate, hmac, [String(sequence) + '\0'])
-  reflectApply(hmacUpdate, hmac, [safeV8Serialize(body)])
+  reflectApply(hmacUpdate, hmac, [direction + '\0' + String(sequence) + '\0'])
+  reflectApply(hmacUpdate, hmac, [serialized])
   return reflectApply(hmacDigest, hmac, ['base64'])
 }
 
-function postToHost(body) {
+function postToHost(body, countAgainstOutput = false) {
+  const serialized = serializeProtocolBody(body)
+  const byteLength = reflectApply(typedArrayByteLength, serialized, [])
+  if (countAgainstOutput) {
+    if (outputMessages >= workerData.maxOutputMessages ||
+        outputBytes + byteLength > workerData.maxOutputBytes) {
+      throw new RangeError('Output limit exceeded')
+    }
+    outputMessages++
+    outputBytes += byteLength
+  }
   const sequence = ++outboundSequence
-  rawPostToHost({ sequence, body, mac: protocolMac(sequence, body) })
+  rawPostToHost({
+    sequence,
+    payload: serialized,
+    mac: protocolMac('worker-to-host', sequence, serialized)
+  })
 }
 
 function authenticateHostMessage(envelope) {
-  if (envelope === null || typeof envelope !== 'object' ||
-      !Number.isSafeInteger(envelope.sequence) || envelope.sequence !== inboundSequence + 1 ||
-      envelope.body === null || typeof envelope.body !== 'object' ||
-      typeof envelope.mac !== 'string' || envelope.mac !== protocolMac(envelope.sequence, envelope.body)) {
-    throw new Error('Unauthenticated host protocol message')
+  let authenticated = false
+  let serialized
+  if (envelope !== null && typeof envelope === 'object' &&
+      Number.isSafeInteger(envelope.sequence) && envelope.sequence === inboundSequence + 1 &&
+      envelope.payload !== null && typeof envelope.payload === 'object' &&
+      reflectApply(arrayBufferIsView, ArrayBuffer, [envelope.payload]) &&
+      typeof envelope.mac === 'string') {
+    serialized = envelope.payload
+    const byteLength = reflectApply(typedArrayByteLength, serialized, [])
+    authenticated = byteLength <= workerData.maxMessageBytes &&
+      envelope.mac === protocolMac('host-to-worker', envelope.sequence, serialized)
   }
+  if (!authenticated) throw new Error('Unauthenticated host protocol message')
+  const body = safeV8Deserialize(serialized)
+  assertSupportedProtocolValue(body)
   inboundSequence = envelope.sequence
-  return envelope.body
+  return body
+}
+
+function limitedString(value, fallback) {
+  if (typeof value !== 'string') return fallback
+  return reflectApply(stringSlice, value, [0, 8_192])
 }
 
 function cloneError(error) {
-  if (error instanceof Error) {
-    return {
-      name: typeof error.name === 'string' ? error.name : 'Error',
-      message: typeof error.message === 'string' ? error.message : 'Untrusted component failed',
-      stack: typeof error.stack === 'string' ? error.stack : undefined,
-      code: typeof error.code === 'string' ? error.code : undefined
+  try {
+    if (error instanceof Error) {
+      return {
+        name: limitedString(error.name, 'Error'),
+        message: limitedString(error.message, 'Untrusted component failed'),
+        stack: limitedString(error.stack, undefined),
+        code: limitedString(error.code, undefined)
+      }
     }
-  }
-  return {
-    name: 'Error',
-    message: typeof error === 'string' ? error : 'Untrusted component threw a non-Error value'
+    return {
+      name: 'Error',
+      message: limitedString(error, 'Untrusted component threw a non-Error value')
+    }
+  } catch {
+    return { name: 'Error', message: 'Untrusted component failed' }
   }
 }
 
 function send(value) {
   const cloned = cloneValue(value, 'message')
-  postToHost({ type: 'message', value: cloned })
+  postToHost({ type: 'message', value: cloned }, true)
 }
 
 function onMessage(callback) {
@@ -229,7 +561,12 @@ function callHostFunction(name, argumentsList) {
   safeV8Serialize(args)
   return new SafePromise((resolve, reject) => {
     reflectApply(mapSet, pendingHostCalls, [id, { resolve, reject }])
-    postToHost({ type: 'host-call', id, name, arguments: args })
+    try {
+      postToHost({ type: 'host-call', id, name, arguments: args }, true)
+    } catch (error) {
+      reflectApply(mapDelete, pendingHostCalls, [id])
+      reject(error)
+    }
   })
 }
 
@@ -342,13 +679,17 @@ async function initialize() {
     protocolSecret
   }, [channel.port2])
   parentPort.close()
+  hardenDangerousBuiltins()
 
+  port.on('messageerror', () => {
+    reportFatal(new Error('The protocol message could not be deserialized'))
+  })
   port.on('message', (message) => {
     let envelope
     try {
       envelope = authenticateHostMessage(message)
     } catch (error) {
-      postToHost({ type: 'fatal', error: cloneError(error) })
+      reportFatal(error)
       return
     }
 
@@ -356,14 +697,14 @@ async function initialize() {
       try {
         handleHostFunctionResult(envelope)
       } catch (error) {
-        postToHost({ type: 'fatal', error: cloneError(error) })
+        reportFatal(error)
       }
       return
     }
 
     const dispatched = reflectApply(promiseThen, processing, [() => dispatch(envelope)])
     processing = reflectApply(promiseCatch, dispatched, [(error) => {
-      postToHost({ type: 'fatal', error: cloneError(error) })
+      reportFatal(error)
     }])
   })
   // A ref'd MessagePort is exposed by process._getActiveHandles(). Keep the
@@ -372,15 +713,20 @@ async function initialize() {
   keepAlive = safeSetInterval(() => {}, 2_147_483_647)
   const host = createHostFunctions()
 
+  let setupResult
   if (workerData.type === 'script') {
-    const execute = new AsyncFunction(
-      'input',
-      'send',
-      'onMessage',
-      'host',
-      '"use strict";\n' + workerData.source
-    )
-    await execute(workerData.input, send, onMessage, host)
+    const execute = workerData.oneShot
+      ? new AsyncFunction('input', '"use strict";\n' + workerData.source)
+      : new AsyncFunction(
+          'input',
+          'send',
+          'onMessage',
+          'host',
+          '"use strict";\n' + workerData.source
+        )
+    setupResult = workerData.oneShot
+      ? await execute(workerData.input)
+      : await execute(workerData.input, send, onMessage, host)
   } else {
     const encoded = Buffer.from(
       workerData.source + '\n//# sourceURL=secure-eval-worker-component.mjs\n',
@@ -390,7 +736,7 @@ async function initialize() {
     if (typeof component.default !== 'function') {
       throw new TypeError('The module default export must be a setup function')
     }
-    await component.default(Object.freeze({
+    setupResult = await component.default(Object.freeze({
       input: workerData.input,
       send,
       onMessage,
@@ -398,21 +744,29 @@ async function initialize() {
     }))
   }
 
-  postToHost({ type: 'ready' })
+  const readyValue = workerData.oneShot
+    ? cloneValue(setupResult, 'result')
+    : undefined
+  postToHost({ type: 'ready', value: readyValue })
 }
 
 reflectApply(promiseCatch, initialize(), [(error) => {
   if (port) {
-    postToHost({ type: 'fatal', error: cloneError(error) })
+    reportFatal(error)
   } else {
     parentPort.postMessage({ type: 'bootstrap-error', error: cloneError(error) })
     parentPort.close()
   }
 }])
+})()
 `
 
 export function createUntrustedWorker (source, options = {}) {
   return new UntrustedWorkerSession(source, options)
+}
+
+export function createUntrustedOneShot (source, options = {}) {
+  return new UntrustedWorkerSession(source, { ...options, [ONE_SHOT]: true })
 }
 
 export class UntrustedWorkerSession extends EventEmitter {
@@ -433,12 +787,23 @@ export class UntrustedWorkerSession extends EventEmitter {
     this.lifetimeTimeoutMs = options.lifetimeTimeoutMs ?? DEFAULT_LIFETIME_TIMEOUT_MS
     this.maxHostFunctionCalls = options.maxHostFunctionCalls ?? DEFAULT_MAX_HOST_FUNCTION_CALLS
     this.maxInFlightHostFunctions = options.maxInFlightHostFunctions ?? DEFAULT_MAX_IN_FLIGHT_HOST_FUNCTIONS
+    this.maxMessageBytes = options.maxMessageBytes ?? DEFAULT_MAX_MESSAGE_BYTES
+    this.maxInputBytes = options.maxInputBytes ?? DEFAULT_MAX_INPUT_BYTES
+    this.maxOutputMessages = options.maxOutputMessages ?? DEFAULT_MAX_OUTPUT_MESSAGES
+    this.maxOutputBytes = options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES
     validateSource(source, maxSourceBytes)
     validateTimeout(startupTimeoutMs, 'startupTimeoutMs')
     validateTimeout(this.messageTimeoutMs, 'messageTimeoutMs')
     validateTimeout(this.lifetimeTimeoutMs, 'lifetimeTimeoutMs')
     validatePositiveInteger(this.maxHostFunctionCalls, 'maxHostFunctionCalls')
     validatePositiveInteger(this.maxInFlightHostFunctions, 'maxInFlightHostFunctions')
+    validatePositiveInteger(this.maxMessageBytes, 'maxMessageBytes')
+    if (this.maxMessageBytes < MIN_MAX_MESSAGE_BYTES) {
+      throw new RangeError(`maxMessageBytes must be at least ${MIN_MAX_MESSAGE_BYTES}`)
+    }
+    validatePositiveInteger(this.maxInputBytes, 'maxInputBytes')
+    validatePositiveInteger(this.maxOutputMessages, 'maxOutputMessages')
+    validatePositiveInteger(this.maxOutputBytes, 'maxOutputBytes')
 
     const signal = options.signal
     if (signal !== undefined && !(signal instanceof AbortSignal)) {
@@ -448,6 +813,11 @@ export class UntrustedWorkerSession extends EventEmitter {
 
     const startedAt = Date.now()
     const input = cloneWithoutSharedMemory(options.input, 'input')
+    assertSupportedProtocolValue(input, 'input')
+    const serializedInput = v8Serialize(input)
+    if (hostReflectApply(hostTypedArrayByteLength, serializedInput, []) > this.maxInputBytes) {
+      throw new RangeError(`input exceeds maxInputBytes (${this.maxInputBytes})`)
+    }
     const environment = sanitizeEnvironment(options.environment)
     const resourceLimits = validateResourceLimits(options.resourceLimits)
     const hostFunctionConfiguration = validateHostFunctions(options.hostFunctions)
@@ -458,14 +828,17 @@ export class UntrustedWorkerSession extends EventEmitter {
     }
 
     this.state = 'starting'
-    this.port = undefined
+    sessionSecrets.set(this, {
+      worker: undefined,
+      port: undefined,
+      protocolSecret: undefined,
+      rawPortPost: undefined
+    })
     this.pending = new Map()
     this.outbound = []
     this.nextRequestId = 1
     this.inboundSequence = 0
     this.outboundSequence = 0
-    this.protocolSecret = undefined
-    this.rawPortPost = undefined
     this.hostFunctionCalls = 0
     this.inFlightHostFunctions = 0
     this.hostFunctions = hostFunctionConfiguration.functions
@@ -487,7 +860,7 @@ export class UntrustedWorkerSession extends EventEmitter {
     if (signal) signal.addEventListener('abort', this.onAbort, { once: true })
 
     try {
-      this.worker = new Worker(SESSION_BOOTSTRAP, {
+      sessionSecrets.get(this).worker = new Worker(SESSION_BOOTSTRAP, {
         eval: true,
         env: environment,
         execArgv: [
@@ -499,8 +872,12 @@ export class UntrustedWorkerSession extends EventEmitter {
         workerData: {
           source,
           type,
+          oneShot: options[ONE_SHOT] === true,
           input,
-          hostFunctionManifest: hostFunctionConfiguration.manifest
+          hostFunctionManifest: hostFunctionConfiguration.manifest,
+          maxMessageBytes: this.maxMessageBytes,
+          maxOutputMessages: this.maxOutputMessages,
+          maxOutputBytes: this.maxOutputBytes
         },
         name: 'secure-eval-worker-session',
         stdout: true,
@@ -513,13 +890,20 @@ export class UntrustedWorkerSession extends EventEmitter {
       throw error
     }
 
-    this.worker.stdout.resume()
-    this.worker.stderr.resume()
-    this.worker.on('message', (message) => this.handleHandshake(message))
-    this.worker.once('error', (error) => {
+    const worker = sessionSecrets.get(this).worker
+    worker.stdout.resume()
+    worker.stderr.resume()
+    worker.on('message', (message) => this.handleHandshake(message))
+    worker.on('messageerror', () => {
+      this.fail(sessionError(
+        'The worker handshake could not be deserialized',
+        'ERR_UNTRUSTED_WORKER_PROTOCOL'
+      ))
+    })
+    worker.once('error', (error) => {
       this.fail(sessionError('The worker failed', 'ERR_UNTRUSTED_WORKER', error))
     })
-    this.worker.once('exit', (code) => this.handleExit(code))
+    worker.once('exit', (code) => this.handleExit(code))
 
     const startupDelay = startupTimeoutMs - (Date.now() - startedAt)
     if (startupDelay <= 0) {
@@ -542,38 +926,60 @@ export class UntrustedWorkerSession extends EventEmitter {
   postMessage (value) {
     this.assertOpen()
     const cloned = cloneWithoutSharedMemory(value, 'message')
-    assertProtocolSerializable(cloned, 'message')
-    const send = () => this.sendProtocol({ type: 'message', value: cloned })
+    this.assertOpen()
+    const body = { type: 'message', value: cloned }
+    const serialized = assertProtocolBody(body, 'message', this.maxMessageBytes)
+    const send = () => this.sendProtocol(body, serialized)
     if (this.state === 'ready') send()
     else this.outbound.push(send)
   }
 
   request (value, options = {}) {
     this.assertOpen()
+    if (isHostFunctionContextActiveForSession(this.sessionId)) {
+      throw sessionError(
+        'Host functions cannot make reentrant requests to their own session',
+        'ERR_UNTRUSTED_WORKER_REENTRANT_REQUEST'
+      )
+    }
     if (options === null || typeof options !== 'object' || Array.isArray(options)) {
       throw new TypeError('request options must be an object')
     }
     const timeoutMs = options.timeoutMs ?? this.messageTimeoutMs
     validateTimeout(timeoutMs, 'timeoutMs')
+    const deadline = Date.now() + timeoutMs
     const cloned = cloneWithoutSharedMemory(value, 'message')
-    assertProtocolSerializable(cloned, 'message')
+    this.assertOpen()
     const id = this.nextRequestId++
+    const body = { type: 'request', id, value: cloned }
+    const serialized = assertProtocolBody(body, 'message', this.maxMessageBytes)
+    const remainingMs = deadline - Date.now()
+    if (remainingMs <= 0) {
+      const error = sessionError(
+        `Message handling exceeded ${timeoutMs} ms`,
+        'ERR_UNTRUSTED_WORKER_MESSAGE_TIMEOUT'
+      )
+      this.fail(error)
+      return Promise.reject(error)
+    }
 
     return new Promise((resolve, reject) => {
-      const pending = { resolve, reject, timer: undefined }
+      const pending = { resolve, reject, timer: undefined, deadline, timeoutMs }
+      const expire = () => {
+        if (!this.pending.delete(id)) return
+        const error = sessionError(
+          `Message handling exceeded ${timeoutMs} ms`,
+          'ERR_UNTRUSTED_WORKER_MESSAGE_TIMEOUT'
+        )
+        reject(error)
+        this.fail(error)
+      }
+      pending.timer = setTimeout(expire, remainingMs)
       this.pending.set(id, pending)
       const send = () => {
         if (this.state !== 'ready' || !this.pending.has(id)) return
-        pending.timer = setTimeout(() => {
-          const error = sessionError(
-            `Message handling exceeded ${timeoutMs} ms`,
-            'ERR_UNTRUSTED_WORKER_MESSAGE_TIMEOUT'
-          )
-          this.pending.delete(id)
-          reject(error)
-          this.fail(error)
-        }, timeoutMs)
-        this.sendProtocol({ type: 'request', id, value: cloned })
+        this.sendProtocol(body, serialized)
+        if (Date.now() >= deadline) expire()
       }
 
       if (this.state === 'ready') send()
@@ -591,14 +997,16 @@ export class UntrustedWorkerSession extends EventEmitter {
       this.hostAbortController.abort(error)
       clearTimeout(this.startupTimer)
       clearTimeout(this.lifetimeTimer)
-      this.port?.close()
+      sessionSecrets.get(this).port?.close()
     }
-    this.termination = this.worker ? this.worker.terminate() : Promise.resolve(undefined)
+    const worker = sessionSecrets.get(this).worker
+    this.termination = worker ? worker.terminate() : Promise.resolve(undefined)
     return this.termination
   }
 
   handleHandshake (message) {
-    if (this.port) {
+    const secrets = sessionSecrets.get(this)
+    if (secrets.port) {
       this.fail(sessionError('Unexpected parent-port message', 'ERR_UNTRUSTED_WORKER_PROTOCOL'))
       return
     }
@@ -612,54 +1020,73 @@ export class UntrustedWorkerSession extends EventEmitter {
       return
     }
 
-    this.port = message.port
-    this.protocolSecret = message.protocolSecret
-    this.rawPortPost = this.port.postMessage.bind(this.port)
-    this.worker.removeAllListeners('message')
-    this.port.on('message', (message) => {
+    secrets.port = message.port
+    secrets.protocolSecret = message.protocolSecret
+    secrets.rawPortPost = secrets.port.postMessage.bind(secrets.port)
+    secrets.worker.removeAllListeners('message')
+    secrets.port.on('message', (message) => {
       try {
         this.handleMessage(this.authenticateMessage(message))
       } catch (error) {
         this.fail(error)
       }
     })
-    this.port.start()
+    secrets.port.on('messageerror', () => {
+      this.fail(sessionError(
+        'The worker protocol message could not be deserialized',
+        'ERR_UNTRUSTED_WORKER_PROTOCOL'
+      ))
+    })
+    secrets.port.start()
   }
 
-  sendProtocol (body) {
+  sendProtocol (body, serialized = serializeProtocolBody(body, this.maxMessageBytes)) {
     const sequence = ++this.outboundSequence
-    this.rawPortPost({
+    const secrets = sessionSecrets.get(this)
+    secrets.rawPortPost({
       sequence,
-      body,
-      mac: this.protocolMac(sequence, body)
+      payload: serialized,
+      mac: protocolMac(secrets.protocolSecret, 'host-to-worker', sequence, serialized)
     })
   }
 
   authenticateMessage (message) {
     if (message === null || typeof message !== 'object' ||
         !Number.isSafeInteger(message.sequence) || message.sequence !== this.inboundSequence + 1 ||
-        message.body === null || typeof message.body !== 'object' ||
+        message.payload === null || typeof message.payload !== 'object' ||
+        !hostReflectApply(safeArrayBufferIsView, ArrayBuffer, [message.payload]) ||
         typeof message.mac !== 'string') {
       throw sessionError('Unauthenticated worker protocol message', 'ERR_UNTRUSTED_WORKER_PROTOCOL')
     }
 
-    const expected = Buffer.from(this.protocolMac(message.sequence, message.body), 'base64')
+    assertNoSharedMemory(message.payload, 'protocol payload')
+    const byteLength = hostReflectApply(hostTypedArrayByteLength, message.payload, [])
+    if (byteLength > this.maxMessageBytes) {
+      throw sessionError('Worker protocol message is too large', 'ERR_UNTRUSTED_WORKER_PROTOCOL')
+    }
+    const expected = Buffer.from(protocolMac(
+      sessionSecrets.get(this).protocolSecret,
+      'worker-to-host',
+      message.sequence,
+      message.payload
+    ), 'base64')
     const actual = Buffer.from(message.mac, 'base64')
     if (expected.length !== actual.length || !timingSafeEqual(expected, actual)) {
       throw sessionError('Unauthenticated worker protocol message', 'ERR_UNTRUSTED_WORKER_PROTOCOL')
     }
+    let body
+    try {
+      body = v8Deserialize(message.payload)
+      assertSupportedProtocolValue(body, 'message')
+    } catch {
+      throw sessionError('Invalid worker protocol payload', 'ERR_UNTRUSTED_WORKER_PROTOCOL')
+    }
     this.inboundSequence = message.sequence
-    return message.body
-  }
-
-  protocolMac (sequence, body) {
-    const hmac = createHmac('sha256', this.protocolSecret)
-    hmac.update(`${sequence}\0`)
-    hmac.update(v8Serialize(body))
-    return hmac.digest('base64')
+    return body
   }
 
   handleMessage (envelope) {
+    if (this.state === 'closing' || this.state === 'closed') return
     if (envelope === null || typeof envelope !== 'object' || typeof envelope.type !== 'string') {
       this.fail(sessionError('Invalid worker protocol message', 'ERR_UNTRUSTED_WORKER_PROTOCOL'))
       return
@@ -685,7 +1112,7 @@ export class UntrustedWorkerSession extends EventEmitter {
       clearTimeout(this.startupTimer)
       this.state = 'ready'
       this.readySettled = true
-      this.resolveReady()
+      this.resolveReady(envelope.value)
       this.lifetimeTimer = setTimeout(() => {
         this.fail(sessionError(
           `Session lifetime exceeded ${this.lifetimeTimeoutMs} ms`,
@@ -717,8 +1144,18 @@ export class UntrustedWorkerSession extends EventEmitter {
       }
       this.pending.delete(envelope.id)
       clearTimeout(pending.timer)
-      if (envelope.type === 'response') pending.resolve(envelope.value)
-      else pending.reject(remoteError(envelope.error))
+      if (Date.now() >= pending.deadline) {
+        const error = sessionError(
+          `Message handling exceeded ${pending.timeoutMs} ms`,
+          'ERR_UNTRUSTED_WORKER_MESSAGE_TIMEOUT'
+        )
+        pending.reject(error)
+        this.fail(error)
+      } else if (envelope.type === 'response') {
+        pending.resolve(envelope.value)
+      } else {
+        pending.reject(remoteError(envelope.error))
+      }
       return
     }
 
@@ -749,14 +1186,14 @@ export class UntrustedWorkerSession extends EventEmitter {
       return
     }
     if (this.hostFunctionCalls >= this.maxHostFunctionCalls) {
-      this.sendHostFunctionError(envelope.id, sessionError(
+      this.fail(sessionError(
         'Host function call limit exceeded',
         'ERR_UNTRUSTED_WORKER_HOST_FUNCTION_LIMIT'
       ))
       return
     }
     if (this.inFlightHostFunctions >= this.maxInFlightHostFunctions) {
-      this.sendHostFunctionError(envelope.id, sessionError(
+      this.fail(sessionError(
         'Concurrent host function limit exceeded',
         'ERR_UNTRUSTED_WORKER_HOST_FUNCTION_LIMIT'
       ))
@@ -766,7 +1203,7 @@ export class UntrustedWorkerSession extends EventEmitter {
     this.hostFunctionCalls++
     this.inFlightHostFunctions++
     const requestIndex = this.hostFunctionCalls
-    void this.invokeHostFunction(envelope, hostFunction, requestIndex)
+    void this.invokeHostFunction(envelope, hostFunction, requestIndex).catch(() => {})
   }
 
   async invokeHostFunction (envelope, hostFunction, requestIndex) {
@@ -778,6 +1215,8 @@ export class UntrustedWorkerSession extends EventEmitter {
         requestIndex,
         hostFunctionName: envelope.name
       })
+      if (this.hostAbortController.signal.aborted ||
+          (this.state !== 'starting' && this.state !== 'ready')) return
       const cloned = cloneWithoutSharedMemory(value, 'host function result')
       assertProtocolSerializable(cloned, 'host function result')
       if (this.state === 'starting' || this.state === 'ready') {
@@ -793,36 +1232,49 @@ export class UntrustedWorkerSession extends EventEmitter {
   }
 
   sendHostFunctionError (id, error) {
-    if (!this.port || (this.state !== 'starting' && this.state !== 'ready')) return
-    this.sendProtocol({
-      type: 'host-error',
-      id,
-      error: serializeHostError(error)
-    })
+    if (!sessionSecrets.get(this).port ||
+        (this.state !== 'starting' && this.state !== 'ready')) return
+    try {
+      this.sendProtocol({
+        type: 'host-error',
+        id,
+        error: serializeHostError(error)
+      })
+    } catch (protocolError) {
+      this.fail(sessionError(
+        'Host function error exceeded protocol limits',
+        'ERR_UNTRUSTED_WORKER_PROTOCOL',
+        protocolError
+      ))
+    }
   }
 
   handleExit (code) {
     clearTimeout(this.startupTimer)
     clearTimeout(this.lifetimeTimer)
     this.signal?.removeEventListener('abort', this.onAbort)
-    this.port?.close()
+    sessionSecrets.get(this).port?.close()
 
+    let errorToEmit
     if (this.state !== 'closing' && this.state !== 'closed') {
-      const error = this.failure ?? sessionError(
+      errorToEmit = this.failure ?? sessionError(
         `The worker exited unexpectedly (code ${code})`,
         'ERR_UNTRUSTED_WORKER_EXIT'
       )
-      this.failure = error
+      this.failure = errorToEmit
       this.state = 'closing'
-      this.hostAbortController.abort(error)
-      this.rejectOutstanding(error)
-      this.rejectReadyOnce(error)
-      this.emitError(error)
+      this.hostAbortController.abort(errorToEmit)
+      this.rejectOutstanding(errorToEmit)
+      this.rejectReadyOnce(errorToEmit)
     }
 
     this.state = 'closed'
     this.resolveClosed({ code, error: this.failure })
-    this.emit('exit', code)
+    try {
+      if (errorToEmit) this.emitError(errorToEmit)
+    } finally {
+      this.emit('exit', code)
+    }
   }
 
   fail (error) {
@@ -832,8 +1284,8 @@ export class UntrustedWorkerSession extends EventEmitter {
     this.hostAbortController.abort(error)
     this.rejectReadyOnce(error)
     this.rejectOutstanding(error)
-    this.emitError(error)
     void this.terminate()
+    this.emitError(error)
   }
 
   rejectReadyOnce (error) {
@@ -862,6 +1314,36 @@ export class UntrustedWorkerSession extends EventEmitter {
   }
 }
 
+function protocolMac (secret, direction, sequence, serialized) {
+  const hmac = createHmac('sha256', secret)
+  hmac.update(`${direction}\0${sequence}\0`)
+  hmac.update(serialized)
+  return hmac.digest('base64')
+}
+
+function serializeProtocolBody (body, maxMessageBytes) {
+  let serialized
+  try {
+    assertSupportedProtocolValue(body, 'message')
+    serialized = v8Serialize(body)
+  } catch {
+    throw new TypeError('Message is not supported by the authenticated protocol')
+  }
+  if (serialized.byteLength > maxMessageBytes) {
+    throw new RangeError(`Message exceeds maxMessageBytes (${maxMessageBytes})`)
+  }
+  return serialized
+}
+
+function assertProtocolBody (body, label, maxMessageBytes) {
+  try {
+    return serializeProtocolBody(body, maxMessageBytes)
+  } catch (error) {
+    if (error instanceof RangeError) throw error
+    throw new TypeError(`${label} is not supported by the authenticated protocol`)
+  }
+}
+
 function assertProtocolSerializable (value, label) {
   try {
     v8Serialize(value)
@@ -872,15 +1354,20 @@ function assertProtocolSerializable (value, label) {
 
 function serializeHostError (error) {
   try {
-    return {
-      name: error instanceof Error && typeof error.name === 'string' ? error.name : 'Error',
-      message: error instanceof Error && typeof error.message === 'string'
-        ? error.message
-        : 'Host function failed',
-      code: error && typeof error.code === 'string' ? error.code : undefined
+    if (error instanceof HostFunctionError) {
+      return {
+        name: 'HostFunctionError',
+        message: typeof error.message === 'string'
+          ? error.message.slice(0, 8_192)
+          : 'Host function failed',
+        code: typeof error.code === 'string' ? error.code.slice(0, 8_192) : 'ERR_HOST_FUNCTION'
+      }
     }
-  } catch {
-    return { name: 'Error', message: 'Host function failed' }
+  } catch {}
+  return {
+    name: 'HostFunctionError',
+    message: 'Host function failed',
+    code: 'ERR_UNTRUSTED_WORKER_HOST_FUNCTION'
   }
 }
 

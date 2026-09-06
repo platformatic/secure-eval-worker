@@ -4,6 +4,9 @@
   "description": "Least-privilege worker-thread execution for untrusted JavaScript",
   "type": "module",
   "exports": "./src/index.js",
+  "files": [
+    "src"
+  ],
   "engines": {
     "node": ">=26.3.0"
   },

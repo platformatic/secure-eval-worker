@@ -15,6 +15,32 @@ test('returns a structured-cloneable result', async () => {
   assert.deepEqual(result, { total: 42 })
 })
 
+test('preserves the one-shot source binding contract', async () => {
+  assert.deepEqual(await runUntrustedCode(`
+    if (typeof postToHost === 'function') {
+      postToHost({ type: 'ready', value: 'spoofed' })
+    }
+    const send = 1
+    const onMessage = 2
+    const host = 3
+    return {
+      send,
+      onMessage,
+      host,
+      port: typeof port,
+      postToHost: typeof postToHost,
+      protocolSecret: typeof protocolSecret
+    }
+  `), {
+    send: 1,
+    onMessage: 2,
+    host: 3,
+    port: 'undefined',
+    postToHost: 'undefined',
+    protocolSecret: 'undefined'
+  })
+})
+
 test('supports asynchronous source', async () => {
   const result = await runUntrustedCode(`
     await new Promise((resolve) => setTimeout(resolve, 10))
@@ -46,6 +72,35 @@ test('starts with a minimal explicit environment', async () => {
   }
 })
 
+test('normalizes one-shot worker options only once', async () => {
+  let environmentReads = 0
+  let resourceLimitReads = 0
+  const environment = {}
+  Object.defineProperty(environment, 'PUBLIC_VALUE', {
+    enumerable: true,
+    get () {
+      environmentReads++
+      return 'visible'
+    }
+  })
+  const resourceLimits = {}
+  Object.defineProperty(resourceLimits, 'stackSizeMb', {
+    enumerable: true,
+    get () {
+      resourceLimitReads++
+      return 4
+    }
+  })
+
+  assert.equal(await runUntrustedCode('return process.env.PUBLIC_VALUE', {
+    environment,
+    resourceLimits,
+    timeoutMs: 5_000
+  }), 'visible')
+  assert.equal(environmentReads, 1)
+  assert.equal(resourceLimitReads, 1)
+})
+
 test('rejects environment variables that can alter the runtime', () => {
   assert.throws(
     () => sanitizeEnvironment({ NODE_OPTIONS: '--import=./hostile.js' }),
@@ -55,6 +110,13 @@ test('rejects environment variables that can alter the runtime', () => {
     () => sanitizeEnvironment({ LD_PRELOAD: '/tmp/hostile.so' }),
     /not allowed/
   )
+  for (const name of ['NODE_CHANNEL_FD', 'NODE_ICU_DATA', 'NODE_V8_COVERAGE']) {
+    assert.throws(
+      () => sanitizeEnvironment({ [name]: 'hostile' }),
+      /not allowed/
+    )
+  }
+  assert.equal(sanitizeEnvironment({ NODE_ENV: 'production' }).NODE_ENV, 'production')
 })
 
 test('drops the worker permission before running source', async () => {
@@ -137,15 +199,13 @@ test('denies nested workers after permission.drop()', async () => {
   )
 })
 
-test('rejects spoofed parent-port messages', async () => {
-  await assert.rejects(
-    runUntrustedCode(`
-      const { parentPort } = await import('node:worker_threads')
-      parentPort.postMessage({ type: 'result', value: 'spoofed' })
-      return 'real'
-    `, { timeoutMs: 5_000 }),
-    (error) => error.code === 'ERR_UNTRUSTED_CODE_PROTOCOL'
-  )
+test('does not expose the one-shot control channel through parentPort', async () => {
+  const result = await runUntrustedCode(`
+    const { parentPort } = await import('node:worker_threads')
+    return { parentPort, value: 'real' }
+  `, { timeoutMs: 5_000 })
+
+  assert.deepEqual(result, { parentPort: null, value: 'real' })
 })
 
 test('terminates source that exceeds its deadline', async () => {

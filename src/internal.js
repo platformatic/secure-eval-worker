@@ -8,7 +8,60 @@ export const DEFAULT_RESOURCE_LIMITS = Object.freeze({
 })
 
 const ENVIRONMENT_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/
-const BLOCKED_ENVIRONMENT_NAME = /^(?:(?:NODE_OPTIONS|NODE_PATH|NODE_EXTRA_CA_CERTS|OPENSSL_CONF|SSLKEYLOGFILE|NPM_CONFIG_USERCONFIG)$|LD_|DYLD_)/i
+const BLOCKED_ENVIRONMENT_NAME = /^(?:(?:NODE_(?!ENV$)[A-Z0-9_]*|OPENSSL_CONF|SSLKEYLOGFILE|NPM_CONFIG_USERCONFIG)$|LD_|DYLD_)/i
+const safeStructuredClone = globalThis.structuredClone
+const reflectApply = Reflect.apply
+const reflectOwnKeys = Reflect.ownKeys
+const arrayBufferIsView = ArrayBuffer.isView
+const arrayIsArray = Array.isArray
+const weakSetHas = WeakSet.prototype.has
+const weakSetAdd = WeakSet.prototype.add
+const arrayPush = Array.prototype.push
+const arrayPop = Array.prototype.pop
+const mapEntries = Map.prototype.entries
+const mapIteratorNext = Object.getPrototypeOf(new Map().entries()).next
+const setValues = Set.prototype.values
+const setIteratorNext = Object.getPrototypeOf(new Set().values()).next
+const arrayBufferByteLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength').get
+const dateTime = Date.prototype.getTime
+const regexpSource = Object.getOwnPropertyDescriptor(RegExp.prototype, 'source').get
+const objectGetPrototypeOf = Object.getPrototypeOf
+const objectPrototype = Object.prototype
+const sharedByteLength = typeof SharedArrayBuffer === 'undefined'
+  ? undefined
+  : Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, 'byteLength').get
+const typedArrayBuffer = Object.getOwnPropertyDescriptor(
+  Object.getPrototypeOf(Uint8Array.prototype),
+  'buffer'
+).get
+const dataViewBuffer = Object.getOwnPropertyDescriptor(DataView.prototype, 'buffer').get
+const wasmMemoryBuffer = Object.getOwnPropertyDescriptor(WebAssembly.Memory.prototype, 'buffer').get
+
+function isSharedArrayBuffer (value) {
+  if (!sharedByteLength || value === null || typeof value !== 'object') return false
+  try {
+    reflectApply(sharedByteLength, value, [])
+    return true
+  } catch {
+    return false
+  }
+}
+
+function getViewBuffer (value) {
+  try {
+    return reflectApply(typedArrayBuffer, value, [])
+  } catch {
+    return reflectApply(dataViewBuffer, value, [])
+  }
+}
+
+function getWasmMemoryBuffer (value) {
+  try {
+    return reflectApply(wasmMemoryBuffer, value, [])
+  } catch {
+    return undefined
+  }
+}
 
 export class UntrustedCodeError extends Error {
   constructor (message, options = {}) {
@@ -42,38 +95,131 @@ export function sanitizeEnvironment (environment = {}) {
 }
 
 export function cloneWithoutSharedMemory (value, label) {
-  const cloned = structuredClone(value)
+  const cloned = safeStructuredClone(value)
   assertNoSharedMemory(cloned, label)
   return cloned
 }
 
 export function assertNoSharedMemory (value, label) {
-  if (typeof SharedArrayBuffer !== 'undefined' && value instanceof SharedArrayBuffer) {
-    throw new TypeError(`${label} must not contain shared memory`)
-  }
   if (value === null || typeof value !== 'object') return
 
   const pending = [value]
   const seen = new WeakSet()
   while (pending.length > 0) {
-    const current = pending.pop()
+    const current = reflectApply(arrayPop, pending, [])
     if (current === null || typeof current !== 'object') continue
-    if (seen.has(current)) continue
-    seen.add(current)
+    if (reflectApply(weakSetHas, seen, [current])) continue
+    reflectApply(weakSetAdd, seen, [current])
 
-    if (typeof SharedArrayBuffer !== 'undefined' && current instanceof SharedArrayBuffer) {
+    if (isSharedArrayBuffer(current)) {
       throw new TypeError(`${label} must not contain shared memory`)
     }
-    if (current instanceof WebAssembly.Memory) {
-      pending.push(current.buffer)
-    } else if (ArrayBuffer.isView(current)) {
-      pending.push(current.buffer)
-    } else if (current instanceof Map) {
-      for (const [key, entry] of current) pending.push(key, entry)
-    } else if (current instanceof Set) {
-      for (const entry of current) pending.push(entry)
-    } else {
-      for (const key of Reflect.ownKeys(current)) pending.push(current[key])
+
+    const memoryBuffer = getWasmMemoryBuffer(current)
+    if (memoryBuffer !== undefined) {
+      reflectApply(arrayPush, pending, [memoryBuffer])
+      continue
+    }
+    if (reflectApply(arrayBufferIsView, ArrayBuffer, [current])) {
+      reflectApply(arrayPush, pending, [getViewBuffer(current)])
+      continue
+    }
+
+    let iterator
+    try {
+      iterator = reflectApply(mapEntries, current, [])
+    } catch {}
+    if (iterator) {
+      while (true) {
+        const item = reflectApply(mapIteratorNext, iterator, [])
+        if (item.done) break
+        reflectApply(arrayPush, pending, [item.value[0], item.value[1]])
+      }
+      continue
+    }
+
+    try {
+      iterator = reflectApply(setValues, current, [])
+    } catch {
+      iterator = undefined
+    }
+    if (iterator) {
+      while (true) {
+        const item = reflectApply(setIteratorNext, iterator, [])
+        if (item.done) break
+        reflectApply(arrayPush, pending, [item.value])
+      }
+      continue
+    }
+
+    for (const key of reflectOwnKeys(current)) {
+      reflectApply(arrayPush, pending, [current[key]])
+    }
+  }
+}
+
+export function assertSupportedProtocolValue (value, label) {
+  const pending = [value]
+  const seen = new WeakSet()
+  while (pending.length > 0) {
+    const current = reflectApply(arrayPop, pending, [])
+    if (current === null) continue
+    const kind = typeof current
+    if (kind === 'string' || kind === 'boolean' || kind === 'number' ||
+        kind === 'bigint' || kind === 'undefined') continue
+    if (kind !== 'object') throw new TypeError(`${label} contains an unsupported value`)
+    if (reflectApply(weakSetHas, seen, [current])) continue
+    reflectApply(weakSetAdd, seen, [current])
+
+    if (isSharedArrayBuffer(current)) throw new TypeError(`${label} contains an unsupported value`)
+    try {
+      reflectApply(arrayBufferByteLength, current, [])
+      continue
+    } catch {}
+    if (reflectApply(arrayBufferIsView, ArrayBuffer, [current])) continue
+    try {
+      reflectApply(dateTime, current, [])
+      continue
+    } catch {}
+    try {
+      reflectApply(regexpSource, current, [])
+      continue
+    } catch {}
+
+    let iterator
+    try {
+      iterator = reflectApply(mapEntries, current, [])
+    } catch {}
+    if (iterator) {
+      while (true) {
+        const item = reflectApply(mapIteratorNext, iterator, [])
+        if (item.done) break
+        reflectApply(arrayPush, pending, [item.value[0], item.value[1]])
+      }
+      continue
+    }
+    try {
+      iterator = reflectApply(setValues, current, [])
+    } catch {
+      iterator = undefined
+    }
+    if (iterator) {
+      while (true) {
+        const item = reflectApply(setIteratorNext, iterator, [])
+        if (item.done) break
+        reflectApply(arrayPush, pending, [item.value])
+      }
+      continue
+    }
+
+    const prototype = objectGetPrototypeOf(current)
+    if (!reflectApply(arrayIsArray, Array, [current]) &&
+        prototype !== objectPrototype && prototype !== null) {
+      throw new TypeError(`${label} contains an unsupported value`)
+    }
+    for (const key of reflectOwnKeys(current)) {
+      if (typeof key === 'symbol') throw new TypeError(`${label} contains an unsupported value`)
+      reflectApply(arrayPush, pending, [current[key]])
     }
   }
 }
@@ -112,11 +258,12 @@ export function validateResourceLimits (limits) {
 
   const result = { ...DEFAULT_RESOURCE_LIMITS }
   for (const name of Object.keys(DEFAULT_RESOURCE_LIMITS)) {
-    if (limits[name] !== undefined) {
-      if (typeof limits[name] !== 'number' || !Number.isFinite(limits[name]) || limits[name] <= 0) {
+    const value = limits[name]
+    if (value !== undefined) {
+      if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
         throw new RangeError(`resourceLimits.${name} must be a positive number`)
       }
-      result[name] = limits[name]
+      result[name] = value
     }
   }
   return result
