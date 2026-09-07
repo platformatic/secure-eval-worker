@@ -31,6 +31,22 @@ console.log(value) // 42
 
 The source is the body of an async function with one argument named `input`. Setup input is copied through `workerData`; the result uses the authenticated private channel. Shared memory and unsupported platform objects are rejected in both directions.
 
+One-shot source can use the same explicit host-function capabilities as a persistent component without changing that function signature:
+
+```js
+const record = await runUntrustedCode(
+  'return records.find(input.id)',
+  {
+    input: { id: 'record-42' },
+    hostFunctions: {
+      records: {
+        find: async (id) => database.records.find(id)
+      }
+    }
+  }
+)
+```
+
 ### Persistent script component
 
 ```js
@@ -91,7 +107,7 @@ console.log(await component.request('hello')) // { echo: 'hello' }
 await component.terminate()
 ```
 
-Module source must be self-contained ESM with a default setup-function export. It is imported from an in-memory `data:` URL after permissions are dropped. Built-in imports are permitted subject to the Permission Model, but relative files, package imports, and filesystem module paths are not resolved.
+Module source must be self-contained ESM with a default setup-function export. It is imported from an in-memory `data:` URL after permissions are dropped. Built-in imports are permitted subject to the Permission Model, but relative files, package imports, and filesystem module paths are not resolved. Bundle authorized dependencies on the trusted host using the model in [`docs/module-dependencies.md`](docs/module-dependencies.md).
 
 ### Host functions
 
@@ -125,6 +141,8 @@ The context is available only while that host function is active. Its identifier
 
 ## API
 
+The package includes TypeScript declarations. `runUntrustedCode<Output, Input>()` and `createUntrustedWorker<SetupInput, InboundMessage, Response, OutboundMessage>()` can type host-side inputs and outputs; runtime protocol validation remains authoritative.
+
 ### `runUntrustedCode(source[, options])`
 
 Returns a promise for the result.
@@ -137,9 +155,20 @@ Options:
 - `environment`: explicit string-to-string environment. Nothing from the host environment is inherited by default. Runtime-control `NODE_*` variables other than `NODE_ENV`, npm user-config, dynamic-loader, OpenSSL config, and TLS key-log variables are rejected.
 - `resourceLimits`: overrides for Worker V8 limits (`maxOldGenerationSizeMb`, `maxYoungGenerationSizeMb`, `codeRangeSizeMb`, and `stackSizeMb`).
 - `signal`: an `AbortSignal` that terminates the worker.
-- `maxInputBytes` and `maxMessageBytes`: equivalent to the persistent options below.
+- `language`: `javascript` (default) or `typescript`. TypeScript mode erases supported type-only syntax; it does not type-check source and rejects syntax requiring transformation.
+- `hostFunctions`, `maxHostFunctionCalls`, and `maxInFlightHostFunctions`: equivalent to the persistent options below.
+- `maxInputBytes`, `maxMessageBytes`, `maxOutputMessages`, and `maxOutputBytes`: equivalent to the persistent options below.
+- `diagnostics` and `onDiagnostic`: opt into bounded, sanitized console records as described below.
 
 Every execution uses a new worker. Source cannot obtain filesystem, network, child-process, native-addon, inspector, WASI, or nested-worker access through supported Node APIs because none of those permissions remain when source starts. Known Permission Model gaps and process-wide APIs are additionally disabled before source is loaded. Ordinary guest stdout and stderr writes are discarded rather than forwarded into host logs.
+
+### `createRunner([defaultOptions])`
+
+Returns a callable wrapper around `runUntrustedCode()` with validated, snapshotted defaults. `input` and `signal` remain invocation-specific. Nested policies such as `environment`, `resourceLimits`, and `hostFunctions` are replaced—not deep-merged—by per-run overrides. Every invocation still creates a fresh worker.
+
+### `configureWorkerAdmission({ maxConcurrentWorkers })`
+
+Sets the fail-fast process-wide live-worker limit shared by one-shot runs and persistent sessions. The measured conservative default is `4`. There is no internal queue. Persistent creation throws `ERR_UNTRUSTED_WORKER_CAPACITY`; one-shot execution rejects with `ERR_UNTRUSTED_CODE_CAPACITY`. Sandbox creation from host worker threads fails closed with `ERR_UNTRUSTED_WORKER_ADMISSION_UNAVAILABLE` so terminating a host thread cannot orphan a slot. Slots are released only after sandbox worker exit. See [`docs/worker-admission.md`](docs/worker-admission.md) for backpressure guidance and limitations.
 
 ### `createUntrustedWorker(source[, options])`
 
@@ -149,6 +178,7 @@ Options:
 
 - `input`: copied setup input, restricted to the protocol value types documented below.
 - `type`: `script` or `module`. Default: `script`.
+- `language`: `javascript` (default) or erase-only `typescript`.
 - `startupTimeoutMs`: deadline for cloning, worker startup, module evaluation, and setup. Default: `1000`.
 - `messageTimeoutMs`: default deadline for each `request()`. A timed-out request terminates the whole session because a CPU-bound handler cannot be interrupted independently. Default: `1000`.
 - `lifetimeTimeoutMs`: maximum session lifetime after startup. Default: `30000`.
@@ -159,6 +189,8 @@ Options:
 - `maxMessageBytes`: maximum V8-serialized protocol body size; must be at least 128 bytes. Default: 1 MiB.
 - `maxOutputMessages`: maximum unsolicited messages and attempted host calls emitted by guest code. Default: `1024`.
 - `maxOutputBytes`: cumulative serialized-byte budget for unsolicited messages and attempted host calls. Default: 16 MiB.
+- `diagnostics`: `true` or `{ maxRecords, maxBytes, maxRecordBytes }` to enable sanitized console records. Defaults: 100 records, 64 KiB total, and 4 KiB per record. Output remains discarded when disabled.
+- `onDiagnostic(record)`: optional callback receiving frozen `{ level, text }` records; providing it enables default diagnostic limits.
 - `maxSourceBytes`, `environment`, `resourceLimits`, and `signal`: equivalent to the one-shot options.
 
 Session interface:
@@ -168,9 +200,11 @@ Session interface:
 - `request(value[, { timeoutMs }])`: delivers a message and resolves with the handler's return value.
 - `terminate()`: idempotently terminates the worker.
 - `closed`: promise resolved with `{ code, error }` after worker exit.
-- Events: `message` for values passed to `send()`, `error` for runtime/session errors, and `exit` for worker exit. Attach an `error` listener when runtime notifications need to be observed.
+- Events: `message` for values passed to `send()`, `diagnostic` for opt-in console records, `error` for runtime/session errors, and `exit` for worker exit. Attach an `error` listener when runtime notifications need to be observed.
 
-`onMessage()` registers one handler, and messages are processed serially. Input, posts, requests, replies, unsolicited messages, and host-function arguments/results are copied. Transfer lists and all shared-memory representations—including `SharedArrayBuffer`, shared typed-array/DataView backing stores, and shared `WebAssembly.Memory`—are rejected. Protocol values are restricted to primitives, plain objects and arrays, `ArrayBuffer` and non-shared views, `Date`, `RegExp`, `Map`, and `Set`. Platform objects such as `Blob`, ports, file handles, sockets, and cryptographic key objects are rejected. The exact serialized bytes—not a second representation of the value—are authenticated before deserialization.
+`onMessage()` registers one handler, and messages are processed serially. Input, posts, requests, replies, unsolicited messages, and host-function arguments/results are copied. Transfer lists and all shared-memory representations—including `SharedArrayBuffer`, shared typed-array/DataView backing stores, and shared `WebAssembly.Memory`—are rejected. Protocol values are restricted to primitives, plain objects and arrays, `ArrayBuffer` and non-shared views, `Date`, `RegExp`, `Map`, and `Set`. Platform objects such as `Blob`, ports, file handles, sockets, cryptographic key objects, and ordinary `Error` values are rejected. Use explicit plain error data when needed; see [`docs/error-values.md`](docs/error-values.md). The exact serialized bytes—not a second representation of the value—are authenticated before deserialization.
+
+Diagnostics use a separate private channel, key, sequence, and byte/count budgets. Control replies carry a diagnostic watermark, so asynchronous callbacks for earlier records settle first. Formatting never reads object properties or invokes custom inspection. Strings have terminal control characters escaped. A callback cannot request from its own session because waiting would deadlock; this throws `ERR_UNTRUSTED_WORKER_REENTRANT_DIAGNOSTIC`. A callback failure uses `ERR_UNTRUSTED_WORKER_DIAGNOSTIC_CALLBACK` for sessions and `ERR_UNTRUSTED_CODE_DIAGNOSTIC_CALLBACK` for one-shot calls; the default remains complete suppression.
 
 ### `getHostFunctionContext()`
 
@@ -186,7 +220,7 @@ Validates an explicit environment and returns a null-prototype copy. Values must
 
 ### `UntrustedCodeError`
 
-Errors originating from execution use this class and have a machine-readable `code`. A remote stack, when available, is exposed as `remoteStack` rather than replacing the trusted caller's local stack. Argument validation and structured-clone failures are thrown synchronously; execution failures reject the returned promise.
+Errors originating from execution use this class and have a machine-readable `code`. A remote stack, when available, is exposed as `remoteStack` rather than replacing the trusted caller's local stack. Guest frames use stable virtual filenames and wrapper-adjusted coordinates, but `remoteStack` remains guest-influenced, untrusted diagnostic text and must never be used for authorization or provenance. Argument validation and structured-clone failures are thrown synchronously; execution failures reject the returned promise.
 
 ## Security notes
 
@@ -202,6 +236,8 @@ Errors originating from execution use this class and have a machine-readable `co
 ## Development
 
 ```sh
+npm ci
 npm test
 npm run test:coverage
+npm run test:types
 ```

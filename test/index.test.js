@@ -2,10 +2,67 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
 import {
+  createRunner,
   runUntrustedCode,
   sanitizeEnvironment,
   UntrustedCodeError
 } from '../src/index.js'
+
+test('createRunner snapshots reusable defaults and applies per-run overrides', async () => {
+  const defaults = {
+    timeoutMs: 5_000,
+    environment: { PUBLIC_VALUE: 'initial' },
+    resourceLimits: { stackSizeMb: 4 },
+    hostFunctions: {
+      tools: { value: () => 40 }
+    }
+  }
+  const run = createRunner(defaults)
+  defaults.environment.PUBLIC_VALUE = 'mutated'
+  defaults.hostFunctions.tools.value = () => 0
+
+  assert.equal(await run('return (await tools.value()) + input', { input: 2 }), 42)
+  assert.equal(await run('return process.env.PUBLIC_VALUE'), 'initial')
+  assert.equal(await run('return process.env.PUBLIC_VALUE', {
+    environment: { PUBLIC_VALUE: 'override' }
+  }), 'override')
+  assert.equal('ready' in run, false)
+  assert.equal('request' in run, false)
+  assert.equal('terminate' in run, false)
+})
+
+test('createRunner validates defaults and keeps input and signals per-run', async () => {
+  assert.throws(() => createRunner(null), /must be an object/)
+  assert.throws(() => createRunner({ input: 1 }), /supplied per run/)
+  assert.throws(() => createRunner({ signal: new AbortController().signal }), /supplied per run/)
+  assert.throws(() => createRunner({ timeoutMs: 0 }), /positive integer/)
+  assert.throws(() => createRunner({ maxMessageBytes: 127 }), /at least 128/)
+  assert.throws(() => createRunner({ unknown: true }), /Unknown runner default/)
+  assert.throws(
+    () => createRunner({ hostFunctions: { process: { value: () => 1 } } }),
+    /Reserved host function namespace/
+  )
+
+  let reads = 0
+  const defaults = {}
+  Object.defineProperty(defaults, 'timeoutMs', {
+    enumerable: true,
+    get () {
+      reads++
+      return 5_000
+    }
+  })
+  assert.throws(() => createRunner(defaults), /data property/)
+  assert.equal(reads, 0)
+
+  const run = createRunner({ timeoutMs: 5_000 })
+  const controller = new AbortController()
+  controller.abort('test')
+  await assert.rejects(
+    run('return input', { input: 42, signal: controller.signal }),
+    (error) => error.name === 'AbortError'
+  )
+})
 
 test('returns a structured-cloneable result', async () => {
   const result = await runUntrustedCode('return { total: input.left + input.right }', {
@@ -31,7 +88,7 @@ test('preserves the one-shot source binding contract', async () => {
       postToHost: typeof postToHost,
       protocolSecret: typeof protocolSecret
     }
-  `), {
+  `, { timeoutMs: 5_000 }), {
     send: 1,
     onMessage: 2,
     host: 3,
@@ -72,7 +129,28 @@ test('starts with a minimal explicit environment', async () => {
   }
 })
 
-test('normalizes one-shot worker options only once', async () => {
+test('ignores inherited one-shot capabilities and limits', async () => {
+  let calls = 0
+  const options = Object.create({
+    hostFunctions: {
+      secrets: {
+        read () {
+          calls++
+          return 'secret'
+        }
+      }
+    },
+    maxHostFunctionCalls: Number.MAX_SAFE_INTEGER,
+    maxOutputMessages: Number.MAX_SAFE_INTEGER,
+    timeoutMs: 0
+  })
+  options.timeoutMs = 5_000
+
+  assert.equal(await runUntrustedCode('return typeof secrets', options), 'undefined')
+  assert.equal(calls, 0)
+})
+
+test('does not invoke accessors in nested one-shot worker options', () => {
   let environmentReads = 0
   let resourceLimitReads = 0
   const environment = {}
@@ -92,13 +170,16 @@ test('normalizes one-shot worker options only once', async () => {
     }
   })
 
-  assert.equal(await runUntrustedCode('return process.env.PUBLIC_VALUE', {
-    environment,
-    resourceLimits,
-    timeoutMs: 5_000
-  }), 'visible')
-  assert.equal(environmentReads, 1)
-  assert.equal(resourceLimitReads, 1)
+  assert.throws(
+    () => runUntrustedCode('return 42', { environment }),
+    /enumerable data property/
+  )
+  assert.throws(
+    () => runUntrustedCode('return 42', { resourceLimits }),
+    /enumerable data property/
+  )
+  assert.equal(environmentReads, 0)
+  assert.equal(resourceLimitReads, 0)
 })
 
 test('rejects environment variables that can alter the runtime', () => {
@@ -296,11 +377,60 @@ test('rejects every supported shared-memory representation in input and output',
   }
 })
 
+test('one-shot runtime errors use stable source coordinates without bootstrap frames', async () => {
+  await assert.rejects(
+    runUntrustedCode(`const value = 1
+//# sourceURL=hostile.js
+throw new Error('located')`, { timeoutMs: 5_000 }),
+    (error) => {
+      assert.equal(error.remoteStack, [
+        'Error: located',
+        '    at eval (secure-eval-worker-one-shot.js:3:7)'
+      ].join('\n'))
+      assert.doesNotMatch(error.remoteStack, /worker eval|trustedBootstrap|hostile\.js/)
+      return true
+    }
+  )
+})
+
+test('remote stacks remain bounded sanitized untrusted diagnostics', async () => {
+  await assert.rejects(
+    runUntrustedCode(`
+      const error = new Error('real')
+      error.stack = 'Error: forged\\n    at fake (secure-eval-worker-one-shot.js:100:1)\\u001b[31m'
+      throw error
+    `, { timeoutMs: 5_000 }),
+    (error) => {
+      assert.match(error.remoteStack, /secure-eval-worker-one-shot\.js:97:1/)
+      assert.equal(error.remoteStack.includes('\\u001b[31m'), true)
+      assert.doesNotMatch(error.remoteStack, /\u001b/)
+      return true
+    }
+  )
+})
+
+test('JavaScript syntax that is valid TypeScript still receives exact coordinates', async () => {
+  await assert.rejects(
+    runUntrustedCode('const value: number = 42', { timeoutMs: 5_000 }),
+    (error) => {
+      assert.match(
+        error.remoteStack,
+        /secure-eval-worker-one-shot\.syntax\.js:1:12/
+      )
+      return true
+    }
+  )
+})
+
 test('reports syntax, runtime, and clone errors', async (t) => {
   await t.test('syntax error', async () => {
     await assert.rejects(
-      runUntrustedCode('return }', { timeoutMs: 5_000 }),
-      /SyntaxError/
+      runUntrustedCode('const value = ;', { timeoutMs: 5_000 }),
+      (error) => {
+        assert.match(error.message, /SyntaxError/)
+        assert.match(error.remoteStack, /secure-eval-worker-one-shot\.syntax\.js:1/)
+        return true
+      }
     )
   })
 

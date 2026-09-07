@@ -26,6 +26,8 @@ const arrayBufferByteLength = Object.getOwnPropertyDescriptor(ArrayBuffer.protot
 const dateTime = Date.prototype.getTime
 const regexpSource = Object.getOwnPropertyDescriptor(RegExp.prototype, 'source').get
 const objectGetPrototypeOf = Object.getPrototypeOf
+const objectGetOwnPropertyDescriptors = Object.getOwnPropertyDescriptors
+const objectHasOwn = Object.hasOwn
 const objectPrototype = Object.prototype
 const sharedByteLength = typeof SharedArrayBuffer === 'undefined'
   ? undefined
@@ -79,7 +81,16 @@ export function sanitizeEnvironment (environment = {}) {
   }
 
   const sanitized = Object.create(null)
-  for (const [name, value] of Object.entries(environment)) {
+  const descriptors = reflectApply(objectGetOwnPropertyDescriptors, Object, [environment])
+  for (const name of reflectOwnKeys(environment)) {
+    if (typeof name === 'symbol') {
+      throw new TypeError('environment must not contain symbol properties')
+    }
+    const descriptor = descriptors[name]
+    if (!descriptor.enumerable || !('value' in descriptor)) {
+      throw new TypeError(`Environment variable ${name} must be an enumerable data property`)
+    }
+    const value = descriptor.value
     if (!ENVIRONMENT_NAME.test(name)) {
       throw new TypeError(`Invalid environment variable name: ${name}`)
     }
@@ -251,20 +262,28 @@ export function validateResourceLimits (limits) {
     throw new TypeError('resourceLimits must be an object')
   }
 
-  const unknown = Object.keys(limits).filter((name) => !(name in DEFAULT_RESOURCE_LIMITS))
-  if (unknown.length > 0) {
-    throw new TypeError(`Unknown resource limit: ${unknown[0]}`)
+  const descriptors = reflectApply(objectGetOwnPropertyDescriptors, Object, [limits])
+  for (const name of reflectOwnKeys(limits)) {
+    if (typeof name === 'symbol') {
+      throw new TypeError('resourceLimits must not contain symbol properties')
+    }
+    if (!reflectApply(objectHasOwn, Object, [DEFAULT_RESOURCE_LIMITS, name])) {
+      throw new TypeError(`Unknown resource limit: ${name}`)
+    }
+    const descriptor = descriptors[name]
+    if (!descriptor.enumerable || !('value' in descriptor)) {
+      throw new TypeError(`resourceLimits.${name} must be an enumerable data property`)
+    }
   }
 
   const result = { ...DEFAULT_RESOURCE_LIMITS }
   for (const name of Object.keys(DEFAULT_RESOURCE_LIMITS)) {
-    const value = limits[name]
-    if (value !== undefined) {
-      if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
-        throw new RangeError(`resourceLimits.${name} must be a positive number`)
-      }
-      result[name] = value
+    if (!reflectApply(objectHasOwn, Object, [descriptors, name])) continue
+    const value = descriptors[name].value
+    if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+      throw new RangeError(`resourceLimits.${name} must be a positive number`)
     }
+    result[name] = value
   }
   return result
 }

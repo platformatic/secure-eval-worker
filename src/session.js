@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { Buffer } from 'node:buffer'
 import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto'
 import { EventEmitter } from 'node:events'
@@ -18,6 +19,7 @@ import {
   validatePositiveInteger,
   validateTimeout
 } from './internal.js'
+import { acquireWorkerSlot } from './admission.js'
 import {
   HostFunctionError,
   invokeHostFunction,
@@ -35,6 +37,9 @@ const MIN_MAX_MESSAGE_BYTES = 128
 const DEFAULT_MAX_INPUT_BYTES = 1024 * 1024
 const DEFAULT_MAX_OUTPUT_MESSAGES = 1024
 const DEFAULT_MAX_OUTPUT_BYTES = 16 * 1024 * 1024
+const DEFAULT_MAX_DIAGNOSTIC_RECORDS = 100
+const DEFAULT_MAX_DIAGNOSTIC_BYTES = 64 * 1024
+const DEFAULT_MAX_DIAGNOSTIC_RECORD_BYTES = 4 * 1024
 const safeArrayBufferIsView = ArrayBuffer.isView
 const hostTypedArrayByteLength = Object.getOwnPropertyDescriptor(
   Object.getPrototypeOf(Uint8Array.prototype),
@@ -42,6 +47,7 @@ const hostTypedArrayByteLength = Object.getOwnPropertyDescriptor(
 ).get
 const hostReflectApply = Reflect.apply
 const sessionSecrets = new WeakMap()
+const diagnosticContextStorage = new AsyncLocalStorage()
 const ONE_SHOT = Symbol('oneShot')
 
 const SESSION_BOOTSTRAP = String.raw`
@@ -77,6 +83,7 @@ const networkAliasBuiltins = [
   require('_tls_wrap')
 ]
 const { deserialize: v8Deserialize, serialize: v8Serialize } = v8Builtin
+const { stripTypeScriptTypes } = moduleBuiltin
 const { MessageChannel, parentPort, workerData } = workerThreadsBuiltin
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor
 const safeStructuredClone = globalThis.structuredClone
@@ -85,6 +92,10 @@ const safeV8Serialize = v8Serialize
 const reflectApply = Reflect.apply
 const SafePromise = Promise
 const SafeError = Error
+const SafeSyntaxError = SyntaxError
+const SafeString = String
+const SafeNumber = Number
+const numberIsSafeInteger = Number.isSafeInteger
 const promiseThen = Promise.prototype.then
 const promiseCatch = Promise.prototype.catch
 const safeSetInterval = globalThis.setInterval
@@ -127,8 +138,15 @@ const objectDefineProperty = Object.defineProperty
 const objectFreeze = Object.freeze
 const objectGetPrototypeOf = Object.getPrototypeOf
 const objectGetOwnPropertyDescriptors = Object.getOwnPropertyDescriptors
+const objectHasOwn = Object.hasOwn
 const objectPrototype = Object.prototype
 const stringSlice = String.prototype.slice
+const stringSplit = String.prototype.split
+const stringIndexOf = String.prototype.indexOf
+const stringCharCodeAt = String.prototype.charCodeAt
+const stringPadStart = String.prototype.padStart
+const numberToString = Number.prototype.toString
+const bufferByteLength = Buffer.byteLength
 
 let port
 let rawPostToHost
@@ -137,6 +155,13 @@ let protocolSecret
 let inboundSequence = 0
 let outboundSequence = 0
 let keepAlive
+let diagnosticPort
+let rawPostDiagnostic
+let closeDiagnosticPort
+let diagnosticSecret
+let diagnosticSequence = 0
+let diagnosticRecords = 0
+let diagnosticBytes = 0
 let handler
 let processing = SafePromise.resolve()
 let nextHostCallId = 1
@@ -199,6 +224,75 @@ function denyFunctions(target, prefix) {
       })
     }
   }
+}
+
+function sanitizeDiagnosticText(value) {
+  const source = reflectApply(stringSlice, SafeString(value), [0, 2_048])
+  let result = ''
+  for (let index = 0; index < source.length; index++) {
+    const code = reflectApply(stringCharCodeAt, source, [index])
+    if (code < 0x20 || (code >= 0x7f && code <= 0x9f) || code === 0x2028 ||
+        code === 0x2029 || (code >= 0x202a && code <= 0x202e) ||
+        (code >= 0x2066 && code <= 0x2069)) {
+      const hexadecimal = reflectApply(numberToString, code, [16])
+      result += '\\u' + reflectApply(stringPadStart, hexadecimal, [4, '0'])
+    } else {
+      result += source[index]
+    }
+  }
+  return result
+}
+
+function formatDiagnosticValue(value) {
+  if (value === null) return 'null'
+  const kind = typeof value
+  if (kind === 'string') return sanitizeDiagnosticText(value)
+  if (kind === 'undefined' || kind === 'boolean' || kind === 'number' || kind === 'bigint') {
+    return sanitizeDiagnosticText(value)
+  }
+  if (kind === 'symbol') return '[Symbol]'
+  if (kind === 'function') return '[Function]'
+  try {
+    if (reflectApply(arrayIsArray, Array, [value])) return '[Array]'
+    if (reflectApply(arrayBufferIsView, ArrayBuffer, [value])) return '[ArrayBufferView]'
+  } catch {
+    return '[Uninspectable]'
+  }
+  try {
+    reflectApply(dateTime, value, [])
+    return '[Date]'
+  } catch {}
+  try {
+    reflectApply(regexpSource, value, [])
+    return '[RegExp]'
+  } catch {}
+  return '[Object]'
+}
+
+function postDiagnostic(level, values) {
+  if (!rawPostDiagnostic || diagnosticRecords >= workerData.diagnostics.maxRecords) return
+  let text = ''
+  for (let index = 0; index < values.length; index++) {
+    if (index > 0) text += ' '
+    text += formatDiagnosticValue(values[index])
+    if (text.length > 2_048) {
+      text = reflectApply(stringSlice, text, [0, 2_048])
+      break
+    }
+  }
+  const record = { level, text }
+  const serialized = safeV8Serialize(record)
+  const byteLength = reflectApply(typedArrayByteLength, serialized, [])
+  if (byteLength > workerData.diagnostics.maxRecordBytes ||
+      diagnosticBytes + byteLength > workerData.diagnostics.maxBytes) return
+  diagnosticRecords++
+  diagnosticBytes += byteLength
+  const sequence = ++diagnosticSequence
+  rawPostDiagnostic({
+    sequence,
+    payload: serialized,
+    mac: protocolMac('worker-diagnostic-to-host', sequence, serialized, diagnosticSecret)
+  })
 }
 
 function hardenDangerousBuiltins() {
@@ -311,7 +405,10 @@ function hardenDangerousBuiltins() {
   }
   replaceProperty(processBuiltin, '_rawDebug', () => {})
   for (const name of ['assert', 'debug', 'dir', 'error', 'info', 'log', 'table', 'trace', 'warn']) {
-    replaceProperty(globalThis.console, name, () => {})
+    const replacement = workerData.diagnostics.enabled
+      ? (...values) => postDiagnostic(name, values)
+      : () => {}
+    replaceProperty(globalThis.console, name, replacement)
   }
 
   // Update named ESM exports to the hardened CommonJS export values. Calling
@@ -470,18 +567,25 @@ function reportFatal(error) {
       })
     } catch {
       closePort()
+      if (closeDiagnosticPort) closeDiagnosticPort()
     }
   }
 }
 
-function protocolMac(direction, sequence, serialized) {
-  const hmac = createHmac('sha256', protocolSecret)
+function protocolMac(direction, sequence, serialized, secret = protocolSecret) {
+  const hmac = createHmac('sha256', secret)
   reflectApply(hmacUpdate, hmac, [direction + '\0' + String(sequence) + '\0'])
   reflectApply(hmacUpdate, hmac, [serialized])
   return reflectApply(hmacDigest, hmac, ['base64'])
 }
 
 function postToHost(body, countAgainstOutput = false) {
+  if (!reflectApply(objectHasOwn, Object, [body, 'diagnosticSequence'])) {
+    objectDefineProperty(body, 'diagnosticSequence', {
+      value: diagnosticSequence,
+      enumerable: true
+    })
+  }
   const serialized = serializeProtocolBody(body)
   const byteLength = reflectApply(typedArrayByteLength, serialized, [])
   if (countAgainstOutput) {
@@ -525,13 +629,61 @@ function limitedString(value, fallback) {
   return reflectApply(stringSlice, value, [0, 8_192])
 }
 
+function normalizedGuestStack(stack, name, message) {
+  if (typeof stack !== 'string') return undefined
+  const lines = reflectApply(stringSplit, reflectApply(stringSlice, stack, [0, 8_192]), ['\n'])
+  const markers = [
+    ['secure-eval-worker-one-shot.js:', 3],
+    ['secure-eval-worker-component.js:', 3],
+    ['secure-eval-worker-component.mjs:', 0],
+    ['secure-eval-worker-one-shot.ts:', 1],
+    ['secure-eval-worker-component.ts:', 1],
+    ['secure-eval-worker-component.mts:', 0],
+    ['secure-eval-worker-one-shot.syntax.js:', 1],
+    ['secure-eval-worker-component.syntax.js:', 1],
+    ['secure-eval-worker-component.syntax.mjs:', 0]
+  ]
+  let result = sanitizeDiagnosticText(name) + ': ' + sanitizeDiagnosticText(message)
+  for (let index = 0; index < lines.length; index++) {
+    let line = lines[index]
+    let selectedMarker
+    let markerIndex = -1
+    for (let markerOffset = 0; markerOffset < markers.length; markerOffset++) {
+      const candidate = markers[markerOffset]
+      const candidateIndex = reflectApply(stringIndexOf, line, [candidate[0]])
+      if (candidateIndex >= 0) {
+        selectedMarker = candidate
+        markerIndex = candidateIndex
+        break
+      }
+    }
+    if (!selectedMarker) continue
+    const lineStart = markerIndex + selectedMarker[0].length
+    const separatorIndex = reflectApply(stringIndexOf, line, [':', lineStart])
+    const lineEnd = separatorIndex < 0 ? line.length : separatorIndex
+    if (selectedMarker[1] > 0 && lineEnd > lineStart) {
+      const sourceLine = SafeNumber(reflectApply(stringSlice, line, [lineStart, lineEnd]))
+      if (reflectApply(numberIsSafeInteger, SafeNumber, [sourceLine]) &&
+          sourceLine > selectedMarker[1]) {
+        line = reflectApply(stringSlice, line, [0, lineStart]) +
+          SafeString(sourceLine - selectedMarker[1]) +
+          reflectApply(stringSlice, line, [lineEnd])
+      }
+    }
+    result += '\n' + sanitizeDiagnosticText(line)
+  }
+  return result
+}
+
 function cloneError(error) {
   try {
     if (error instanceof Error) {
+      const name = limitedString(error.name, 'Error')
+      const message = limitedString(error.message, 'Untrusted component failed')
       return {
-        name: limitedString(error.name, 'Error'),
-        message: limitedString(error.message, 'Untrusted component failed'),
-        stack: limitedString(error.stack, undefined),
+        name,
+        message,
+        stack: normalizedGuestStack(error.stack, name, message),
         code: limitedString(error.code, undefined)
       }
     }
@@ -542,6 +694,92 @@ function cloneError(error) {
   } catch {
     return { name: 'Error', message: 'Untrusted component failed' }
   }
+}
+
+function stripGuestTypeScript(source, sourceUrl) {
+  try {
+    return stripTypeScriptTypes(source, { mode: 'strip' })
+  } catch {
+    // Reparse only failing input with a trusted virtual name so Node includes
+    // useful source coordinates in the thrown parser error.
+    return stripTypeScriptTypes(source, { mode: 'strip', sourceUrl })
+  }
+}
+
+function locateJavaScriptSyntaxError(source, originalError) {
+  let candidate = source
+  let sourceUrl = 'secure-eval-worker-component.syntax.mjs'
+  if (workerData.type === 'script') {
+    const prefix = workerData.oneShot
+      ? 'async function __secureEval(input) {\n'
+      : 'async function __secureEval(input, send, onMessage, host) {\n'
+    candidate = prefix + source + '\n}'
+    sourceUrl = workerData.oneShot
+      ? 'secure-eval-worker-one-shot.syntax.js'
+      : 'secure-eval-worker-component.syntax.js'
+  }
+  let transformed
+  try {
+    transformed = stripTypeScriptTypes(candidate, { mode: 'strip' })
+  } catch {
+    // Reparse only failing input with a trusted virtual name so Node includes
+    // useful source coordinates in the thrown parser error.
+    stripTypeScriptTypes(candidate, { mode: 'strip', sourceUrl })
+  }
+
+  let difference = -1
+  const length = candidate.length < transformed.length ? candidate.length : transformed.length
+  for (let index = 0; index < length; index++) {
+    if (candidate[index] !== transformed[index]) {
+      difference = index
+      break
+    }
+  }
+  if (difference < 0 && candidate.length !== transformed.length) difference = length
+  if (difference < 0) return
+
+  let line = 1
+  let column = 1
+  for (let index = 0; index < difference; index++) {
+    if (reflectApply(stringCharCodeAt, candidate, [index]) === 10) {
+      line++
+      column = 1
+    } else {
+      column++
+    }
+  }
+  objectDefineProperty(originalError, 'stack', {
+    value: limitedString(originalError.name, 'SyntaxError') + ': ' +
+      limitedString(originalError.message, 'Invalid JavaScript syntax') + '\n' +
+      '    at ' + sourceUrl + ':' + line + ':' + column,
+    configurable: true
+  })
+}
+
+function prepareGuestSource() {
+  if (workerData.language === 'javascript') return workerData.source
+
+  let transformed
+  if (workerData.type === 'script') {
+    const prefix = workerData.oneShot
+      ? 'async function __secureEval(input) {\n'
+      : 'async function __secureEval(input, send, onMessage, host) {\n'
+    const suffix = '\n}'
+    const sourceUrl = workerData.oneShot
+      ? 'secure-eval-worker-one-shot.ts'
+      : 'secure-eval-worker-component.ts'
+    const wrapped = stripGuestTypeScript(prefix + workerData.source + suffix, sourceUrl)
+    transformed = reflectApply(stringSlice, wrapped, [prefix.length, wrapped.length - suffix.length])
+  } else {
+    transformed = stripGuestTypeScript(
+      workerData.source,
+      'secure-eval-worker-component.mts'
+    )
+  }
+  if (bufferByteLength(transformed, 'utf8') > workerData.maxSourceBytes) {
+    throw new RangeError('Transformed source exceeds maxSourceBytes (' + workerData.maxSourceBytes + ')')
+  }
+  return transformed
 }
 
 function send(value) {
@@ -619,6 +857,7 @@ async function dispatch(envelope) {
   if (envelope.type === 'terminate') {
     safeClearInterval(keepAlive)
     closePort()
+    if (closeDiagnosticPort) closeDiagnosticPort()
     return
   }
   if (envelope.type !== 'message' && envelope.type !== 'request') {
@@ -673,11 +912,24 @@ async function initialize() {
     portPrototype = objectGetPrototypeOf(portPrototype)
   }
   protocolSecret = randomBytes(32).toString('base64')
-  parentPort.postMessage({
+  const handshake = {
     type: 'session-port',
     port: channel.port2,
     protocolSecret
-  }, [channel.port2])
+  }
+  const transferList = [channel.port2]
+  if (workerData.diagnostics.enabled) {
+    const diagnosticChannel = new MessageChannel()
+    diagnosticPort = diagnosticChannel.port1
+    rawPostDiagnostic = diagnosticPort.postMessage.bind(diagnosticPort)
+    closeDiagnosticPort = diagnosticPort.close.bind(diagnosticPort)
+    diagnosticSecret = randomBytes(32).toString('base64')
+    diagnosticPort.unref()
+    handshake.diagnosticPort = diagnosticChannel.port2
+    handshake.diagnosticSecret = diagnosticSecret
+    transferList.push(diagnosticChannel.port2)
+  }
+  parentPort.postMessage(handshake, transferList)
   parentPort.close()
   hardenDangerousBuiltins()
 
@@ -713,26 +965,47 @@ async function initialize() {
   keepAlive = safeSetInterval(() => {}, 2_147_483_647)
   const host = createHostFunctions()
 
+  const guestSource = prepareGuestSource()
   let setupResult
   if (workerData.type === 'script') {
-    const execute = workerData.oneShot
-      ? new AsyncFunction('input', '"use strict";\n' + workerData.source)
-      : new AsyncFunction(
-          'input',
-          'send',
-          'onMessage',
-          'host',
-          '"use strict";\n' + workerData.source
-        )
+    const sourceName = workerData.oneShot
+      ? 'secure-eval-worker-one-shot.js'
+      : 'secure-eval-worker-component.js'
+    const executableSource = '"use strict";\n' + guestSource + '\n//# sourceURL=' + sourceName
+    let execute
+    try {
+      execute = workerData.oneShot
+        ? new AsyncFunction('input', executableSource)
+        : new AsyncFunction(
+            'input',
+            'send',
+            'onMessage',
+            'host',
+            executableSource
+          )
+    } catch (error) {
+      if (workerData.language === 'javascript' && error instanceof SafeSyntaxError) {
+        locateJavaScriptSyntaxError(guestSource, error)
+      }
+      throw error
+    }
     setupResult = workerData.oneShot
       ? await execute(workerData.input)
       : await execute(workerData.input, send, onMessage, host)
   } else {
     const encoded = Buffer.from(
-      workerData.source + '\n//# sourceURL=secure-eval-worker-component.mjs\n',
+      guestSource + '\n//# sourceURL=secure-eval-worker-component.mjs\n',
       'utf8'
     ).toString('base64')
-    const component = await import('data:text/javascript;base64,' + encoded)
+    let component
+    try {
+      component = await import('data:text/javascript;base64,' + encoded)
+    } catch (error) {
+      if (workerData.language === 'javascript' && error instanceof SafeSyntaxError) {
+        locateJavaScriptSyntaxError(guestSource, error)
+      }
+      throw error
+    }
     if (typeof component.default !== 'function') {
       throw new TypeError('The module default export must be a setup function')
     }
@@ -775,10 +1048,15 @@ export class UntrustedWorkerSession extends EventEmitter {
     if (options === null || typeof options !== 'object' || Array.isArray(options)) {
       throw new TypeError('options must be an object')
     }
+    options = snapshotSessionOptions(options)
 
     const type = options.type ?? 'script'
     if (type !== 'script' && type !== 'module') {
       throw new TypeError("type must be 'script' or 'module'")
+    }
+    const language = options.language ?? 'javascript'
+    if (language !== 'javascript' && language !== 'typescript') {
+      throw new TypeError("language must be 'javascript' or 'typescript'")
     }
 
     const maxSourceBytes = options.maxSourceBytes ?? DEFAULT_MAX_SOURCE_BYTES
@@ -791,6 +1069,15 @@ export class UntrustedWorkerSession extends EventEmitter {
     this.maxInputBytes = options.maxInputBytes ?? DEFAULT_MAX_INPUT_BYTES
     this.maxOutputMessages = options.maxOutputMessages ?? DEFAULT_MAX_OUTPUT_MESSAGES
     this.maxOutputBytes = options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES
+    const onDiagnostic = options.onDiagnostic
+    this.diagnostics = validateDiagnostics(options.diagnostics, onDiagnostic)
+    this.onDiagnostic = onDiagnostic
+    this.diagnosticRecords = 0
+    this.diagnosticBytes = 0
+    this.diagnosticSequence = 0
+    this.diagnosticsHandledSequence = 0
+    this.deferredDiagnosticEnvelopes = []
+    this.diagnosticProcessing = Promise.resolve()
     validateSource(source, maxSourceBytes)
     validateTimeout(startupTimeoutMs, 'startupTimeoutMs')
     validateTimeout(this.messageTimeoutMs, 'messageTimeoutMs')
@@ -832,7 +1119,10 @@ export class UntrustedWorkerSession extends EventEmitter {
       worker: undefined,
       port: undefined,
       protocolSecret: undefined,
-      rawPortPost: undefined
+      rawPortPost: undefined,
+      diagnosticPort: undefined,
+      diagnosticSecret: undefined,
+      releaseWorkerSlot: undefined
     })
     this.pending = new Map()
     this.outbound = []
@@ -859,6 +1149,17 @@ export class UntrustedWorkerSession extends EventEmitter {
 
     if (signal) signal.addEventListener('abort', this.onAbort, { once: true })
 
+    let releaseWorkerSlot
+    try {
+      releaseWorkerSlot = acquireWorkerSlot()
+    } catch (error) {
+      if (signal) signal.removeEventListener('abort', this.onAbort)
+      this.resolveClosed({ code: undefined, error })
+      this.state = 'closed'
+      throw error
+    }
+    sessionSecrets.get(this).releaseWorkerSlot = releaseWorkerSlot
+
     try {
       sessionSecrets.get(this).worker = new Worker(SESSION_BOOTSTRAP, {
         eval: true,
@@ -866,24 +1167,29 @@ export class UntrustedWorkerSession extends EventEmitter {
         execArgv: [
           '--permission',
           '--allow-worker',
-          '--disable-warning=PERM0006'
+          '--disable-warning=PERM0006',
+          '--disable-warning=DEP0192'
         ],
         resourceLimits,
         workerData: {
           source,
           type,
+          language,
           oneShot: options[ONE_SHOT] === true,
           input,
+          maxSourceBytes,
           hostFunctionManifest: hostFunctionConfiguration.manifest,
           maxMessageBytes: this.maxMessageBytes,
           maxOutputMessages: this.maxOutputMessages,
-          maxOutputBytes: this.maxOutputBytes
+          maxOutputBytes: this.maxOutputBytes,
+          diagnostics: this.diagnostics
         },
         name: 'secure-eval-worker-session',
         stdout: true,
         stderr: true
       })
     } catch (error) {
+      releaseWorkerSlot()
       if (signal) signal.removeEventListener('abort', this.onAbort)
       this.resolveClosed({ code: undefined, error })
       this.state = 'closed'
@@ -891,6 +1197,10 @@ export class UntrustedWorkerSession extends EventEmitter {
     }
 
     const worker = sessionSecrets.get(this).worker
+    worker.once('exit', (code) => {
+      releaseWorkerSlot()
+      this.handleExit(code)
+    })
     worker.stdout.resume()
     worker.stderr.resume()
     worker.on('message', (message) => this.handleHandshake(message))
@@ -903,7 +1213,6 @@ export class UntrustedWorkerSession extends EventEmitter {
     worker.once('error', (error) => {
       this.fail(sessionError('The worker failed', 'ERR_UNTRUSTED_WORKER', error))
     })
-    worker.once('exit', (code) => this.handleExit(code))
 
     const startupDelay = startupTimeoutMs - (Date.now() - startedAt)
     if (startupDelay <= 0) {
@@ -942,9 +1251,17 @@ export class UntrustedWorkerSession extends EventEmitter {
         'ERR_UNTRUSTED_WORKER_REENTRANT_REQUEST'
       )
     }
+    const diagnosticStore = diagnosticContextStorage.getStore()
+    if (diagnosticStore?.active && diagnosticStore.session === this) {
+      throw sessionError(
+        'Diagnostic callbacks cannot make reentrant requests to their own session',
+        'ERR_UNTRUSTED_WORKER_REENTRANT_DIAGNOSTIC'
+      )
+    }
     if (options === null || typeof options !== 'object' || Array.isArray(options)) {
       throw new TypeError('request options must be an object')
     }
+    options = snapshotSessionOptions(options)
     const timeoutMs = options.timeoutMs ?? this.messageTimeoutMs
     validateTimeout(timeoutMs, 'timeoutMs')
     const deadline = Date.now() + timeoutMs
@@ -998,6 +1315,7 @@ export class UntrustedWorkerSession extends EventEmitter {
       clearTimeout(this.startupTimer)
       clearTimeout(this.lifetimeTimer)
       sessionSecrets.get(this).port?.close()
+      sessionSecrets.get(this).diagnosticPort?.close()
     }
     const worker = sessionSecrets.get(this).worker
     this.termination = worker ? worker.terminate() : Promise.resolve(undefined)
@@ -1014,8 +1332,13 @@ export class UntrustedWorkerSession extends EventEmitter {
       this.fail(remoteError(message.error, 'ERR_UNTRUSTED_WORKER_BOOTSTRAP'))
       return
     }
+    const validDiagnosticHandshake = this.diagnostics.enabled
+      ? message?.diagnosticPort instanceof MessagePort &&
+        typeof message.diagnosticSecret === 'string' && message.diagnosticSecret.length >= 32
+      : message?.diagnosticPort === undefined && message?.diagnosticSecret === undefined
     if (message?.type !== 'session-port' || !(message.port instanceof MessagePort) ||
-        typeof message.protocolSecret !== 'string' || message.protocolSecret.length < 32) {
+        typeof message.protocolSecret !== 'string' || message.protocolSecret.length < 32 ||
+        !validDiagnosticHandshake) {
       this.fail(sessionError('Invalid worker handshake', 'ERR_UNTRUSTED_WORKER_PROTOCOL'))
       return
     }
@@ -1023,6 +1346,31 @@ export class UntrustedWorkerSession extends EventEmitter {
     secrets.port = message.port
     secrets.protocolSecret = message.protocolSecret
     secrets.rawPortPost = secrets.port.postMessage.bind(secrets.port)
+    if (this.diagnostics.enabled) {
+      secrets.diagnosticPort = message.diagnosticPort
+      secrets.diagnosticSecret = message.diagnosticSecret
+      secrets.diagnosticPort.on('message', (message) => {
+        let record
+        let sequence
+        try {
+          record = this.authenticateDiagnostic(message)
+          sequence = this.diagnosticSequence
+        } catch (error) {
+          this.fail(error)
+          return
+        }
+        this.diagnosticProcessing = this.diagnosticProcessing
+          .then(() => this.handleDiagnostic(record, sequence))
+          .catch((error) => this.fail(error))
+      })
+      secrets.diagnosticPort.on('messageerror', () => {
+        this.fail(sessionError(
+          'The worker diagnostic message could not be deserialized',
+          'ERR_UNTRUSTED_WORKER_DIAGNOSTIC_PROTOCOL'
+        ))
+      })
+      secrets.diagnosticPort.start()
+    }
     secrets.worker.removeAllListeners('message')
     secrets.port.on('message', (message) => {
       try {
@@ -1085,10 +1433,104 @@ export class UntrustedWorkerSession extends EventEmitter {
     return body
   }
 
-  handleMessage (envelope) {
+  authenticateDiagnostic (message) {
+    if (message === null || typeof message !== 'object' ||
+        !Number.isSafeInteger(message.sequence) ||
+        message.sequence !== this.diagnosticSequence + 1 ||
+        message.payload === null || typeof message.payload !== 'object' ||
+        !hostReflectApply(safeArrayBufferIsView, ArrayBuffer, [message.payload]) ||
+        typeof message.mac !== 'string') {
+      throw sessionError(
+        'Unauthenticated worker diagnostic message',
+        'ERR_UNTRUSTED_WORKER_DIAGNOSTIC_PROTOCOL'
+      )
+    }
+    assertNoSharedMemory(message.payload, 'diagnostic payload')
+    const byteLength = hostReflectApply(hostTypedArrayByteLength, message.payload, [])
+    if (byteLength > this.diagnostics.maxRecordBytes ||
+        this.diagnosticRecords >= this.diagnostics.maxRecords ||
+        this.diagnosticBytes + byteLength > this.diagnostics.maxBytes) {
+      throw sessionError(
+        'Worker diagnostic limit exceeded',
+        'ERR_UNTRUSTED_WORKER_DIAGNOSTIC_PROTOCOL'
+      )
+    }
+    const expected = Buffer.from(protocolMac(
+      sessionSecrets.get(this).diagnosticSecret,
+      'worker-diagnostic-to-host',
+      message.sequence,
+      message.payload
+    ), 'base64')
+    const actual = Buffer.from(message.mac, 'base64')
+    if (expected.length !== actual.length || !timingSafeEqual(expected, actual)) {
+      throw sessionError(
+        'Unauthenticated worker diagnostic message',
+        'ERR_UNTRUSTED_WORKER_DIAGNOSTIC_PROTOCOL'
+      )
+    }
+    let record
+    try {
+      record = v8Deserialize(message.payload)
+    } catch {
+      throw sessionError(
+        'Invalid worker diagnostic payload',
+        'ERR_UNTRUSTED_WORKER_DIAGNOSTIC_PROTOCOL'
+      )
+    }
+    if (record === null || typeof record !== 'object' ||
+        !['assert', 'debug', 'dir', 'error', 'info', 'log', 'table', 'trace', 'warn'].includes(record.level) ||
+        typeof record.text !== 'string' || Reflect.ownKeys(record).length !== 2) {
+      throw sessionError(
+        'Invalid worker diagnostic payload',
+        'ERR_UNTRUSTED_WORKER_DIAGNOSTIC_PROTOCOL'
+      )
+    }
+    this.diagnosticSequence = message.sequence
+    this.diagnosticRecords++
+    this.diagnosticBytes += byteLength
+    return Object.freeze({ level: record.level, text: record.text })
+  }
+
+  async handleDiagnostic (record, sequence) {
     if (this.state === 'closing' || this.state === 'closed') return
-    if (envelope === null || typeof envelope !== 'object' || typeof envelope.type !== 'string') {
+    const store = { active: true, session: this }
+    try {
+      await diagnosticContextStorage.run(store, async () => {
+        if (this.onDiagnostic) await this.onDiagnostic(record)
+        this.emit('diagnostic', record)
+      })
+    } catch (error) {
+      throw sessionError(
+        'The diagnostic callback failed',
+        'ERR_UNTRUSTED_WORKER_DIAGNOSTIC_CALLBACK',
+        error
+      )
+    } finally {
+      store.active = false
+    }
+    this.diagnosticsHandledSequence = sequence
+    while (this.deferredDiagnosticEnvelopes.length > 0 &&
+           this.deferredDiagnosticEnvelopes[0].diagnosticSequence <= sequence) {
+      this.handleMessage(this.deferredDiagnosticEnvelopes.shift(), true)
+      if (this.state === 'closing' || this.state === 'closed') return
+    }
+  }
+
+  handleMessage (envelope, diagnosticsReady = false) {
+    if (this.state === 'closing' || this.state === 'closed') return
+    if (envelope === null || typeof envelope !== 'object' || typeof envelope.type !== 'string' ||
+        !Number.isSafeInteger(envelope.diagnosticSequence) || envelope.diagnosticSequence < 0) {
       this.fail(sessionError('Invalid worker protocol message', 'ERR_UNTRUSTED_WORKER_PROTOCOL'))
+      return
+    }
+    if (!diagnosticsReady &&
+        (this.deferredDiagnosticEnvelopes.length > 0 ||
+         envelope.diagnosticSequence > this.diagnosticsHandledSequence)) {
+      if (!this.diagnostics.enabled && envelope.diagnosticSequence !== 0) {
+        this.fail(sessionError('Invalid worker protocol message', 'ERR_UNTRUSTED_WORKER_PROTOCOL'))
+      } else {
+        this.deferredDiagnosticEnvelopes.push(envelope)
+      }
       return
     }
 
@@ -1254,6 +1696,7 @@ export class UntrustedWorkerSession extends EventEmitter {
     clearTimeout(this.lifetimeTimer)
     this.signal?.removeEventListener('abort', this.onAbort)
     sessionSecrets.get(this).port?.close()
+    sessionSecrets.get(this).diagnosticPort?.close()
 
     let errorToEmit
     if (this.state !== 'closing' && this.state !== 'closed') {
@@ -1369,6 +1812,64 @@ function serializeHostError (error) {
     message: 'Host function failed',
     code: 'ERR_UNTRUSTED_WORKER_HOST_FUNCTION'
   }
+}
+
+function snapshotSessionOptions (options) {
+  const snapshot = Object.create(null)
+  const descriptors = Object.getOwnPropertyDescriptors(options)
+  for (const key of Reflect.ownKeys(options)) {
+    if (typeof key === 'symbol' && key !== ONE_SHOT) {
+      throw new TypeError('options must not contain symbol properties')
+    }
+    const descriptor = descriptors[key]
+    if (!descriptor.enumerable || !('value' in descriptor)) {
+      throw new TypeError(`options.${String(key)} must be an enumerable data property`)
+    }
+    snapshot[key] = descriptor.value
+  }
+  return snapshot
+}
+
+function validateDiagnostics (diagnostics, onDiagnostic) {
+  if (onDiagnostic !== undefined && typeof onDiagnostic !== 'function') {
+    throw new TypeError('onDiagnostic must be a function')
+  }
+  if (diagnostics === false && onDiagnostic !== undefined) {
+    throw new TypeError('onDiagnostic cannot be used when diagnostics is false')
+  }
+  if (diagnostics === undefined || diagnostics === false) {
+    if (onDiagnostic === undefined) return Object.freeze({ enabled: false })
+    diagnostics = true
+  }
+  if (diagnostics !== true &&
+      (diagnostics === null || typeof diagnostics !== 'object' || Array.isArray(diagnostics))) {
+    throw new TypeError('diagnostics must be a boolean or an options object')
+  }
+
+  const values = {
+    maxRecords: DEFAULT_MAX_DIAGNOSTIC_RECORDS,
+    maxBytes: DEFAULT_MAX_DIAGNOSTIC_BYTES,
+    maxRecordBytes: DEFAULT_MAX_DIAGNOSTIC_RECORD_BYTES
+  }
+  if (diagnostics !== true) {
+    const keys = Reflect.ownKeys(diagnostics)
+    if (keys.some((key) => typeof key === 'symbol')) {
+      throw new TypeError('diagnostics must not contain symbol properties')
+    }
+    for (const key of keys) {
+      if (!Object.hasOwn(values, key)) throw new TypeError(`Unknown diagnostics option: ${key}`)
+      const descriptor = Object.getOwnPropertyDescriptor(diagnostics, key)
+      if (!descriptor.enumerable || !('value' in descriptor)) {
+        throw new TypeError(`diagnostics.${key} must be an enumerable data property`)
+      }
+      validatePositiveInteger(descriptor.value, `diagnostics.${key}`)
+      values[key] = descriptor.value
+    }
+  }
+  if (values.maxRecordBytes > values.maxBytes) {
+    throw new RangeError('diagnostics.maxRecordBytes must not exceed diagnostics.maxBytes')
+  }
+  return Object.freeze({ enabled: true, ...values })
 }
 
 function sessionError (message, code, cause) {

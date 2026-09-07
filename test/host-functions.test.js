@@ -4,8 +4,180 @@ import { test } from 'node:test'
 import {
   createUntrustedWorker,
   getHostFunctionContext,
-  HostFunctionError
+  HostFunctionError,
+  runUntrustedCode
 } from '../src/index.js'
+
+test('one-shot source calls synchronous and asynchronous host functions as globals', async () => {
+  const calls = []
+  const value = await runUntrustedCode(`
+    return {
+      sum: await math.add(input.left, input.right),
+      upper: await text.upper(input.label),
+      hostBinding: typeof host
+    }
+  `, {
+    input: { left: 20, right: 22, label: 'hello' },
+    hostFunctions: {
+      math: {
+        add (left, right) {
+          calls.push(['add', left, right])
+          return left + right
+        }
+      },
+      text: {
+        async upper (value) {
+          calls.push(['upper', value])
+          return value.toUpperCase()
+        }
+      }
+    },
+    timeoutMs: 5_000
+  })
+
+  assert.deepEqual(value, { sum: 42, upper: 'HELLO', hostBinding: 'undefined' })
+  assert.deepEqual(calls, [['add', 20, 22], ['upper', 'hello']])
+})
+
+test('one-shot host functions share context, redaction, and public errors', async () => {
+  const contexts = []
+  const value = await runUntrustedCode(`
+    const results = {}
+    for (const name of ['context', 'privateFailure', 'publicFailure']) {
+      try {
+        results[name] = await tools[name]()
+      } catch (error) {
+        results[name] = { name: error.name, message: error.message, code: error.code }
+      }
+    }
+    return results
+  `, {
+    hostFunctions: {
+      tools: {
+        context () {
+          const context = getHostFunctionContext()
+          contexts.push(context)
+          return {
+            requestId: context.requestId,
+            requestIndex: context.requestIndex,
+            hostFunctionName: context.hostFunctionName
+          }
+        },
+        privateFailure () {
+          throw new Error('HOST_PRIVATE_SECRET')
+        },
+        publicFailure () {
+          throw new HostFunctionError('Safe detail', { code: 'SAFE_CODE' })
+        }
+      }
+    },
+    timeoutMs: 5_000
+  })
+
+  assert.equal(contexts.length, 1)
+  assert.equal(value.context.requestIndex, 1)
+  assert.equal(value.context.hostFunctionName, 'tools.context')
+  assert.match(value.context.requestId, /:1$/)
+  assert.deepEqual(value.privateFailure, {
+    name: 'HostFunctionError',
+    message: 'Host function failed',
+    code: 'ERR_UNTRUSTED_WORKER_HOST_FUNCTION'
+  })
+  assert.deepEqual(value.publicFailure, {
+    name: 'HostFunctionError',
+    message: 'Safe detail',
+    code: 'SAFE_CODE'
+  })
+})
+
+test('one-shot host functions enforce call and output limits', async () => {
+  await assert.rejects(
+    runUntrustedCode('await tools.value(); return tools.value()', {
+      hostFunctions: { tools: { value: () => 42 } },
+      maxHostFunctionCalls: 1,
+      timeoutMs: 5_000
+    }),
+    (error) => error.code === 'ERR_UNTRUSTED_CODE_HOST_FUNCTION_LIMIT'
+  )
+
+  let calls = 0
+  await assert.rejects(
+    runUntrustedCode('return Promise.all([tools.value(), tools.value()])', {
+      hostFunctions: {
+        tools: {
+          async value () {
+            calls++
+            await new Promise((resolve) => setTimeout(resolve, 20))
+            return 42
+          }
+        }
+      },
+      maxInFlightHostFunctions: 1,
+      timeoutMs: 5_000
+    }),
+    (error) => error.code === 'ERR_UNTRUSTED_CODE_HOST_FUNCTION_LIMIT'
+  )
+  assert.equal(calls, 1)
+})
+
+test('one-shot cancellation aborts active host-function context and ignores late results', async () => {
+  const controller = new AbortController()
+  let context
+  let resolveHost
+  let resultReads = 0
+  const result = runUntrustedCode('return tools.wait()', {
+    signal: controller.signal,
+    hostFunctions: {
+      tools: {
+        wait () {
+          context = getHostFunctionContext()
+          return new Promise((resolve) => { resolveHost = resolve })
+        }
+      }
+    },
+    timeoutMs: 5_000
+  })
+
+  while (!resolveHost) await new Promise((resolve) => setImmediate(resolve))
+  controller.abort('test')
+  await assert.rejects(result, (error) => error.name === 'AbortError')
+  assert.equal(context.abortSignal.aborted, true)
+  resolveHost({
+    get value () {
+      resultReads++
+      return 42
+    }
+  })
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(resultReads, 0)
+})
+
+test('one-shot host functions reject unsupported boundary values', async () => {
+  let calls = 0
+  await assert.rejects(
+    runUntrustedCode('return tools.echo(new SharedArrayBuffer(8))', {
+      hostFunctions: {
+        tools: {
+          echo: (value) => {
+            calls++
+            return value
+          }
+        }
+      },
+      timeoutMs: 5_000
+    }),
+    /shared memory/
+  )
+  assert.equal(calls, 0)
+
+  await assert.rejects(
+    runUntrustedCode('return tools.value()', {
+      hostFunctions: { tools: { value: () => new Blob(['secret']) } },
+      timeoutMs: 5_000
+    }),
+    /HostFunctionError|Host function failed/
+  )
+})
 
 for (const type of ['script', 'module']) {
   test(`${type} components call asynchronous host functions as globals`, async () => {

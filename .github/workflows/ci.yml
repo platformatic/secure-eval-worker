@@ -34,8 +34,14 @@ jobs:
         with:
           node-version: ${{ matrix.node-version }}
 
+      - name: Install development dependencies
+        run: npm ci
+
       - name: Test
         run: npm test
+
+      - name: Verify published TypeScript declarations
+        run: npm run test:types
 
       - name: Verify package contents
         run: |
@@ -49,8 +55,16 @@ jobs:
           const expected = [
             'LICENSE',
             'README.md',
+            'docs/deferred-capabilities.md',
+            'docs/error-values.md',
+            'docs/module-dependencies.md',
+            'docs/one-shot-pooling.md',
+            'docs/vercel-labs-run-comparison.md',
+            'docs/worker-admission.md',
             'package.json',
+            'src/admission.js',
             'src/host-functions.js',
+            'src/index.d.ts',
             'src/index.js',
             'src/internal.js',
             'src/session.js'

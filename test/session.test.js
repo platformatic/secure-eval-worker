@@ -365,21 +365,46 @@ for (const type of ['script', 'module']) {
   })
 }
 
+test('persistent runtime errors use stable guest filenames without bootstrap frames', async () => {
+  for (const [type, source, expected] of [
+    ['script', `const value = 1
+throw new Error('script location')`, /secure-eval-worker-component\.js:2:7/],
+    ['module', `const value = 1
+throw new Error('module location')`, /secure-eval-worker-component\.mjs:2:7/]
+  ]) {
+    const session = createUntrustedWorker(source, {
+      type,
+      startupTimeoutMs: 5_000,
+      lifetimeTimeoutMs: 5_000
+    })
+    await assert.rejects(session.ready, (error) => {
+      assert.match(error.remoteStack, expected)
+      assert.doesNotMatch(error.remoteStack, /worker eval|trustedBootstrap|data:text/)
+      return true
+    })
+    await session.closed
+  }
+})
+
 test('module and script startup errors reject ready', async (t) => {
   const cases = [
-    ['script syntax', 'return }', 'script', /SyntaxError/],
-    ['module syntax', 'export default {', 'module', /SyntaxError/],
-    ['module contract', 'export default 42', 'module', /default export must be a setup function/]
+    ['script syntax', 'const value = ;', 'script', /SyntaxError/, /secure-eval-worker-component\.syntax\.js:1/],
+    ['module syntax', 'export default {', 'module', /SyntaxError/, /secure-eval-worker-component\.syntax\.mjs:1/],
+    ['module contract', 'export default 42', 'module', /default export must be a setup function/, undefined]
   ]
 
-  for (const [name, source, type, expected] of cases) {
+  for (const [name, source, type, expected, expectedStack] of cases) {
     await t.test(name, async () => {
       const session = createUntrustedWorker(source, {
         type,
         startupTimeoutMs: 5_000,
         lifetimeTimeoutMs: 5_000
       })
-      await assert.rejects(session.ready, expected)
+      await assert.rejects(session.ready, (error) => {
+        assert.match(error.message, expected)
+        if (expectedStack) assert.match(error.remoteStack, expectedStack)
+        return true
+      })
       await session.closed
     })
   }
@@ -482,6 +507,46 @@ test('startup timeout terminates hanging scripts and modules', async (t) => {
       await session.closed
     })
   }
+})
+
+test('request options ignore inherited deadlines and reject accessors', async () => {
+  const session = createUntrustedWorker(`
+    onMessage(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 100))
+      return 42
+    })
+  `, {
+    startupTimeoutMs: 5_000,
+    messageTimeoutMs: 20,
+    lifetimeTimeoutMs: 5_000
+  })
+  await session.ready
+
+  const inherited = Object.create({ timeoutMs: 5_000 })
+  await assert.rejects(
+    session.request(null, inherited),
+    (error) => error.code === 'ERR_UNTRUSTED_WORKER_MESSAGE_TIMEOUT'
+  )
+  await session.closed
+
+  const next = createUntrustedWorker('onMessage(value => value)', {
+    startupTimeoutMs: 5_000,
+    messageTimeoutMs: 5_000,
+    lifetimeTimeoutMs: 5_000
+  })
+  await next.ready
+  let reads = 0
+  const accessor = {}
+  Object.defineProperty(accessor, 'timeoutMs', {
+    enumerable: true,
+    get () {
+      reads++
+      return 5_000
+    }
+  })
+  assert.throws(() => next.request(null, accessor), /enumerable data property/)
+  assert.equal(reads, 0)
+  await next.terminate()
 })
 
 test('request deadlines include synchronous cloning and serialization', async () => {
@@ -670,6 +735,31 @@ test('rejects all shared-memory representations at every session boundary', asyn
 
   const ordinary = new ArrayBuffer(8)
   assert.equal(await session.request(ordinary) instanceof ArrayBuffer, true)
+  await session.terminate()
+})
+
+test('ignores inherited persistent capabilities and limits', async () => {
+  let calls = 0
+  const options = Object.create({
+    hostFunctions: {
+      secrets: {
+        read () {
+          calls++
+          return 'secret'
+        }
+      }
+    },
+    maxHostFunctionCalls: Number.MAX_SAFE_INTEGER,
+    lifetimeTimeoutMs: 1
+  })
+  options.startupTimeoutMs = 5_000
+  options.messageTimeoutMs = 5_000
+  options.lifetimeTimeoutMs = 5_000
+
+  const session = createUntrustedWorker('onMessage(() => typeof secrets)', options)
+  await session.ready
+  assert.equal(await session.request(null), 'undefined')
+  assert.equal(calls, 0)
   await session.terminate()
 })
 

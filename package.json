@@ -3,8 +3,17 @@
   "version": "0.1.0",
   "description": "Least-privilege worker-thread execution for untrusted JavaScript",
   "type": "module",
-  "exports": "./src/index.js",
+  "types": "./src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.d.ts",
+      "import": "./src/index.js",
+      "require": "./src/index.js",
+      "default": "./src/index.js"
+    }
+  },
   "files": [
+    "docs",
     "src"
   ],
   "engines": {
@@ -12,7 +21,13 @@
   },
   "scripts": {
     "test": "node --test",
-    "test:coverage": "node --test --experimental-test-coverage"
+    "test:coverage": "node --test --experimental-test-coverage",
+    "test:types": "node scripts/check-package-types.js",
+    "measure:workers": "node --expose-gc scripts/measure-worker-overhead.js"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "26.4.1",
+    "typescript": "7.0.2"
+  }
 }

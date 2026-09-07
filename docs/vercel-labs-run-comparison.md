@@ -31,41 +31,33 @@ container sandbox.
 
 | Capability | `run` | `secure-eval-worker` | Assessment |
 | --- | --- | --- | --- |
-| One-shot host functions | Passed directly to `run()` | Available only through persistent sessions | High-impact API gap |
-| TypeScript declarations | Published declarations and generic result types | No declarations | High-impact packaging gap |
-| Guest TypeScript | Runtime type stripping | JavaScript source only | Important for coding-agent output |
+| One-shot host functions | Passed directly to `run()` | Available through one-shot and persistent APIs | Closed |
+| TypeScript declarations | Published declarations and generic result types | Published declarations with generic host-side values | Closed |
+| Guest TypeScript | Runtime type stripping | Optional erase-only stripping | Closed for erasable syntax |
 | Controlled module graph | Static, cyclic, and dynamic ESM through a host loader | Self-contained ESM only | Important for multi-file programs |
 | Interrupt and resume | Signed or stored replay continuations | No durable continuation mechanism | Important for approval and authentication workflows |
-| Aggregate admission control | Process-wide worker cap with immediate backpressure | No process-wide cap | High operational priority |
-| One-shot worker reuse | Pooled workers with fresh QuickJS contexts | A new worker for each one-shot execution | Throughput and startup gap |
+| Aggregate admission control | Process-wide worker cap with immediate backpressure | Main-thread process-wide cap with immediate rejection | Closed with fail-closed host-thread restriction |
+| One-shot worker reuse | Pooled workers with fresh QuickJS contexts | A new worker for each one-shot execution | Deliberate no-pool security decision |
 | Runtime support | Node.js 20.19+ and Bun | Node.js 26.3+ | Significant deployment restriction |
 | Synchronous guest bindings | Supported for compatibility APIs | Host functions always return promises | Specialized compatibility gap |
-| Guest console | Bounded and sanitized output | Output is discarded | Debugging and diagnostics gap |
+| Guest console | Bounded and sanitized output | Opt-in bounded sanitized diagnostics; discarded by default | Closed |
 | Serialized errors | Supports `Error`, causes, and aggregate errors as data | Errors use dedicated failure channels | Moderate interoperability gap |
 
 ### One-shot host functions
 
-The most immediate product gap is the inability to pass host functions to
-`runUntrustedCode()`. Calling generated code with a narrow set of tools is the
-primary `run` workflow. In `secure-eval-worker`, users must create and terminate
-a persistent session even when they need only one result.
-
-This can be added without changing the one-shot source signature: `input` can
-remain the only function parameter while capability namespaces remain guest
-globals.
+`runUntrustedCode()` now accepts the same namespaced host-function manifest and
+limits as persistent sessions. The one-shot source signature remains unchanged:
+`input` is its only parameter and capability namespaces are frozen guest
+globals. Calls reuse the authenticated session bridge, value restrictions,
+redaction, cancellation context, and output accounting.
 
 ### TypeScript support
 
-There are two separate improvements:
-
-1. Publish declarations for the host API, including generic input, output, and
-   host-function types.
-2. Optionally strip supported TypeScript syntax from guest source while
-   preserving useful source coordinates.
-
-Declarations are lower-risk and should land first. Type stripping is not type
-checking; applications remain responsible for validating generated code when
-type correctness matters.
+The package now publishes declarations for the complete host API and validates
+them from the packed artifact. Guest source may opt into Node's erase-only
+TypeScript stripping with pre/post source limits and virtual coordinates. Type
+stripping is not type checking; applications remain responsible for validating
+generated code when type correctness matters.
 
 ### Controlled modules
 
@@ -93,11 +85,11 @@ agent workflows are core use cases.
 
 ### Admission control and pooling
 
-Per-worker limits do not prevent an application from creating too many workers
-at once. A process-wide cap with explicit backpressure should precede pooling.
-Pooling can then improve one-shot startup cost, but every leased worker must be
-returned to a verified clean state or retired. Error listeners must remain
-attached for the complete worker lifecycle, including while a worker is idle.
+A fail-fast process-wide cap now covers one-shot and persistent sandbox workers
+created from the main thread. Host-thread creation fails closed so thread
+termination cannot orphan leases. Pooling was rejected because a reused native
+Node realm cannot satisfy the required clean-reset invariant; every one-shot
+run continues to receive a fresh worker.
 
 ### Synchronous bindings and console output
 
@@ -105,9 +97,9 @@ Synchronous host bindings help emulate APIs whose callers cannot await a
 promise, but they require a blocking bridge and substantially increase
 complexity. They should be added only for demonstrated compatibility needs.
 
-Bounded console forwarding or a structured diagnostic callback would improve
-debugging. Output must remain size-limited, sanitized, and separate from the
-private control protocol.
+Bounded diagnostics are available through a structured callback or session
+event. They use an independently authenticated private channel and remain
+disabled by default.
 
 ## Existing differentiators to preserve
 
@@ -128,18 +120,12 @@ into a clone of `run`.
 
 ## Recommended sequence
 
-1. Add one-shot host-function parity.
-2. Publish TypeScript declarations and generic public types.
-3. Add process-wide admission control.
-4. Add an approved in-memory module graph or documented bundling adapter.
-5. Add optional guest TypeScript stripping.
-6. Add opt-in bounded diagnostics.
-7. Evaluate worker pooling after clean-reset invariants are defined.
-8. Implement continuations only if durable approval workflows are in scope.
-9. Add synchronous host functions only for demonstrated compatibility needs.
-
-The first three items close the largest general-purpose gaps without committing
-the project to a new execution or replay architecture.
+Completed work includes one-shot host-function parity, declarations,
+admission control, a documented host-side bundling model, erase-only TypeScript,
+bounded diagnostics, reusable runner defaults, and source-oriented errors.
+Worker pooling was evaluated and rejected. Durable continuations and
+synchronous guest bindings remain deferred until concrete product requirements
+justify separate threat models and protocol designs.
 
 ## Primary references
 
