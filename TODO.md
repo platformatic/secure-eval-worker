@@ -40,18 +40,18 @@ features.
 ## P1 — Source and developer experience
 
 - [x] **Define a safe module-dependency model**
-  - Start with a documented host-side bundling adapter or a bounded in-memory
-    module graph.
-  - Support explicit canonical module identities and authorized resolution.
-  - Bound aggregate and per-module source sizes, module count, resolution depth,
-    and loader requests.
-  - Preserve static, cyclic, and dynamic ESM semantics where practical.
-  - Never use privileged Node.js loader hooks or alternate execution contexts
-    that bypass guest hardening.
-  - Require traversal, alias, cycle, oversized graph, cancellation, and
-    malicious-resolver tests if an in-worker graph is ever added.
-  - Decision: use trusted host-side bundling; native VM modules are unavailable
-    without experimental execution flags on supported Node versions. See
+  - Support self-contained host bundles when the guest should receive no
+    filesystem authority.
+  - Support explicit local entry paths through a canonical trusted root and
+    Node's granular filesystem-read permission.
+  - Preserve native static, cyclic, package, and dynamic ESM semantics inside
+    that root without privileged loader hooks or alternate execution contexts.
+  - Reject entries outside the root and every symlink within it, preserve
+    inherited-descriptor protections, and keep writes and native addons
+    unavailable.
+  - Decision: provide native path APIs for explicitly trusted module trees and
+    retain trusted host-side bundling for zero-filesystem workers. Native VM
+    modules remain unavailable without experimental execution flags. See
     [`docs/module-dependencies.md`](docs/module-dependencies.md).
 
 - [x] **Add optional guest TypeScript stripping**

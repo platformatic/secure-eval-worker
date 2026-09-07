@@ -25,7 +25,7 @@ try {
   execFileSync(process.execPath, [
     '--input-type=commonjs',
     '--eval',
-    "const api = require('secure-eval-worker'); if (typeof api.runUntrustedCode !== 'function') process.exit(1)"
+    "const api = require('secure-eval-worker'); if (typeof api.runUntrustedFile !== 'function' || typeof api.createUntrustedWorkerFromFile !== 'function') process.exit(1)"
   ], { cwd: project, stdio: 'inherit' })
 
   execFileSync(process.execPath, [

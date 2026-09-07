@@ -34,7 +34,7 @@ container sandbox.
 | One-shot host functions | Passed directly to `run()` | Available through one-shot and persistent APIs | Closed |
 | TypeScript declarations | Published declarations and generic result types | Published declarations with generic host-side values | Closed |
 | Guest TypeScript | Runtime type stripping | Optional erase-only stripping | Closed for erasable syntax |
-| Controlled module graph | Static, cyclic, and dynamic ESM through a host loader | Self-contained ESM only | Important for multi-file programs |
+| Controlled module graph | Static, cyclic, and dynamic ESM through a host loader | Native local modules within an explicit filesystem-read root, or self-contained host bundles | Closed with a broader root-authority tradeoff |
 | Interrupt and resume | Signed or stored replay continuations | No durable continuation mechanism | Important for approval and authentication workflows |
 | Aggregate admission control | Process-wide worker cap with immediate backpressure | Main-thread process-wide cap with immediate rejection | Closed with fail-closed host-thread restriction |
 | One-shot worker reuse | Pooled workers with fresh QuickJS contexts | A new worker for each one-shot execution | Deliberate no-pool security decision |
@@ -61,14 +61,18 @@ generated code when type correctness matters.
 
 ### Controlled modules
 
-`run` provides a host-controlled module loader supporting static, cyclic, and
-dynamic imports. `secure-eval-worker` requires one self-contained ESM source,
-so applications must bundle approved dependencies before execution.
+`run` provides a host-controlled in-memory module loader. `secure-eval-worker`
+now provides path-based one-shot and persistent factories that use Node's
+native loader under a canonical `--allow-fs-read` root. This preserves native
+static, cyclic, package, and dynamic import behavior, but the complete root is
+an explicit read-authority grant and must contain no secrets or unrelated
+files. Self-contained host bundles remain available when the guest should
+receive no filesystem permission.
 
-A future module graph must not rely on privileged Node.js loader hooks that can
-create execution contexts outside the hardened guest runtime. Prefer host-side
-bundling or an authenticated, bounded in-memory module graph with explicit
-resolution rules.
+Neither model uses privileged loader hooks or creates an execution context
+outside the hardened worker. The path model additionally wraps descriptor APIs
+so the guest cannot use the Permission Model's existing-descriptor exception to
+read descriptors inherited from the parent process.
 
 ### Durable interruption and continuation
 
@@ -121,8 +125,9 @@ into a clone of `run`.
 ## Recommended sequence
 
 Completed work includes one-shot host-function parity, declarations,
-admission control, a documented host-side bundling model, erase-only TypeScript,
-bounded diagnostics, reusable runner defaults, and source-oriented errors.
+admission control, native root-confined local modules, a host-side bundling
+model, erase-only TypeScript, bounded diagnostics, reusable runner defaults,
+and source-oriented errors.
 Worker pooling was evaluated and rejected. Durable continuations and
 synchronous guest bindings remain deferred until concrete product requirements
 justify separate threat models and protocol designs.

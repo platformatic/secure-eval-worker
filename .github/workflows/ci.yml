@@ -67,6 +67,7 @@ jobs:
             'src/index.d.ts',
             'src/index.js',
             'src/internal.js',
+            'src/local-files.js',
             'src/session.js'
           ]
           assert.deepEqual(actual, expected)

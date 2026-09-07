@@ -1,5 +1,7 @@
 import {
   abortError,
+  assertSupportedProtocolValue,
+  cloneWithoutSharedMemory,
   DEFAULT_MAX_SOURCE_BYTES,
   MAX_TIMEOUT_MS,
   sanitizeEnvironment,
@@ -8,7 +10,8 @@ import {
   validateResourceLimits
 } from './internal.js'
 import { validateHostFunctions } from './host-functions.js'
-import { createUntrustedOneShot } from './session.js'
+import { resolveLocalModule } from './local-files.js'
+import { createUntrustedFileSession, createUntrustedOneShot } from './session.js'
 
 export { configureWorkerAdmission } from './admission.js'
 export { getHostFunctionContext, HostFunctionError } from './host-functions.js'
@@ -16,6 +19,9 @@ export { sanitizeEnvironment, UntrustedCodeError } from './internal.js'
 export { createUntrustedWorker, UntrustedWorkerSession } from './session.js'
 
 const DEFAULT_TIMEOUT_MS = 1_000
+const DEFAULT_MAX_ROOT_ENTRIES = 10_000
+const DEFAULT_MAX_FILE_BYTES = 1024 * 1024
+const DEFAULT_MAX_TOTAL_FILE_BYTES = 16 * 1024 * 1024
 const RUNNER_DEFAULT_NAMES = new Set([
   'timeoutMs',
   'maxSourceBytes',
@@ -72,25 +78,111 @@ export function runUntrustedCode (source, options = {}) {
     throw new RangeError(`source exceeds maxSourceBytes (${maxSourceBytes})`)
   }
 
-  // Normalize these here to preserve synchronous option errors without
-  // evaluating caller-controlled properties twice.
+  return runOneShot(options, timeoutMs, timeoutMs, (sessionOptions) => {
+    return createUntrustedOneShot(source, { ...sessionOptions, maxSourceBytes })
+  })
+}
+
+/**
+ * Execute a local ESM entry module and its imports in a fresh worker. The
+ * module must default-export a function receiving the one-shot input.
+ */
+export async function runUntrustedFile (modulePath, options = {}) {
+  const startedAt = Date.now()
+  options = snapshotFileOptions(options, 'options')
+  snapshotFilePolicies(options)
+  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
+  validatePositiveInteger(timeoutMs, 'timeoutMs')
+  if (timeoutMs > MAX_TIMEOUT_MS) {
+    throw new RangeError(`timeoutMs must not exceed ${MAX_TIMEOUT_MS}`)
+  }
+  const signal = validateSignal(options.signal)
+  if (signal?.aborted) throw abortError(signal.reason)
+
+  const localModule = await resolveLocalModule(
+    modulePath,
+    options.rootDirectory,
+    {
+      maxRootEntries: options.maxRootEntries,
+      maxFileBytes: options.maxFileBytes,
+      maxTotalFileBytes: options.maxTotalFileBytes
+    },
+    signal
+  )
+  const remainingTimeoutMs = timeoutMs - (Date.now() - startedAt)
+  if (remainingTimeoutMs <= 0) {
+    throw new UntrustedCodeError(`Execution exceeded ${timeoutMs} ms`, {
+      code: 'ERR_UNTRUSTED_CODE_TIMEOUT'
+    })
+  }
+  delete options.rootDirectory
+  delete options.maxRootEntries
+  delete options.maxFileBytes
+  delete options.maxTotalFileBytes
+  options.timeoutMs = remainingTimeoutMs
+  return runOneShot(options, remainingTimeoutMs, timeoutMs, (sessionOptions) => {
+    return createUntrustedFileSession(localModule, sessionOptions, true)
+  })
+}
+
+/**
+ * Create a persistent session from a local ESM entry module. The trusted root
+ * is granted to Node's module loader and the constrained synchronous read
+ * facade. File preparation is asynchronous, so this factory returns a promise
+ * for the session.
+ */
+export async function createUntrustedWorkerFromFile (modulePath, options = {}) {
+  const startedAt = Date.now()
+  options = snapshotFileOptions(options, 'options')
+  snapshotFilePolicies(options)
+  const startupTimeoutMs = options.startupTimeoutMs ?? DEFAULT_TIMEOUT_MS
+  validatePositiveInteger(startupTimeoutMs, 'startupTimeoutMs')
+  if (startupTimeoutMs > MAX_TIMEOUT_MS) {
+    throw new RangeError(`startupTimeoutMs must not exceed ${MAX_TIMEOUT_MS}`)
+  }
+  const signal = validateSignal(options.signal)
+  if (signal?.aborted) throw abortError(signal.reason)
+
+  const localModule = await resolveLocalModule(
+    modulePath,
+    options.rootDirectory,
+    {
+      maxRootEntries: options.maxRootEntries,
+      maxFileBytes: options.maxFileBytes,
+      maxTotalFileBytes: options.maxTotalFileBytes
+    },
+    signal
+  )
+  const remainingStartupMs = startupTimeoutMs - (Date.now() - startedAt)
+  if (remainingStartupMs <= 0) {
+    throw new UntrustedCodeError(`Startup exceeded ${startupTimeoutMs} ms`, {
+      code: 'ERR_UNTRUSTED_WORKER_STARTUP_TIMEOUT'
+    })
+  }
+  delete options.rootDirectory
+  delete options.maxRootEntries
+  delete options.maxFileBytes
+  delete options.maxTotalFileBytes
+  options.startupTimeoutMs = remainingStartupMs
+  return createUntrustedFileSession(localModule, options)
+}
+
+function runOneShot (options, timeoutMs, reportedTimeoutMs, createSession) {
+  // Normalize these here to preserve synchronous source-API option errors and
+  // avoid evaluating caller-controlled properties twice.
   const environment = sanitizeEnvironment(options.environment)
   const resourceLimits = validateResourceLimits(options.resourceLimits)
-  const signal = options.signal
-  if (signal !== undefined && !(signal instanceof AbortSignal)) {
-    throw new TypeError('signal must be an AbortSignal')
-  }
+  const signal = validateSignal(options.signal)
   if (signal?.aborted) return Promise.reject(abortError(signal.reason))
 
   let session
   try {
-    session = createUntrustedOneShot(source, {
+    session = createSession({
       input: options.input,
       language: options.language,
       environment,
       resourceLimits,
       signal,
-      maxSourceBytes,
       maxMessageBytes: options.maxMessageBytes,
       maxInputBytes: options.maxInputBytes,
       maxOutputMessages: options.maxOutputMessages,
@@ -109,20 +201,77 @@ export function runUntrustedCode (source, options = {}) {
         error?.code === 'ERR_UNTRUSTED_WORKER_STARTUP_TIMEOUT' ||
         error?.code === 'ERR_UNTRUSTED_WORKER_CAPACITY' ||
         error?.code === 'ERR_UNTRUSTED_WORKER_ADMISSION_UNAVAILABLE') {
-      return Promise.reject(translateSessionError(error, timeoutMs))
+      return Promise.reject(translateSessionError(error, reportedTimeoutMs))
     }
     throw error
   }
 
   return session.ready
     .catch((error) => {
-      throw translateSessionError(error, timeoutMs)
+      throw translateSessionError(error, reportedTimeoutMs)
     })
     .finally(async () => {
       try {
         await session.terminate()
       } catch {}
     })
+}
+
+function snapshotFilePolicies (options) {
+  const policyInput = Object.create(null)
+  for (const name of [
+    'environment',
+    'resourceLimits',
+    'maxMessageBytes',
+    'maxInputBytes',
+    'maxOutputMessages',
+    'maxOutputBytes',
+    'hostFunctions',
+    'maxHostFunctionCalls',
+    'maxInFlightHostFunctions',
+    'diagnostics',
+    'onDiagnostic'
+  ]) {
+    if (name in options) policyInput[name] = options[name]
+  }
+  Object.assign(options, snapshotRunnerDefaults(policyInput))
+
+  const input = cloneWithoutSharedMemory(options.input, 'input')
+  assertSupportedProtocolValue(input, 'input')
+  options.input = input
+
+  for (const [name, defaultValue] of [
+    ['maxRootEntries', DEFAULT_MAX_ROOT_ENTRIES],
+    ['maxFileBytes', DEFAULT_MAX_FILE_BYTES],
+    ['maxTotalFileBytes', DEFAULT_MAX_TOTAL_FILE_BYTES]
+  ]) {
+    const value = options[name] ?? defaultValue
+    validatePositiveInteger(value, name)
+    options[name] = value
+  }
+  if (options.maxFileBytes > options.maxTotalFileBytes) {
+    throw new RangeError('maxFileBytes must not exceed maxTotalFileBytes')
+  }
+}
+
+function validateSignal (signal) {
+  if (signal !== undefined && !(signal instanceof AbortSignal)) {
+    throw new TypeError('signal must be an AbortSignal')
+  }
+  return signal
+}
+
+function snapshotFileOptions (options, label) {
+  if (options === null || typeof options !== 'object' || Array.isArray(options)) {
+    throw new TypeError(`${label} must be an object`)
+  }
+  const snapshot = snapshotPublicOptions(options, label)
+  for (const unsupported of ['language', 'maxSourceBytes', 'type']) {
+    if (unsupported in snapshot) {
+      throw new TypeError(`${unsupported} is not supported for local module files`)
+    }
+  }
+  return snapshot
 }
 
 function snapshotPublicOptions (options, label) {

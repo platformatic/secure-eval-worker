@@ -1,8 +1,8 @@
 # secure-eval-worker
 
-Run JavaScript scripts or self-contained ES modules in Node.js workers with a small, explicitly defined authority set. Use one-shot evaluation or create a persistent session that exchanges messages with the component.
+Run JavaScript scripts, self-contained ES modules, or trusted-root local module trees in Node.js workers with a small, explicitly defined authority set. Use one-shot evaluation or create a persistent session that exchanges messages with the component.
 
-Each worker starts with Node's Permission Model enabled and only the `worker` permission. Its trusted bootstrap immediately calls `process.permission.drop('worker')` before compiling, importing, or invoking caller-provided source. The worker also receives an explicit environment instead of inheriting `process.env`, has V8 resource limits, and is terminated after a deadline.
+Each worker starts with Node's Permission Model enabled. Source-string workers receive only the `worker` permission; local-file workers additionally receive read permission for their canonical trusted root. The trusted bootstrap immediately calls `process.permission.drop('worker')` before compiling, importing, or invoking caller-provided source. The worker also receives an explicit environment instead of inheriting `process.env`, has V8 resource limits, and is terminated after a deadline.
 
 > [!WARNING]
 > Node's Permission Model and `node:worker_threads` are defense-in-depth controls, **not a complete security boundary against malicious code**. Workers share a process, and resource limits do not constrain every kind of allocation. For adversarial multi-tenant workloads, put this module inside a separately sandboxed process or container with OS-level CPU, memory, filesystem, network, and syscall restrictions.
@@ -10,7 +10,7 @@ Each worker starts with Node's Permission Model enabled and only the `worker` pe
 ## Requirements
 
 - Node.js 26.3.0 or newer (`process.permission.drop()` is required)
-- No permission flags are required when the host uses Node's default mode. If the host itself runs with `--permission`, it must include `--allow-worker`. Each sandbox worker is started with its own reviewed `execArgv`.
+- No permission flags are required when the host uses Node's default mode. If the host itself runs with `--permission`, it must include `--allow-worker`. Path-based execution additionally requires host read permission for the entry and trusted root. Each sandbox worker is started with its own reviewed `execArgv`.
 
 ## Usage
 
@@ -107,11 +107,50 @@ console.log(await component.request('hello')) // { echo: 'hello' }
 await component.terminate()
 ```
 
-Module source must be self-contained ESM with a default setup-function export. It is imported from an in-memory `data:` URL after permissions are dropped. Built-in imports are permitted subject to the Permission Model, but relative files, package imports, and filesystem module paths are not resolved. Bundle authorized dependencies on the trusted host using the model in [`docs/module-dependencies.md`](docs/module-dependencies.md).
+Module source must be self-contained ESM with a default setup-function export. It is imported from an in-memory `data:` URL after permissions are dropped. Built-in imports are permitted subject to the Permission Model, but relative files, package imports, and filesystem module paths are not resolved from source strings. Use the path APIs below or bundle authorized dependencies on the trusted host as described in [`docs/module-dependencies.md`](docs/module-dependencies.md).
+
+### Local module files
+
+Use `runUntrustedFile()` to execute an ESM entry file. The module must default-export a function receiving `input`:
+
+```js
+import { runUntrustedFile } from 'secure-eval-worker'
+
+const result = await runUntrustedFile('./components/calculate.mjs', {
+  rootDirectory: './components',
+  input: { values: [10, 20, 12] },
+  timeoutMs: 500
+})
+```
+
+Static and dynamic imports are resolved by Node's native module loader. `rootDirectory` is canonicalized and granted through `--allow-fs-read`; imports and reads resolving outside it are denied by Node's Permission Model. It defaults to the entry file's directory. The entry must be a regular file inside the canonical root. Because Node's Permission Model can follow relative symlinks outside an allowed directory, the complete root is scanned before startup and any symbolic link or non-file/non-directory entry is rejected. `maxRootEntries` bounds that scan and defaults to 10,000. `maxFileBytes` and `maxTotalFileBytes` bound individual files and the complete tree, defaulting to 1 MiB and 16 MiB.
+
+Use the asynchronous `createUntrustedWorkerFromFile()` factory for a persistent component:
+
+```js
+import { createUntrustedWorkerFromFile } from 'secure-eval-worker'
+
+const component = await createUntrustedWorkerFromFile(
+  './components/service.mjs',
+  {
+    rootDirectory: './components',
+    input: { tenant: 'example' },
+    lifetimeTimeoutMs: 60_000
+  }
+)
+
+await component.ready
+console.log(await component.request('hello'))
+await component.terminate()
+```
+
+Its default export uses the same `{ input, send, onMessage, host }` setup contract as an in-memory module. JavaScript and Node's native erase-only TypeScript module formats are supported according to the selected file extension.
+
+The trusted root is an explicit authority grant. Guest code can use the retained synchronous `node:fs` read facade to read files inside it, and imported code can load any Node-supported module or data reachable within it. Never include secrets, native addons, sockets, or unrelated application files in that directory. Filesystem writes, promise-based filesystem APIs, inherited descriptors, and reads outside the root remain disabled. Concurrently mutable module trees require an outer OS sandbox or immutable staging directory for stronger TOCTOU protection.
 
 ### Host functions
 
-Host functions provide narrow, explicit capabilities without granting ambient filesystem, network, database, or secret access to the worker. Groups are installed as read-only globals in both script and module source. Module setup also receives the same null-prototype object as `host`.
+Host functions provide narrow, explicit capabilities without adding ambient filesystem, network, database, or secret access to the worker. Local-file workers separately retain their configured read root. Groups are installed as read-only globals in both script and module source. Module setup also receives the same null-prototype object as `host`.
 
 ```js
 const component = createUntrustedWorker(`
@@ -141,7 +180,7 @@ The context is available only while that host function is active. Its identifier
 
 ## API
 
-The package includes TypeScript declarations. `runUntrustedCode<Output, Input>()` and `createUntrustedWorker<SetupInput, InboundMessage, Response, OutboundMessage>()` can type host-side inputs and outputs; runtime protocol validation remains authoritative.
+The package includes TypeScript declarations. `runUntrustedCode<Output, Input>()`, `runUntrustedFile<Output, Input>()`, and the corresponding persistent factories can type host-side inputs and outputs; runtime protocol validation remains authoritative.
 
 ### `runUntrustedCode(source[, options])`
 
@@ -160,7 +199,15 @@ Options:
 - `maxInputBytes`, `maxMessageBytes`, `maxOutputMessages`, and `maxOutputBytes`: equivalent to the persistent options below.
 - `diagnostics` and `onDiagnostic`: opt into bounded, sanitized console records as described below.
 
-Every execution uses a new worker. Source cannot obtain filesystem, network, child-process, native-addon, inspector, WASI, or nested-worker access through supported Node APIs because none of those permissions remain when source starts. Known Permission Model gaps and process-wide APIs are additionally disabled before source is loaded. Ordinary guest stdout and stderr writes are discarded rather than forwarded into host logs.
+Every execution uses a new worker. Source-string execution cannot obtain filesystem, network, child-process, native-addon, inspector, WASI, or nested-worker access through supported Node APIs because none of those permissions remain when source starts. Local-file execution retains only its explicit filesystem-read root for native module loading and path-based reads. Known Permission Model gaps and process-wide APIs are additionally disabled before source is loaded. Ordinary guest stdout and stderr writes are discarded rather than forwarded into host logs.
+
+### `runUntrustedFile(modulePath[, options])`
+
+Asynchronously canonicalizes a path string or `file:` URL, then executes its default-exported function in a fresh worker. Options match `runUntrustedCode()` except `language` and `maxSourceBytes`, plus `rootDirectory`, `maxRootEntries`, `maxFileBytes`, and `maxTotalFileBytes`. `timeoutMs` covers root scanning, path preparation, worker startup, and execution. The file extension selects Node's module format and optional native TypeScript stripping.
+
+### `createUntrustedWorkerFromFile(modulePath[, options])`
+
+Asynchronously returns an `UntrustedWorkerSession` for a local module. Options match `createUntrustedWorker()` except `type`, `language`, and `maxSourceBytes`, plus `rootDirectory`, `maxRootEntries`, `maxFileBytes`, and `maxTotalFileBytes`. `startupTimeoutMs` includes root scanning and path preparation. The entry must default-export the persistent setup function.
 
 ### `createRunner([defaultOptions])`
 

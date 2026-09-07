@@ -99,6 +99,24 @@ export function runUntrustedCode<
   Hosts extends HostFunctionNamespaces = HostFunctionNamespaces
 >(source: string, options?: RunUntrustedCodeOptions<Input, Hosts>): Promise<Output>
 
+export interface LocalModuleOptions {
+  rootDirectory?: string | URL
+  maxRootEntries?: number
+  maxFileBytes?: number
+  maxTotalFileBytes?: number
+}
+
+export type RunUntrustedFileOptions<
+  Input = unknown,
+  Hosts extends HostFunctionNamespaces = HostFunctionNamespaces
+> = Omit<RunUntrustedCodeOptions<Input, Hosts>, 'language' | 'maxSourceBytes'> & LocalModuleOptions
+
+export function runUntrustedFile<
+  Output = unknown,
+  Input = unknown,
+  Hosts extends HostFunctionNamespaces = HostFunctionNamespaces
+>(modulePath: string | URL, options?: RunUntrustedFileOptions<Input, Hosts>): Promise<Output>
+
 export type RunnerDefaultOptions<Hosts extends HostFunctionNamespaces = HostFunctionNamespaces> =
   Omit<RunUntrustedCodeOptions<never, Hosts>, 'input' | 'signal'>
 
@@ -170,6 +188,23 @@ export function createUntrustedWorker<
   source: string,
   options?: UntrustedWorkerOptions<SetupInput, Hosts>
 ): UntrustedWorkerSession<InboundMessage, Response, OutboundMessage, SetupInput, Hosts>
+
+export type UntrustedWorkerFileOptions<
+  SetupInput = unknown,
+  Hosts extends HostFunctionNamespaces = HostFunctionNamespaces
+> = Omit<UntrustedWorkerOptions<SetupInput, Hosts>, 'type' | 'language' | 'maxSourceBytes'> &
+  LocalModuleOptions
+
+export function createUntrustedWorkerFromFile<
+  SetupInput = unknown,
+  InboundMessage = unknown,
+  Response = unknown,
+  OutboundMessage = unknown,
+  Hosts extends HostFunctionNamespaces = HostFunctionNamespaces
+>(
+  modulePath: string | URL,
+  options?: UntrustedWorkerFileOptions<SetupInput, Hosts>
+): Promise<UntrustedWorkerSession<InboundMessage, Response, OutboundMessage, SetupInput, Hosts>>
 
 export interface WorkerAdmissionOptions {
   maxConcurrentWorkers: number

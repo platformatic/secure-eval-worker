@@ -2,9 +2,11 @@ import {
   configureWorkerAdmission,
   createRunner,
   createUntrustedWorker,
+  createUntrustedWorkerFromFile,
   getHostFunctionContext,
   HostFunctionError,
   runUntrustedCode,
+  runUntrustedFile,
   sanitizeEnvironment,
   UntrustedCodeError,
   UntrustedWorkerSession,
@@ -129,6 +131,36 @@ const runnerResult: string = await runner<string, { value: string }>('return inp
 })
 void runnerResult
 
+const fileResult: number = await runUntrustedFile<number, { value: number }, typeof hosts>(
+  new URL('file:///trusted/entry.mjs'),
+  {
+    rootDirectory: '/trusted',
+    input: { value: 42 },
+    hostFunctions: hosts,
+    timeoutMs: 1_000
+  }
+)
+void fileResult
+
+const fileSession = await createUntrustedWorkerFromFile<
+  { initial: number },
+  { value: number },
+  { doubled: number },
+  { notice: string },
+  typeof hosts
+>('/trusted/entry.mjs', {
+  rootDirectory: '/trusted',
+  input: { initial: 1 },
+  hostFunctions: hosts
+})
+const fileResponse: { doubled: number } = await fileSession.request({ value: 21 })
+void fileResponse
+await fileSession.terminate()
+
+// @ts-expect-error local module language is selected by the file extension
+void runUntrustedFile('/trusted/entry.mjs', { language: 'javascript' })
+// @ts-expect-error persistent local modules always use the module contract
+void createUntrustedWorkerFromFile('/trusted/entry.mjs', { type: 'module' })
 // @ts-expect-error timeout must be numeric
 void runUntrustedCode('return 1', { timeoutMs: 'fast' })
 // @ts-expect-error environment values must be strings

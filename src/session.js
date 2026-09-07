@@ -49,6 +49,7 @@ const hostReflectApply = Reflect.apply
 const sessionSecrets = new WeakMap()
 const diagnosticContextStorage = new AsyncLocalStorage()
 const ONE_SHOT = Symbol('oneShot')
+const LOCAL_MODULE = Symbol('localModule')
 
 const SESSION_BOOTSTRAP = String.raw`
 'use strict'
@@ -107,11 +108,13 @@ const weakSetHas = WeakSet.prototype.has
 const weakSetAdd = WeakSet.prototype.add
 const arrayPush = Array.prototype.push
 const arrayPop = Array.prototype.pop
+const arrayJoin = Array.prototype.join
 const mapGet = Map.prototype.get
 const mapSet = Map.prototype.set
 const mapDelete = Map.prototype.delete
 const mapEntries = Map.prototype.entries
 const mapIteratorNext = Object.getPrototypeOf(new Map().entries()).next
+const setHas = Set.prototype.has
 const setValues = Set.prototype.values
 const setIteratorNext = Object.getPrototypeOf(new Set().values()).next
 const arrayBufferByteLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength').get
@@ -147,6 +150,13 @@ const stringCharCodeAt = String.prototype.charCodeAt
 const stringPadStart = String.prototype.padStart
 const numberToString = Number.prototype.toString
 const bufferByteLength = Buffer.byteLength
+const moduleFileReaders = objectFreeze(Object.fromEntries(
+  [
+    'accessSync', 'closeSync', 'existsSync', 'fstatSync', 'lstatSync', 'openSync',
+    'readFileSync', 'readSync', 'readvSync', 'realpathSync', 'statSync'
+  ].map((name) => [name, fsBuiltin[name]])
+))
+const moduleFileDescriptors = objectCreate(null)
 
 let port
 let rawPostToHost
@@ -295,13 +305,58 @@ function postDiagnostic(level, values) {
   })
 }
 
+function hardenFileSystemForModuleLoading() {
+  const descriptorReaders = new Set(['closeSync', 'fstatSync', 'readSync', 'readvSync'])
+  for (const [name, descriptor] of Object.entries(objectGetOwnPropertyDescriptors(fsBuiltin))) {
+    const reader = moduleFileReaders[name]
+    if (typeof reader === 'function') {
+      replaceProperty(fsBuiltin, name, function permittedModuleRead(...args) {
+        // Node's Permission Model does not re-check already-open descriptors.
+        // Track descriptors opened through this root-confined facade and reject
+        // inherited process descriptors even when their numeric values are
+        // guessed by guest code.
+        if (name === 'openSync') {
+          const fd = reflectApply(reader, fsBuiltin, args)
+          moduleFileDescriptors[fd] = true
+          return fd
+        }
+        if (reflectApply(setHas, descriptorReaders, [name])) {
+          const fd = args[0]
+          if (typeof fd !== 'number' || !objectHasOwn(moduleFileDescriptors, fd)) {
+            return sandboxDenied('node:fs.' + name)
+          }
+          if (name === 'closeSync') {
+            try {
+              return reflectApply(reader, fsBuiltin, args)
+            } finally {
+              delete moduleFileDescriptors[fd]
+            }
+          }
+          return reflectApply(reader, fsBuiltin, args)
+        }
+        if (typeof args[0] === 'number') return sandboxDenied('node:fs.' + name)
+        return reflectApply(reader, fsBuiltin, args)
+      })
+    } else if (!('value' in descriptor) || typeof descriptor.value === 'function') {
+      replaceProperty(fsBuiltin, name, function deniedFileSystemApi() {
+        return sandboxDenied('node:fs.' + name)
+      })
+    }
+  }
+  denyFunctions(fsPromisesBuiltin, 'node:fs/promises')
+}
+
 function hardenDangerousBuiltins() {
   // Existing numeric file descriptors bypass Node's Permission Model and are
-  // shared by every thread. Disable the complete fs and tty surfaces rather
-  // than trying to maintain an error-prone list of descriptor-taking APIs.
+  // shared by every thread. Source-string workers disable the complete fs
+  // surface. File-module workers retain only path-based synchronous readers
+  // needed by Node's loader; the permission root confines those reads.
   denyFunctions(asyncHooksBuiltin, 'node:async_hooks')
-  denyFunctions(fsBuiltin, 'node:fs')
-  denyFunctions(fsPromisesBuiltin, 'node:fs/promises')
+  if (workerData.localModule) hardenFileSystemForModuleLoading()
+  else {
+    denyFunctions(fsBuiltin, 'node:fs')
+    denyFunctions(fsPromisesBuiltin, 'node:fs/promises')
+  }
   denyFunctions(ttyBuiltin, 'node:tty')
   denyFunctions(netBuiltin, 'node:net')
   denyFunctions(tlsBuiltin, 'node:tls')
@@ -629,6 +684,18 @@ function limitedString(value, fallback) {
   return reflectApply(stringSlice, value, [0, 8_192])
 }
 
+function virtualizeModuleLocations(value) {
+  if (!workerData.localModule || typeof value !== 'string') return value
+  let result = value
+  for (const [location, replacement] of [
+    [workerData.localModule.rootUrlPrefix, 'secure-eval-worker-files/'],
+    [workerData.localModule.rootPathPrefix, 'secure-eval-worker-files/']
+  ]) {
+    result = reflectApply(arrayJoin, reflectApply(stringSplit, result, [location]), [replacement])
+  }
+  return result
+}
+
 function normalizedGuestStack(stack, name, message) {
   if (typeof stack !== 'string') return undefined
   const lines = reflectApply(stringSplit, reflectApply(stringSlice, stack, [0, 8_192]), ['\n'])
@@ -645,10 +712,15 @@ function normalizedGuestStack(stack, name, message) {
   ]
   let result = sanitizeDiagnosticText(name) + ': ' + sanitizeDiagnosticText(message)
   for (let index = 0; index < lines.length; index++) {
-    let line = lines[index]
+    let line = virtualizeModuleLocations(lines[index])
     let selectedMarker
     let markerIndex = -1
-    for (let markerOffset = 0; markerOffset < markers.length; markerOffset++) {
+    const fileMarkerIndex = reflectApply(stringIndexOf, line, ['secure-eval-worker-files/'])
+    if (fileMarkerIndex >= 0) {
+      selectedMarker = ['secure-eval-worker-files/', 0]
+      markerIndex = fileMarkerIndex
+    }
+    for (let markerOffset = 0; !selectedMarker && markerOffset < markers.length; markerOffset++) {
       const candidate = markers[markerOffset]
       const candidateIndex = reflectApply(stringIndexOf, line, [candidate[0]])
       if (candidateIndex >= 0) {
@@ -679,7 +751,9 @@ function cloneError(error) {
   try {
     if (error instanceof Error) {
       const name = limitedString(error.name, 'Error')
-      const message = limitedString(error.message, 'Untrusted component failed')
+      const message = virtualizeModuleLocations(
+        limitedString(error.message, 'Untrusted component failed')
+      )
       return {
         name,
         message,
@@ -965,7 +1039,7 @@ async function initialize() {
   keepAlive = safeSetInterval(() => {}, 2_147_483_647)
   const host = createHostFunctions()
 
-  const guestSource = prepareGuestSource()
+  const guestSource = workerData.localModule ? undefined : prepareGuestSource()
   let setupResult
   if (workerData.type === 'script') {
     const sourceName = workerData.oneShot
@@ -993,28 +1067,37 @@ async function initialize() {
       ? await execute(workerData.input)
       : await execute(workerData.input, send, onMessage, host)
   } else {
-    const encoded = Buffer.from(
-      guestSource + '\n//# sourceURL=secure-eval-worker-component.mjs\n',
-      'utf8'
-    ).toString('base64')
     let component
     try {
-      component = await import('data:text/javascript;base64,' + encoded)
+      if (workerData.localModule) {
+        component = await import(workerData.localModule.entryUrl)
+      } else {
+        const encoded = Buffer.from(
+          guestSource + '\n//# sourceURL=secure-eval-worker-component.mjs\n',
+          'utf8'
+        ).toString('base64')
+        component = await import('data:text/javascript;base64,' + encoded)
+      }
     } catch (error) {
-      if (workerData.language === 'javascript' && error instanceof SafeSyntaxError) {
+      if (!workerData.localModule && workerData.language === 'javascript' &&
+          error instanceof SafeSyntaxError) {
         locateJavaScriptSyntaxError(guestSource, error)
       }
       throw error
     }
     if (typeof component.default !== 'function') {
-      throw new TypeError('The module default export must be a setup function')
+      throw new TypeError(workerData.oneShot
+        ? 'The module default export must be a function'
+        : 'The module default export must be a setup function')
     }
-    setupResult = await component.default(Object.freeze({
-      input: workerData.input,
-      send,
-      onMessage,
-      host
-    }))
+    setupResult = workerData.oneShot
+      ? await component.default(workerData.input)
+      : await component.default(Object.freeze({
+          input: workerData.input,
+          send,
+          onMessage,
+          host
+        }))
   }
 
   const readyValue = workerData.oneShot
@@ -1042,6 +1125,16 @@ export function createUntrustedOneShot (source, options = {}) {
   return new UntrustedWorkerSession(source, { ...options, [ONE_SHOT]: true })
 }
 
+export function createUntrustedFileSession (localModule, options = {}, oneShot = false) {
+  return new UntrustedWorkerSession('', {
+    ...options,
+    type: 'module',
+    language: 'javascript',
+    [ONE_SHOT]: oneShot,
+    [LOCAL_MODULE]: localModule
+  })
+}
+
 export class UntrustedWorkerSession extends EventEmitter {
   constructor (source, options = {}) {
     super()
@@ -1050,6 +1143,7 @@ export class UntrustedWorkerSession extends EventEmitter {
     }
     options = snapshotSessionOptions(options)
 
+    const localModule = options[LOCAL_MODULE]
     const type = options.type ?? 'script'
     if (type !== 'script' && type !== 'module') {
       throw new TypeError("type must be 'script' or 'module'")
@@ -1079,6 +1173,12 @@ export class UntrustedWorkerSession extends EventEmitter {
     this.deferredDiagnosticEnvelopes = []
     this.diagnosticProcessing = Promise.resolve()
     validateSource(source, maxSourceBytes)
+    if (localModule !== undefined &&
+        (localModule === null || typeof localModule !== 'object' ||
+         typeof localModule.entryUrl !== 'string' || typeof localModule.rootPath !== 'string' ||
+         typeof localModule.rootPathPrefix !== 'string' || typeof localModule.rootUrlPrefix !== 'string')) {
+      throw new TypeError('Invalid local module configuration')
+    }
     validateTimeout(startupTimeoutMs, 'startupTimeoutMs')
     validateTimeout(this.messageTimeoutMs, 'messageTimeoutMs')
     validateTimeout(this.lifetimeTimeoutMs, 'lifetimeTimeoutMs')
@@ -1167,6 +1267,7 @@ export class UntrustedWorkerSession extends EventEmitter {
         execArgv: [
           '--permission',
           '--allow-worker',
+          ...(localModule ? [`--allow-fs-read=${localModule.rootPath}`] : []),
           '--disable-warning=PERM0006',
           '--disable-warning=DEP0192'
         ],
@@ -1182,7 +1283,8 @@ export class UntrustedWorkerSession extends EventEmitter {
           maxMessageBytes: this.maxMessageBytes,
           maxOutputMessages: this.maxOutputMessages,
           maxOutputBytes: this.maxOutputBytes,
-          diagnostics: this.diagnostics
+          diagnostics: this.diagnostics,
+          localModule
         },
         name: 'secure-eval-worker-session',
         stdout: true,
@@ -1818,7 +1920,7 @@ function snapshotSessionOptions (options) {
   const snapshot = Object.create(null)
   const descriptors = Object.getOwnPropertyDescriptors(options)
   for (const key of Reflect.ownKeys(options)) {
-    if (typeof key === 'symbol' && key !== ONE_SHOT) {
+    if (typeof key === 'symbol' && key !== ONE_SHOT && key !== LOCAL_MODULE) {
       throw new TypeError('options must not contain symbol properties')
     }
     const descriptor = descriptors[key]
