@@ -58,9 +58,13 @@ test('createRunner validates defaults and keeps input and signals per-run', asyn
   const run = createRunner({ timeoutMs: 5_000 })
   const controller = new AbortController()
   controller.abort('test')
+  Object.defineProperties(controller.signal, {
+    aborted: { value: false },
+    reason: { value: 'shadowed' }
+  })
   await assert.rejects(
     run('return input', { input: 42, signal: controller.signal }),
-    (error) => error.name === 'AbortError'
+    (error) => error.name === 'AbortError' && error.cause === 'test'
   )
 })
 

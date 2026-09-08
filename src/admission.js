@@ -3,7 +3,14 @@ import { isMainThread } from 'node:worker_threads'
 import { UntrustedCodeError } from './internal.js'
 
 const DEFAULT_MAX_CONCURRENT_WORKERS = 4
+// Keep the original worker key so older and newer package copies continue to
+// share the same process-wide worker counter.
 const STATE_KEY = Symbol.for('secure-eval-worker.admission.main.v1')
+const PREPARATION_STATE_KEY = Symbol.for('secure-eval-worker.admission.preparation.main.v1')
+
+function capacityError (message) {
+  return new UntrustedCodeError(message, { code: 'ERR_UNTRUSTED_WORKER_CAPACITY' })
+}
 
 function createState () {
   let activeWorkers = 0
@@ -12,10 +19,7 @@ function createState () {
   return Object.freeze({
     acquire () {
       if (activeWorkers >= maxConcurrentWorkers) {
-        throw new UntrustedCodeError(
-          `Worker capacity exhausted (${maxConcurrentWorkers} active workers)`,
-          { code: 'ERR_UNTRUSTED_WORKER_CAPACITY' }
-        )
+        throw capacityError(`Worker capacity exhausted (${maxConcurrentWorkers} active workers)`)
       }
       activeWorkers++
       let released = false
@@ -37,7 +41,34 @@ function createState () {
   })
 }
 
+function createPreparationState () {
+  let activePreparations = 0
+  let maxConcurrentPreparations = DEFAULT_MAX_CONCURRENT_WORKERS
+
+  return Object.freeze({
+    acquire () {
+      if (activePreparations >= maxConcurrentPreparations) {
+        throw capacityError(
+          `File preparation capacity exhausted (${maxConcurrentPreparations} active preparations)`
+        )
+      }
+      activePreparations++
+      let released = false
+      return () => {
+        if (released) return
+        released = true
+        activePreparations--
+      }
+    },
+
+    configure (maxPreparations) {
+      maxConcurrentPreparations = maxPreparations
+    }
+  })
+}
+
 let state
+let preparationState
 if (isMainThread) {
   state = globalThis[STATE_KEY]
   if (state === undefined) {
@@ -49,10 +80,21 @@ if (isMainThread) {
       writable: false
     })
   }
+
+  preparationState = globalThis[PREPARATION_STATE_KEY]
+  if (preparationState === undefined) {
+    preparationState = createPreparationState()
+    Object.defineProperty(globalThis, PREPARATION_STATE_KEY, {
+      value: preparationState,
+      configurable: false,
+      enumerable: false,
+      writable: false
+    })
+  }
 }
 
 function requireState () {
-  if (!state) {
+  if (!state || !preparationState) {
     throw new UntrustedCodeError(
       'Sandbox workers must be created from the main thread so process-wide admission cannot be orphaned',
       { code: 'ERR_UNTRUSTED_WORKER_ADMISSION_UNAVAILABLE' }
@@ -63,6 +105,11 @@ function requireState () {
 
 export function acquireWorkerSlot () {
   return requireState().acquire()
+}
+
+export function acquireFilePreparationSlot () {
+  requireState()
+  return preparationState.acquire()
 }
 
 export function configureWorkerAdmission (options) {
@@ -84,7 +131,10 @@ export function configureWorkerAdmission (options) {
   if (!Number.isSafeInteger(descriptor.value) || descriptor.value <= 0) {
     throw new RangeError('maxConcurrentWorkers must be a positive integer')
   }
-  return requireState().configure(descriptor.value)
+  const admissionState = requireState()
+  const status = admissionState.configure(descriptor.value)
+  preparationState.configure(descriptor.value)
+  return status
 }
 
 export function getWorkerAdmissionStatus () {

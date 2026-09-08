@@ -46,10 +46,16 @@ const hostTypedArrayByteLength = Object.getOwnPropertyDescriptor(
   'byteLength'
 ).get
 const hostReflectApply = Reflect.apply
+const hostEventTargetAddEventListener = EventTarget.prototype.addEventListener
+const hostEventTargetRemoveEventListener = EventTarget.prototype.removeEventListener
+const hostAbortSignalAborted = Object.getOwnPropertyDescriptor(AbortSignal.prototype, 'aborted').get
+const hostAbortSignalReason = Object.getOwnPropertyDescriptor(AbortSignal.prototype, 'reason').get
 const sessionSecrets = new WeakMap()
 const diagnosticContextStorage = new AsyncLocalStorage()
 const ONE_SHOT = Symbol('oneShot')
 const LOCAL_MODULE = Symbol('localModule')
+const PREACQUIRED_SLOT = Symbol('preacquiredSlot')
+const PREPARATION_SLOT = Symbol('preparationSlot')
 
 const SESSION_BOOTSTRAP = String.raw`
 'use strict'
@@ -1125,14 +1131,27 @@ export function createUntrustedOneShot (source, options = {}) {
   return new UntrustedWorkerSession(source, { ...options, [ONE_SHOT]: true })
 }
 
-export function createUntrustedFileSession (localModule, options = {}, oneShot = false) {
-  return new UntrustedWorkerSession('', {
-    ...options,
-    type: 'module',
-    language: 'javascript',
-    [ONE_SHOT]: oneShot,
-    [LOCAL_MODULE]: localModule
-  })
+export function createUntrustedFileSession (
+  localModule,
+  options = {},
+  oneShot = false,
+  releaseWorkerSlot,
+  releasePreparationSlot
+) {
+  try {
+    return new UntrustedWorkerSession('', {
+      ...options,
+      type: 'module',
+      language: 'javascript',
+      [ONE_SHOT]: oneShot,
+      [LOCAL_MODULE]: localModule,
+      [PREACQUIRED_SLOT]: releaseWorkerSlot,
+      [PREPARATION_SLOT]: releasePreparationSlot
+    })
+  } catch (error) {
+    releaseWorkerSlot()
+    throw error
+  }
 }
 
 export class UntrustedWorkerSession extends EventEmitter {
@@ -1144,6 +1163,14 @@ export class UntrustedWorkerSession extends EventEmitter {
     options = snapshotSessionOptions(options)
 
     const localModule = options[LOCAL_MODULE]
+    const preacquiredSlot = options[PREACQUIRED_SLOT]
+    const preparationSlot = options[PREPARATION_SLOT]
+    if (preacquiredSlot !== undefined && typeof preacquiredSlot !== 'function') {
+      throw new TypeError('Invalid pre-acquired worker slot')
+    }
+    if (preparationSlot !== undefined && typeof preparationSlot !== 'function') {
+      throw new TypeError('Invalid file preparation slot')
+    }
     const type = options.type ?? 'script'
     if (type !== 'script' && type !== 'module') {
       throw new TypeError("type must be 'script' or 'module'")
@@ -1176,7 +1203,8 @@ export class UntrustedWorkerSession extends EventEmitter {
     if (localModule !== undefined &&
         (localModule === null || typeof localModule !== 'object' ||
          typeof localModule.entryUrl !== 'string' || typeof localModule.rootPath !== 'string' ||
-         typeof localModule.rootPathPrefix !== 'string' || typeof localModule.rootUrlPrefix !== 'string')) {
+         typeof localModule.rootPathPrefix !== 'string' || typeof localModule.rootUrlPrefix !== 'string' ||
+         typeof localModule.cleanup !== 'function')) {
       throw new TypeError('Invalid local module configuration')
     }
     validateTimeout(startupTimeoutMs, 'startupTimeoutMs')
@@ -1196,7 +1224,9 @@ export class UntrustedWorkerSession extends EventEmitter {
     if (signal !== undefined && !(signal instanceof AbortSignal)) {
       throw new TypeError('signal must be an AbortSignal')
     }
-    if (signal?.aborted) throw abortError(signal.reason)
+    if (signal && hostReflectApply(hostAbortSignalAborted, signal, [])) {
+      throw abortError(hostReflectApply(hostAbortSignalReason, signal, []))
+    }
 
     const startedAt = Date.now()
     const input = cloneWithoutSharedMemory(options.input, 'input')
@@ -1208,7 +1238,9 @@ export class UntrustedWorkerSession extends EventEmitter {
     const environment = sanitizeEnvironment(options.environment)
     const resourceLimits = validateResourceLimits(options.resourceLimits)
     const hostFunctionConfiguration = validateHostFunctions(options.hostFunctions)
-    if (signal?.aborted) throw abortError(signal.reason)
+    if (signal && hostReflectApply(hostAbortSignalAborted, signal, [])) {
+      throw abortError(hostReflectApply(hostAbortSignalReason, signal, []))
+    }
     const remainingStartupMs = startupTimeoutMs - (Date.now() - startedAt)
     if (remainingStartupMs <= 0) {
       throw sessionError(`Startup exceeded ${startupTimeoutMs} ms`, 'ERR_UNTRUSTED_WORKER_STARTUP_TIMEOUT')
@@ -1237,7 +1269,9 @@ export class UntrustedWorkerSession extends EventEmitter {
     this.readySettled = false
     this.failure = undefined
     this.signal = signal
-    this.onAbort = () => this.fail(abortError(signal.reason))
+    this.onAbort = () => this.fail(abortError(
+      hostReflectApply(hostAbortSignalReason, signal, [])
+    ))
 
     this.ready = new Promise((resolve, reject) => {
       this.resolveReady = resolve
@@ -1247,19 +1281,24 @@ export class UntrustedWorkerSession extends EventEmitter {
       this.resolveClosed = resolve
     })
 
-    if (signal) signal.addEventListener('abort', this.onAbort, { once: true })
-
     let releaseWorkerSlot
     try {
-      releaseWorkerSlot = acquireWorkerSlot()
+      releaseWorkerSlot = preacquiredSlot ?? acquireWorkerSlot()
     } catch (error) {
-      if (signal) signal.removeEventListener('abort', this.onAbort)
       this.resolveClosed({ code: undefined, error })
       this.state = 'closed'
       throw error
     }
     sessionSecrets.get(this).releaseWorkerSlot = releaseWorkerSlot
 
+    const workerLocalModule = localModule
+      ? {
+          entryUrl: localModule.entryUrl,
+          rootPath: localModule.rootPath,
+          rootPathPrefix: localModule.rootPathPrefix,
+          rootUrlPrefix: localModule.rootUrlPrefix
+        }
+      : undefined
     try {
       sessionSecrets.get(this).worker = new Worker(SESSION_BOOTSTRAP, {
         eval: true,
@@ -1284,7 +1323,7 @@ export class UntrustedWorkerSession extends EventEmitter {
           maxOutputMessages: this.maxOutputMessages,
           maxOutputBytes: this.maxOutputBytes,
           diagnostics: this.diagnostics,
-          localModule
+          localModule: workerLocalModule
         },
         name: 'secure-eval-worker-session',
         stdout: true,
@@ -1292,7 +1331,6 @@ export class UntrustedWorkerSession extends EventEmitter {
       })
     } catch (error) {
       releaseWorkerSlot()
-      if (signal) signal.removeEventListener('abort', this.onAbort)
       this.resolveClosed({ code: undefined, error })
       this.state = 'closed'
       throw error
@@ -1301,7 +1339,28 @@ export class UntrustedWorkerSession extends EventEmitter {
     const worker = sessionSecrets.get(this).worker
     worker.once('exit', (code) => {
       releaseWorkerSlot()
-      this.handleExit(code)
+      if (!localModule) {
+        this.handleExit(code)
+        return
+      }
+      void localModule.cleanup().then(() => {
+        preparationSlot?.()
+        this.handleExit(code)
+      }, (error) => {
+        const primaryError = this.failure
+        this.failure = sessionError(
+          'The private module snapshot could not be removed',
+          'ERR_UNTRUSTED_WORKER_CLEANUP',
+          primaryError
+            ? new AggregateError([primaryError, error], 'Worker and cleanup failures')
+            : error
+        )
+        void localModule.cleanupUntilRemoved().then(
+          () => preparationSlot?.(),
+          () => preparationSlot?.()
+        )
+        this.handleExit(code)
+      })
     })
     worker.stdout.resume()
     worker.stderr.resume()
@@ -1331,7 +1390,24 @@ export class UntrustedWorkerSession extends EventEmitter {
       }, startupDelay)
     }
 
-    if (signal?.aborted) this.fail(abortError(signal.reason))
+    if (signal) {
+      try {
+        hostReflectApply(hostEventTargetAddEventListener, signal, [
+          'abort',
+          this.onAbort,
+          { once: true }
+        ])
+        if (hostReflectApply(hostAbortSignalAborted, signal, [])) {
+          this.fail(abortError(hostReflectApply(hostAbortSignalReason, signal, [])))
+        }
+      } catch (error) {
+        this.fail(sessionError(
+          'The cancellation signal could not be observed',
+          'ERR_UNTRUSTED_WORKER_ABORT_SIGNAL',
+          error
+        ))
+      }
+    }
   }
 
   postMessage (value) {
@@ -1796,7 +1872,11 @@ export class UntrustedWorkerSession extends EventEmitter {
   handleExit (code) {
     clearTimeout(this.startupTimer)
     clearTimeout(this.lifetimeTimer)
-    this.signal?.removeEventListener('abort', this.onAbort)
+    if (this.signal) {
+      try {
+        hostReflectApply(hostEventTargetRemoveEventListener, this.signal, ['abort', this.onAbort])
+      } catch {}
+    }
     sessionSecrets.get(this).port?.close()
     sessionSecrets.get(this).diagnosticPort?.close()
 
@@ -1920,7 +2000,8 @@ function snapshotSessionOptions (options) {
   const snapshot = Object.create(null)
   const descriptors = Object.getOwnPropertyDescriptors(options)
   for (const key of Reflect.ownKeys(options)) {
-    if (typeof key === 'symbol' && key !== ONE_SHOT && key !== LOCAL_MODULE) {
+    if (typeof key === 'symbol' && key !== ONE_SHOT && key !== LOCAL_MODULE &&
+        key !== PREACQUIRED_SLOT && key !== PREPARATION_SLOT) {
       throw new TypeError('options must not contain symbol properties')
     }
     const descriptor = descriptors[key]

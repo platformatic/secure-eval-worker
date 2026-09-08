@@ -42,13 +42,13 @@ features.
 - [x] **Define a safe module-dependency model**
   - Support self-contained host bundles when the guest should receive no
     filesystem authority.
-  - Support explicit local entry paths through a canonical trusted root and
-    Node's granular filesystem-read permission.
+  - Support explicit local entry paths by copying a canonical trusted root into
+    a private bounded snapshot with granular filesystem-read permission.
   - Preserve native static, cyclic, package, and dynamic ESM semantics inside
     that root without privileged loader hooks or alternate execution contexts.
-  - Reject entries outside the root and every symlink within it, preserve
-    inherited-descriptor protections, and keep writes and native addons
-    unavailable.
+  - Reject entries outside the root and every symlink within it, use held-file
+    identity checks while staging, preserve inherited-descriptor protections,
+    and keep writes and native addons unavailable.
   - Decision: provide native path APIs for explicitly trusted module trees and
     retain trusted host-side bundling for zero-filesystem workers. Native VM
     modules remain unavailable without experimental execution flags. See

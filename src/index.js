@@ -9,6 +9,7 @@ import {
   validatePositiveInteger,
   validateResourceLimits
 } from './internal.js'
+import { acquireFilePreparationSlot, acquireWorkerSlot } from './admission.js'
 import { validateHostFunctions } from './host-functions.js'
 import { resolveLocalModule } from './local-files.js'
 import { createUntrustedFileSession, createUntrustedOneShot } from './session.js'
@@ -22,6 +23,10 @@ const DEFAULT_TIMEOUT_MS = 1_000
 const DEFAULT_MAX_ROOT_ENTRIES = 10_000
 const DEFAULT_MAX_FILE_BYTES = 1024 * 1024
 const DEFAULT_MAX_TOTAL_FILE_BYTES = 16 * 1024 * 1024
+const eventTargetAddEventListener = EventTarget.prototype.addEventListener
+const eventTargetRemoveEventListener = EventTarget.prototype.removeEventListener
+const abortSignalAborted = Object.getOwnPropertyDescriptor(AbortSignal.prototype, 'aborted').get
+const abortSignalReason = Object.getOwnPropertyDescriptor(AbortSignal.prototype, 'reason').get
 const RUNNER_DEFAULT_NAMES = new Set([
   'timeoutMs',
   'maxSourceBytes',
@@ -97,32 +102,74 @@ export async function runUntrustedFile (modulePath, options = {}) {
     throw new RangeError(`timeoutMs must not exceed ${MAX_TIMEOUT_MS}`)
   }
   const signal = validateSignal(options.signal)
-  if (signal?.aborted) throw abortError(signal.reason)
+  if (signal && Reflect.apply(abortSignalAborted, signal, [])) {
+    throw abortError(Reflect.apply(abortSignalReason, signal, []))
+  }
 
-  const localModule = await resolveLocalModule(
+  let releaseWorkerSlot
+  try {
+    releaseWorkerSlot = acquireWorkerSlot()
+  } catch (error) {
+    throw translateSessionError(error, timeoutMs)
+  }
+
+  let releasePreparationSlot
+  try {
+    releasePreparationSlot = acquireFilePreparationSlot()
+  } catch (error) {
+    releaseWorkerSlot()
+    throw translateSessionError(error, timeoutMs)
+  }
+
+  const localModule = await prepareLocalModule(
     modulePath,
-    options.rootDirectory,
-    {
-      maxRootEntries: options.maxRootEntries,
-      maxFileBytes: options.maxFileBytes,
-      maxTotalFileBytes: options.maxTotalFileBytes
-    },
-    signal
+    options,
+    timeoutMs - (Date.now() - startedAt),
+    new UntrustedCodeError(`Execution exceeded ${timeoutMs} ms`, {
+      code: 'ERR_UNTRUSTED_CODE_TIMEOUT'
+    }),
+    releaseWorkerSlot,
+    releasePreparationSlot
   )
+
   const remainingTimeoutMs = timeoutMs - (Date.now() - startedAt)
   if (remainingTimeoutMs <= 0) {
-    throw new UntrustedCodeError(`Execution exceeded ${timeoutMs} ms`, {
+    releaseWorkerSlot()
+    const timeoutError = new UntrustedCodeError(`Execution exceeded ${timeoutMs} ms`, {
       code: 'ERR_UNTRUSTED_CODE_TIMEOUT'
     })
+    await cleanupLocalModule(localModule, releasePreparationSlot, timeoutError)
+    throw timeoutError
   }
   delete options.rootDirectory
   delete options.maxRootEntries
   delete options.maxFileBytes
   delete options.maxTotalFileBytes
   options.timeoutMs = remainingTimeoutMs
-  return runOneShot(options, remainingTimeoutMs, timeoutMs, (sessionOptions) => {
-    return createUntrustedFileSession(localModule, sessionOptions, true)
-  })
+
+  let transferred = false
+  let primaryError
+  try {
+    return await runOneShot(options, remainingTimeoutMs, timeoutMs, (sessionOptions) => {
+      const session = createUntrustedFileSession(
+        localModule,
+        sessionOptions,
+        true,
+        releaseWorkerSlot,
+        releasePreparationSlot
+      )
+      transferred = true
+      return session
+    })
+  } catch (error) {
+    primaryError = error
+    throw error
+  } finally {
+    if (!transferred) {
+      releaseWorkerSlot()
+      await cleanupLocalModule(localModule, releasePreparationSlot, primaryError)
+    }
+  }
 }
 
 /**
@@ -141,9 +188,103 @@ export async function createUntrustedWorkerFromFile (modulePath, options = {}) {
     throw new RangeError(`startupTimeoutMs must not exceed ${MAX_TIMEOUT_MS}`)
   }
   const signal = validateSignal(options.signal)
-  if (signal?.aborted) throw abortError(signal.reason)
+  if (signal && Reflect.apply(abortSignalAborted, signal, [])) {
+    throw abortError(Reflect.apply(abortSignalReason, signal, []))
+  }
 
-  const localModule = await resolveLocalModule(
+  const releaseWorkerSlot = acquireWorkerSlot()
+  let releasePreparationSlot
+  try {
+    releasePreparationSlot = acquireFilePreparationSlot()
+  } catch (error) {
+    releaseWorkerSlot()
+    throw error
+  }
+  const localModule = await prepareLocalModule(
+    modulePath,
+    options,
+    startupTimeoutMs - (Date.now() - startedAt),
+    new UntrustedCodeError(`Startup exceeded ${startupTimeoutMs} ms`, {
+      code: 'ERR_UNTRUSTED_WORKER_STARTUP_TIMEOUT'
+    }),
+    releaseWorkerSlot,
+    releasePreparationSlot
+  )
+
+  const remainingStartupMs = startupTimeoutMs - (Date.now() - startedAt)
+  if (remainingStartupMs <= 0) {
+    releaseWorkerSlot()
+    const timeoutError = new UntrustedCodeError(`Startup exceeded ${startupTimeoutMs} ms`, {
+      code: 'ERR_UNTRUSTED_WORKER_STARTUP_TIMEOUT'
+    })
+    await cleanupLocalModule(localModule, releasePreparationSlot, timeoutError)
+    throw timeoutError
+  }
+  delete options.rootDirectory
+  delete options.maxRootEntries
+  delete options.maxFileBytes
+  delete options.maxTotalFileBytes
+  options.startupTimeoutMs = remainingStartupMs
+  try {
+    return createUntrustedFileSession(
+      localModule,
+      options,
+      false,
+      releaseWorkerSlot,
+      releasePreparationSlot
+    )
+  } catch (error) {
+    releaseWorkerSlot()
+    await cleanupLocalModule(localModule, releasePreparationSlot, error)
+    throw error
+  }
+}
+
+async function prepareLocalModule (
+  modulePath,
+  options,
+  timeoutMs,
+  timeoutError,
+  releaseWorkerSlot,
+  releasePreparationSlot
+) {
+  if (timeoutMs <= 0) {
+    releaseWorkerSlot()
+    releasePreparationSlot()
+    throw timeoutError
+  }
+
+  const controller = new AbortController()
+  const callerSignal = options.signal
+  let rejectInterruption
+  const interruption = new Promise((resolve, reject) => {
+    rejectInterruption = reject
+  })
+  const interrupt = (error) => {
+    if (controller.signal.aborted) return
+    controller.abort(error)
+    rejectInterruption(error)
+  }
+  const onAbort = () => interrupt(abortError(
+    Reflect.apply(abortSignalReason, callerSignal, [])
+  ))
+  if (callerSignal) {
+    try {
+      Reflect.apply(eventTargetAddEventListener, callerSignal, [
+        'abort',
+        onAbort,
+        { once: true }
+      ])
+      if (Reflect.apply(abortSignalAborted, callerSignal, [])) onAbort()
+    } catch (error) {
+      releaseWorkerSlot()
+      releasePreparationSlot()
+      throw error
+    }
+  }
+  const timer = setTimeout(() => interrupt(timeoutError), timeoutMs)
+
+  const preparation = resolveLocalModule(
     modulePath,
     options.rootDirectory,
     {
@@ -151,20 +292,84 @@ export async function createUntrustedWorkerFromFile (modulePath, options = {}) {
       maxFileBytes: options.maxFileBytes,
       maxTotalFileBytes: options.maxTotalFileBytes
     },
-    signal
-  )
-  const remainingStartupMs = startupTimeoutMs - (Date.now() - startedAt)
-  if (remainingStartupMs <= 0) {
-    throw new UntrustedCodeError(`Startup exceeded ${startupTimeoutMs} ms`, {
-      code: 'ERR_UNTRUSTED_WORKER_STARTUP_TIMEOUT'
-    })
+    controller.signal
+  ).then(async (localModule) => {
+    if (controller.signal.aborted) {
+      try {
+        await localModule.cleanup()
+      } catch (cleanupError) {
+        const error = new UntrustedCodeError(
+          'The private module snapshot could not be removed',
+          { code: 'ERR_UNTRUSTED_MODULE_CLEANUP', cause: cleanupError }
+        )
+        Object.defineProperty(error, 'cleanupUntilRemoved', {
+          value: localModule.cleanupUntilRemoved
+        })
+        throw error
+      }
+      throw controller.signal.reason
+    }
+    return localModule
+  })
+  // A filesystem request may settle after the public deadline. Preparation
+  // can never continue into worker creation.
+  void preparation.catch(() => {})
+
+  try {
+    return await Promise.race([preparation, interruption])
+  } catch (error) {
+    releaseWorkerSlot()
+    if (controller.signal.aborted) {
+      // Keep abandoned filesystem work independently bounded without starving
+      // ordinary worker admission if an operating-system request never settles.
+      void preparation.then(
+        releasePreparationSlot,
+        (preparationError) => releaseAfterPreparationError(
+          preparationError,
+          releasePreparationSlot
+        )
+      )
+    } else {
+      releaseAfterPreparationError(error, releasePreparationSlot)
+    }
+    throw error
+  } finally {
+    clearTimeout(timer)
+    if (callerSignal) {
+      try {
+        Reflect.apply(eventTargetRemoveEventListener, callerSignal, ['abort', onAbort])
+      } catch {}
+    }
   }
-  delete options.rootDirectory
-  delete options.maxRootEntries
-  delete options.maxFileBytes
-  delete options.maxTotalFileBytes
-  options.startupTimeoutMs = remainingStartupMs
-  return createUntrustedFileSession(localModule, options)
+}
+
+function releaseAfterPreparationError (error, releasePreparationSlot) {
+  if (typeof error?.cleanupUntilRemoved === 'function') {
+    void error.cleanupUntilRemoved().then(releasePreparationSlot, releasePreparationSlot)
+  } else {
+    releasePreparationSlot()
+  }
+}
+
+async function cleanupLocalModule (localModule, releasePreparationSlot, primaryError) {
+  try {
+    await localModule.cleanup()
+    releasePreparationSlot()
+  } catch (cleanupError) {
+    void localModule.cleanupUntilRemoved().then(
+      releasePreparationSlot,
+      releasePreparationSlot
+    )
+    throw new UntrustedCodeError(
+      'The private module snapshot could not be removed',
+      {
+        code: 'ERR_UNTRUSTED_MODULE_CLEANUP',
+        cause: primaryError
+          ? new AggregateError([primaryError, cleanupError], 'Operation and cleanup failures')
+          : cleanupError
+      }
+    )
+  }
 }
 
 function runOneShot (options, timeoutMs, reportedTimeoutMs, createSession) {
@@ -173,7 +378,9 @@ function runOneShot (options, timeoutMs, reportedTimeoutMs, createSession) {
   const environment = sanitizeEnvironment(options.environment)
   const resourceLimits = validateResourceLimits(options.resourceLimits)
   const signal = validateSignal(options.signal)
-  if (signal?.aborted) return Promise.reject(abortError(signal.reason))
+  if (signal && Reflect.apply(abortSignalAborted, signal, [])) {
+    return Promise.reject(abortError(Reflect.apply(abortSignalReason, signal, [])))
+  }
 
   let session
   try {
@@ -214,6 +421,10 @@ function runOneShot (options, timeoutMs, reportedTimeoutMs, createSession) {
       try {
         await session.terminate()
       } catch {}
+      const closed = await session.closed
+      if (closed.error?.code === 'ERR_UNTRUSTED_WORKER_CLEANUP') {
+        throw translateSessionError(closed.error, reportedTimeoutMs)
+      }
     })
 }
 
@@ -436,6 +647,10 @@ function translateSessionError (error, timeoutMs) {
     ERR_UNTRUSTED_WORKER_DIAGNOSTIC_CALLBACK: [
       error.message,
       'ERR_UNTRUSTED_CODE_DIAGNOSTIC_CALLBACK'
+    ],
+    ERR_UNTRUSTED_WORKER_CLEANUP: [
+      error.message,
+      'ERR_UNTRUSTED_CODE_CLEANUP'
     ],
     ERR_UNTRUSTED_WORKER_EXIT: [
       error.message.replace('The worker exited unexpectedly', 'The worker exited before returning a result'),

@@ -34,7 +34,7 @@ container sandbox.
 | One-shot host functions | Passed directly to `run()` | Available through one-shot and persistent APIs | Closed |
 | TypeScript declarations | Published declarations and generic result types | Published declarations with generic host-side values | Closed |
 | Guest TypeScript | Runtime type stripping | Optional erase-only stripping | Closed for erasable syntax |
-| Controlled module graph | Static, cyclic, and dynamic ESM through a host loader | Native local modules within an explicit filesystem-read root, or self-contained host bundles | Closed with a broader root-authority tradeoff |
+| Controlled module graph | Static, cyclic, and dynamic ESM through a host loader | Native local modules from a bounded staged snapshot, or self-contained host bundles | Closed with an explicit source-root authority tradeoff |
 | Interrupt and resume | Signed or stored replay continuations | No durable continuation mechanism | Important for approval and authentication workflows |
 | Aggregate admission control | Process-wide worker cap with immediate backpressure | Main-thread process-wide cap with immediate rejection | Closed with fail-closed host-thread restriction |
 | One-shot worker reuse | Pooled workers with fresh QuickJS contexts | A new worker for each one-shot execution | Deliberate no-pool security decision |
@@ -62,12 +62,13 @@ generated code when type correctness matters.
 ### Controlled modules
 
 `run` provides a host-controlled in-memory module loader. `secure-eval-worker`
-now provides path-based one-shot and persistent factories that use Node's
-native loader under a canonical `--allow-fs-read` root. This preserves native
-static, cyclic, package, and dynamic import behavior, but the complete root is
-an explicit read-authority grant and must contain no secrets or unrelated
-files. Self-contained host bundles remain available when the guest should
-receive no filesystem permission.
+now provides path-based one-shot and persistent factories that copy an
+authorized source root into a private bounded snapshot, then use Node's native
+loader under `--allow-fs-read` for that snapshot. This preserves native static,
+cyclic, package, and dynamic import behavior, but the source root is an explicit
+authority grant and must contain no secrets or unrelated files. Self-contained
+host bundles remain available when the guest should receive no filesystem
+permission.
 
 Neither model uses privileged loader hooks or creates an execution context
 outside the hardened worker. The path model additionally wraps descriptor APIs

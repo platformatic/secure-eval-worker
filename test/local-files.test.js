@@ -1,20 +1,42 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, open, rm, symlink, writeFile } from 'node:fs/promises'
+import { execFile } from 'node:child_process'
+import { mkdtemp, mkdir, open, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
-import { pathToFileURL } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+import { promisify } from 'node:util'
 import { Worker } from 'node:worker_threads'
 
 import {
+  configureWorkerAdmission,
+  createUntrustedWorker,
   createUntrustedWorkerFromFile,
+  runUntrustedCode,
   runUntrustedFile
 } from '../src/index.js'
+
+const execFileAsync = promisify(execFile)
+const packageUrl = new URL('../src/index.js', import.meta.url).href
+const repositoryRoot = fileURLToPath(new URL('..', import.meta.url))
 
 const TIMEOUTS = {
   startupTimeoutMs: 5_000,
   messageTimeoutMs: 5_000,
   lifetimeTimeoutMs: 5_000
+}
+
+async function waitForFilePreparation (entryPath, rootDirectory) {
+  const deadline = Date.now() + 5_000
+  while (true) {
+    try {
+      await runUntrustedFile(entryPath, { rootDirectory, timeoutMs: 5_000 })
+      return
+    } catch (error) {
+      if (error.code !== 'ERR_UNTRUSTED_CODE_CAPACITY' || Date.now() >= deadline) throw error
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+  }
 }
 
 async function fixture (files) {
@@ -113,15 +135,33 @@ test('uses the entry directory as the default trusted root', async (t) => {
 test('confines filesystem reads and blocks inherited descriptors', async (t) => {
   const files = await fixture({
     'entry.mjs': `
-      import { readFileSync } from 'node:fs'
+      import fs from 'node:fs'
+      import fsPromises from 'node:fs/promises'
+      import Module, { createRequire } from 'node:module'
+      const require = createRequire(import.meta.url)
       export default (input) => {
-        const local = readFileSync(new URL('./value.txt', import.meta.url), 'utf8')
-        try {
-          readFileSync(input.inheritedFd, 'utf8')
-          return { local, inherited: 'read' }
-        } catch (error) {
-          return { local, inherited: { code: error.code, permission: error.permission } }
+        const local = fs.readFileSync(new URL('./value.txt', import.meta.url), 'utf8')
+        const aliases = [fs, require('fs'), Module._load('fs')]
+        const inherited = []
+        for (const alias of aliases) {
+          for (const name of ['readFileSync', 'fstatSync', 'readSync', 'readvSync', 'closeSync']) {
+            try {
+              if (name === 'readSync') alias[name](input.inheritedFd, Buffer.alloc(1), 0, 1, 0)
+              else if (name === 'readvSync') alias[name](input.inheritedFd, [Buffer.alloc(1)], 0)
+              else alias[name](input.inheritedFd)
+              inherited.push('allowed:' + name)
+            } catch (error) {
+              inherited.push(error.code)
+            }
+          }
         }
+        try {
+          fsPromises.readFile(new URL('./value.txt', import.meta.url))
+          inherited.push('allowed:promise')
+        } catch (error) {
+          inherited.push(error.code)
+        }
+        return { local, inherited }
       }
     `,
     'value.txt': 'trusted root value'
@@ -130,14 +170,15 @@ test('confines filesystem reads and blocks inherited descriptors', async (t) => 
   const inherited = await open(files.path('value.txt'), 'r')
   t.after(() => inherited.close())
 
-  assert.deepEqual(await runUntrustedFile(files.path('entry.mjs'), {
+  const result = await runUntrustedFile(files.path('entry.mjs'), {
     rootDirectory: files.directory,
     input: { inheritedFd: inherited.fd },
     timeoutMs: 5_000
-  }), {
-    local: 'trusted root value',
-    inherited: { code: 'ERR_ACCESS_DENIED', permission: 'SandboxEscape' }
   })
+  assert.equal(result.local, 'trusted root value')
+  assert.equal(result.inherited.length, 16)
+  assert.equal(result.inherited.every((code) => code === 'ERR_ACCESS_DENIED'), true)
+  await inherited.stat()
 })
 
 test('rejects entries and symlinks outside the trusted root', async (t) => {
@@ -161,7 +202,7 @@ test('rejects entries and symlinks outside the trusted root', async (t) => {
       rootDirectory: root.directory,
       timeoutMs: 5_000
     }),
-    (error) => error.code === 'ERR_UNTRUSTED_MODULE_ROOT'
+    (error) => error.code === 'ERR_UNTRUSTED_MODULE_OUTSIDE_ROOT'
   )
 })
 
@@ -234,7 +275,7 @@ test('the native loader denies imports that escape the trusted root', async (t) 
       rootDirectory: root,
       timeoutMs: 5_000
     }),
-    (error) => error.code === 'ERR_UNTRUSTED_CODE' && error.remoteCode === 'ERR_ACCESS_DENIED'
+    (error) => error.code === 'ERR_UNTRUSTED_CODE' && error.remoteCode === 'ERR_MODULE_NOT_FOUND'
   )
 })
 
@@ -262,6 +303,31 @@ test('validates local-file options without invoking accessors', async (t) => {
   await assert.rejects(
     runUntrustedFile(new URL('https://example.com/entry.mjs')),
     /file: protocol/
+  )
+
+  const controller = new AbortController()
+  controller.signal.addEventListener = () => { throw new Error('poisoned addEventListener') }
+  controller.signal.removeEventListener = () => { throw new Error('poisoned removeEventListener') }
+  assert.equal(await runUntrustedFile(files.path('entry.mjs'), {
+    rootDirectory: files.directory,
+    signal: controller.signal,
+    timeoutMs: 5_000
+  }), 42)
+
+  const aborted = new AbortController()
+  aborted.abort(new Error('expected abort'))
+  Object.defineProperties(aborted.signal, {
+    aborted: { value: false },
+    reason: { value: new Error('shadowed reason') }
+  })
+  await assert.rejects(
+    runUntrustedFile(files.path('entry.mjs'), {
+      rootDirectory: files.directory,
+      signal: aborted.signal,
+      timeoutMs: 5_000
+    }),
+    (error) => error.code === 'ABORT_ERR' &&
+      error.cause?.message === 'expected abort'
   )
 })
 
@@ -350,8 +416,171 @@ test('local module errors use virtual paths', async (t) => {
   )
 })
 
+test('stages an immutable snapshot before guest execution', async (t) => {
+  const files = await fixture({
+    'entry.mjs': `
+      import { readFileSync } from 'node:fs'
+      export default ({ onMessage }) => {
+        onMessage(() => readFileSync(new URL('./value.txt', import.meta.url), 'utf8'))
+      }
+    `,
+    'value.txt': 'before'
+  })
+  t.after(() => files.cleanup())
+
+  const session = await createUntrustedWorkerFromFile(files.path('entry.mjs'), {
+    ...TIMEOUTS,
+    rootDirectory: files.directory
+  })
+  await session.ready
+  await writeFile(files.path('value.txt'), 'after')
+  assert.equal(await session.request(null), 'before')
+  await session.terminate()
+  await session.closed
+})
+
+test('removes private snapshots after worker exit', async (t) => {
+  const files = await fixture({
+    'one-shot.mjs': 'export default () => import.meta.url',
+    'persistent.mjs': `
+      export default ({ onMessage }) => onMessage(() => import.meta.url)
+    `
+  })
+  t.after(() => files.cleanup())
+
+  const oneShotUrl = await runUntrustedFile(files.path('one-shot.mjs'), {
+    rootDirectory: files.directory,
+    timeoutMs: 5_000
+  })
+  await assert.rejects(stat(fileURLToPath(oneShotUrl)), (error) => error.code === 'ENOENT')
+
+  const session = await createUntrustedWorkerFromFile(files.path('persistent.mjs'), {
+    ...TIMEOUTS,
+    rootDirectory: files.directory
+  })
+  await session.ready
+  const persistentUrl = await session.request(null)
+  await session.terminate()
+  await session.closed
+  await assert.rejects(stat(fileURLToPath(persistentUrl)), (error) => error.code === 'ENOENT')
+})
+
+test('surfaces snapshot cleanup failures under host permissions', {
+  skip: process.platform === 'win32'
+}, async (t) => {
+  const files = await fixture({ 'entry.mjs': 'export default () => 42' })
+  const stagingBase = await mkdtemp(join(tmpdir(), 'secure-eval-worker-staging-test-'))
+  t.after(async () => {
+    await Promise.all([
+      files.cleanup(),
+      rm(stagingBase, { force: true, recursive: true })
+    ])
+  })
+
+  const childSource = `
+    import { runUntrustedFile } from ${JSON.stringify(packageUrl)}
+    try {
+      await runUntrustedFile(${JSON.stringify(files.path('entry.mjs'))}, {
+        rootDirectory: ${JSON.stringify(files.directory)},
+        timeoutMs: 5000
+      })
+    } catch (error) {
+      console.log(error.code)
+    }
+  `
+  const { stdout } = await execFileAsync(process.execPath, [
+    '--permission',
+    '--allow-worker',
+    `--allow-fs-read=${repositoryRoot}`,
+    `--allow-fs-read=${files.directory}`,
+    `--allow-fs-write=${stagingBase}`,
+    '--input-type=module',
+    '--eval',
+    childSource
+  ], {
+    env: { ...process.env, TMPDIR: stagingBase },
+    timeout: 10_000
+  })
+  assert.equal(stdout.trim(), 'ERR_UNTRUSTED_CODE_CLEANUP')
+  assert.equal((await readdir(stagingBase)).length, 1)
+})
+
+test('acquires admission before touching the module root', async (t) => {
+  configureWorkerAdmission({ maxConcurrentWorkers: 1 })
+  t.after(() => configureWorkerAdmission({ maxConcurrentWorkers: 4 }))
+  const active = createUntrustedWorker('await new Promise(() => {})', TIMEOUTS)
+  const ready = active.ready.catch(() => {})
+
+  const files = await fixture({ 'entry.mjs': 'export default () => 42' })
+  t.after(() => files.cleanup())
+  await symlink('../outside', files.path('invalid-link'))
+
+  await assert.rejects(
+    runUntrustedFile(files.path('entry.mjs'), {
+      rootDirectory: files.directory,
+      timeoutMs: 5_000
+    }),
+    (error) => error.code === 'ERR_UNTRUSTED_CODE_CAPACITY'
+  )
+  await assert.rejects(
+    createUntrustedWorkerFromFile(files.path('entry.mjs'), {
+      ...TIMEOUTS,
+      rootDirectory: files.directory
+    }),
+    (error) => error.code === 'ERR_UNTRUSTED_WORKER_CAPACITY'
+  )
+
+  await active.terminate()
+  await ready
+  await active.closed
+})
+
+test('preparation deadlines reject promptly without starving worker admission', async (t) => {
+  configureWorkerAdmission({ maxConcurrentWorkers: 1 })
+  t.after(() => configureWorkerAdmission({ maxConcurrentWorkers: 4 }))
+  const sources = { 'entry.mjs': 'export default () => 42' }
+  for (let index = 0; index < 100; index++) {
+    sources[`modules/${index}.mjs`] = `export default ${index}`
+  }
+  const files = await fixture(sources)
+  t.after(() => files.cleanup())
+
+  const startedAt = Date.now()
+  await assert.rejects(
+    runUntrustedFile(files.path('entry.mjs'), {
+      rootDirectory: files.directory,
+      timeoutMs: 1
+    }),
+    (error) => error.code === 'ERR_UNTRUSTED_CODE_TIMEOUT'
+  )
+  assert.ok(Date.now() - startedAt < 1_000)
+  assert.equal(await runUntrustedCode('return 42', { timeoutMs: 5_000 }), 42)
+  await waitForFilePreparation(files.path('entry.mjs'), files.directory)
+})
+
+test('cancellation stops preparation without starving worker admission', async (t) => {
+  configureWorkerAdmission({ maxConcurrentWorkers: 1 })
+  t.after(() => configureWorkerAdmission({ maxConcurrentWorkers: 4 }))
+  const sources = { 'entry.mjs': 'export default () => 42' }
+  for (let index = 0; index < 100; index++) {
+    sources[`modules/${index}.mjs`] = `export default ${index}`
+  }
+  const files = await fixture(sources)
+  t.after(() => files.cleanup())
+  const controller = new AbortController()
+
+  const execution = runUntrustedFile(files.path('entry.mjs'), {
+    rootDirectory: files.directory,
+    signal: controller.signal,
+    timeoutMs: 5_000
+  })
+  setImmediate(() => controller.abort('review-test'))
+  await assert.rejects(execution, (error) => error.name === 'AbortError')
+  assert.equal(await runUntrustedCode('return 42', { timeoutMs: 5_000 }), 42)
+  await waitForFilePreparation(files.path('entry.mjs'), files.directory)
+})
+
 test('host worker threads fail before resolving local module paths', async () => {
-  const packageUrl = new URL('../src/index.js', import.meta.url).href
   const childSource = `
     import { parentPort } from 'node:worker_threads'
     import { runUntrustedFile } from ${JSON.stringify(packageUrl)}
@@ -369,6 +598,6 @@ test('host worker threads fail before resolving local module paths', async () =>
     child.once('message', resolve)
     child.once('error', reject)
   })
-  assert.deepEqual(result, { code: 'ERR_UNTRUSTED_WORKER_ADMISSION_UNAVAILABLE' })
+  assert.deepEqual(result, { code: 'ERR_UNTRUSTED_CODE_ADMISSION_UNAVAILABLE' })
   await child.terminate()
 })

@@ -1,10 +1,11 @@
 # Worker admission control
 
-`secure-eval-worker` limits the number of live workers in a process. The limit
-covers one-shot runs and persistent sessions together. Admission is fail-fast:
+`secure-eval-worker` limits the number of admitted sandbox operations in a
+process. The limit covers one-shot runs and persistent sessions together,
+including local-module staging before worker creation. Admission is fail-fast:
 there is no internal queue and rejected work is never started later.
 
-The default is four live workers. Sandbox workers must be created from the
+The default is four admitted operations. Sandbox workers must be created from the
 process main thread. Calls from host `worker_threads` fail closed with
 `ERR_UNTRUSTED_WORKER_ADMISSION_UNAVAILABLE`; otherwise terminating a host
 thread could orphan its admission leases. Multiple package copies in the main
@@ -25,9 +26,18 @@ promise with `ERR_UNTRUSTED_CODE_CAPACITY`. Applications that need waiting or
 fairness should implement an application-owned bounded queue before calling
 this package.
 
-A slot is acquired immediately before `new Worker()` and remains occupied until
-the worker's `exit` event. Calling `terminate()` does not release it early.
-This prevents termination races from temporarily exceeding the configured cap.
+Source-string execution acquires a slot immediately before `new Worker()`.
+Local-file execution acquires one before touching the source tree and transfers
+that same lease to the worker after staging. Preparation failures release it
+after staging has stopped and temporary files have been removed. Once a worker
+starts, the slot remains occupied until its `exit` event; calling `terminate()`
+does not release it early. This prevents preparation and termination races from
+exceeding the configured cap. A public staging timeout or cancellation rejects
+promptly. Its worker slot is released, while a separate bounded preparation
+slot remains occupied until any in-flight filesystem call settles and cleanup
+finishes. This prevents abandoned preparation from starving ordinary workers
+or allowing unbounded additional scans; avoid roots on filesystems that can
+stall indefinitely.
 
 ## Default measurement
 

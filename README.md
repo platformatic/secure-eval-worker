@@ -2,7 +2,7 @@
 
 Run JavaScript scripts, self-contained ES modules, or trusted-root local module trees in Node.js workers with a small, explicitly defined authority set. Use one-shot evaluation or create a persistent session that exchanges messages with the component.
 
-Each worker starts with Node's Permission Model enabled. Source-string workers receive only the `worker` permission; local-file workers additionally receive read permission for their canonical trusted root. The trusted bootstrap immediately calls `process.permission.drop('worker')` before compiling, importing, or invoking caller-provided source. The worker also receives an explicit environment instead of inheriting `process.env`, has V8 resource limits, and is terminated after a deadline.
+Each worker starts with Node's Permission Model enabled. Source-string workers receive only the `worker` permission; local-file workers additionally receive read permission for a private staged snapshot of their trusted root. The trusted bootstrap immediately calls `process.permission.drop('worker')` before compiling, importing, or invoking caller-provided source. The worker also receives an explicit environment instead of inheriting `process.env`, has V8 resource limits, and is terminated after a deadline.
 
 > [!WARNING]
 > Node's Permission Model and `node:worker_threads` are defense-in-depth controls, **not a complete security boundary against malicious code**. Workers share a process, and resource limits do not constrain every kind of allocation. For adversarial multi-tenant workloads, put this module inside a separately sandboxed process or container with OS-level CPU, memory, filesystem, network, and syscall restrictions.
@@ -10,7 +10,7 @@ Each worker starts with Node's Permission Model enabled. Source-string workers r
 ## Requirements
 
 - Node.js 26.3.0 or newer (`process.permission.drop()` is required)
-- No permission flags are required when the host uses Node's default mode. If the host itself runs with `--permission`, it must include `--allow-worker`. Path-based execution additionally requires host read permission for the entry and trusted root. Each sandbox worker is started with its own reviewed `execArgv`.
+- No permission flags are required when the host uses Node's default mode. If the host itself runs with `--permission`, it must include `--allow-worker`. Path-based execution additionally requires host read permission for the entry/root and read/write permission for the operating-system temporary directory used to create and remove the private snapshot. Each sandbox worker is started with its own reviewed `execArgv`.
 
 ## Usage
 
@@ -123,7 +123,7 @@ const result = await runUntrustedFile('./components/calculate.mjs', {
 })
 ```
 
-Static and dynamic imports are resolved by Node's native module loader. `rootDirectory` is canonicalized and granted through `--allow-fs-read`; imports and reads resolving outside it are denied by Node's Permission Model. It defaults to the entry file's directory. The entry must be a regular file inside the canonical root. Because Node's Permission Model can follow relative symlinks outside an allowed directory, the complete root is scanned before startup and any symbolic link or non-file/non-directory entry is rejected. `maxRootEntries` bounds that scan and defaults to 10,000. `maxFileBytes` and `maxTotalFileBytes` bound individual files and the complete tree, defaulting to 1 MiB and 16 MiB.
+Static and dynamic imports are resolved by Node's native module loader. `rootDirectory` defaults to the entry file's directory and is treated as the source authorization boundary. Before worker startup, the host copies its regular files into a private temporary snapshot using no-follow file handles where supported, canonical containment and file-identity checks. Symbolic links and special files are rejected. The worker receives `--allow-fs-read` only for that snapshot, so changes made after staging cannot redirect guest reads or imports. `maxRootEntries` bounds staging and defaults to 10,000. `maxFileBytes` and `maxTotalFileBytes` default to 1 MiB and 16 MiB.
 
 Use the asynchronous `createUntrustedWorkerFromFile()` factory for a persistent component:
 
@@ -146,7 +146,7 @@ await component.terminate()
 
 Its default export uses the same `{ input, send, onMessage, host }` setup contract as an in-memory module. JavaScript and Node's native erase-only TypeScript module formats are supported according to the selected file extension.
 
-The trusted root is an explicit authority grant. Guest code can use the retained synchronous `node:fs` read facade to read files inside it, and imported code can load any Node-supported module or data reachable within it. Never include secrets, native addons, sockets, or unrelated application files in that directory. Filesystem writes, promise-based filesystem APIs, inherited descriptors, and reads outside the root remain disabled. Concurrently mutable module trees require an outer OS sandbox or immutable staging directory for stronger TOCTOU protection.
+The trusted root is an explicit authority grant. Guest code can use the retained synchronous `node:fs` read facade to read files in its staged snapshot, and imported code can load any Node-supported module or data copied from the root. Never include secrets, native addons, sockets, or unrelated application files in that directory. Filesystem writes, promise-based filesystem APIs, inherited descriptors, and reads outside the snapshot remain disabled. The source filesystem and any process able to mutate it must remain trusted during staging: portable Node APIs cannot prove path containment against an actively adversarial parent-directory rename/symlink race. Concurrent changes can also make staging fail or produce files captured at different instants. Use an application-owned immutable source tree—or an outer OS sandbox—when that race is in scope. The private snapshot is removed after worker exit, and cleanup failures are reported with `ERR_UNTRUSTED_MODULE_CLEANUP`, `ERR_UNTRUSTED_WORKER_CLEANUP`, or `ERR_UNTRUSTED_CODE_CLEANUP`.
 
 ### Host functions
 
@@ -199,15 +199,15 @@ Options:
 - `maxInputBytes`, `maxMessageBytes`, `maxOutputMessages`, and `maxOutputBytes`: equivalent to the persistent options below.
 - `diagnostics` and `onDiagnostic`: opt into bounded, sanitized console records as described below.
 
-Every execution uses a new worker. Source-string execution cannot obtain filesystem, network, child-process, native-addon, inspector, WASI, or nested-worker access through supported Node APIs because none of those permissions remain when source starts. Local-file execution retains only its explicit filesystem-read root for native module loading and path-based reads. Known Permission Model gaps and process-wide APIs are additionally disabled before source is loaded. Ordinary guest stdout and stderr writes are discarded rather than forwarded into host logs.
+Every execution uses a new worker. Source-string execution cannot obtain filesystem, network, child-process, native-addon, inspector, WASI, or nested-worker access through supported Node APIs because none of those permissions remain when source starts. Local-file execution retains read access only to its private staged snapshot for native module loading and path-based reads. Known Permission Model gaps and process-wide APIs are additionally disabled before source is loaded. Ordinary guest stdout and stderr writes are discarded rather than forwarded into host logs.
 
 ### `runUntrustedFile(modulePath[, options])`
 
-Asynchronously canonicalizes a path string or `file:` URL, then executes its default-exported function in a fresh worker. Options match `runUntrustedCode()` except `language` and `maxSourceBytes`, plus `rootDirectory`, `maxRootEntries`, `maxFileBytes`, and `maxTotalFileBytes`. `timeoutMs` covers root scanning, path preparation, worker startup, and execution. The file extension selects Node's module format and optional native TypeScript stripping.
+Asynchronously stages a path string or `file:` URL and executes its default-exported function in a fresh worker. Options match `runUntrustedCode()` except `language` and `maxSourceBytes`, plus `rootDirectory`, `maxRootEntries`, `maxFileBytes`, and `maxTotalFileBytes`. `timeoutMs` actively bounds staging, worker startup, and execution. The file extension selects Node's module format and optional native TypeScript stripping.
 
 ### `createUntrustedWorkerFromFile(modulePath[, options])`
 
-Asynchronously returns an `UntrustedWorkerSession` for a local module. Options match `createUntrustedWorker()` except `type`, `language`, and `maxSourceBytes`, plus `rootDirectory`, `maxRootEntries`, `maxFileBytes`, and `maxTotalFileBytes`. `startupTimeoutMs` includes root scanning and path preparation. The entry must default-export the persistent setup function.
+Asynchronously returns an `UntrustedWorkerSession` for a staged local module. Options match `createUntrustedWorker()` except `type`, `language`, and `maxSourceBytes`, plus `rootDirectory`, `maxRootEntries`, `maxFileBytes`, and `maxTotalFileBytes`. `startupTimeoutMs` actively bounds staging and worker startup. The entry must default-export the persistent setup function.
 
 ### `createRunner([defaultOptions])`
 
@@ -215,7 +215,7 @@ Returns a callable wrapper around `runUntrustedCode()` with validated, snapshott
 
 ### `configureWorkerAdmission({ maxConcurrentWorkers })`
 
-Sets the fail-fast process-wide live-worker limit shared by one-shot runs and persistent sessions. The measured conservative default is `4`. There is no internal queue. Persistent creation throws `ERR_UNTRUSTED_WORKER_CAPACITY`; one-shot execution rejects with `ERR_UNTRUSTED_CODE_CAPACITY`. Sandbox creation from host worker threads fails closed with `ERR_UNTRUSTED_WORKER_ADMISSION_UNAVAILABLE` so terminating a host thread cannot orphan a slot. Slots are released only after sandbox worker exit. See [`docs/worker-admission.md`](docs/worker-admission.md) for backpressure guidance and limitations.
+Sets the fail-fast process-wide admission limit shared by one-shot runs and persistent sessions. Local-file staging holds the same slot that is later transferred to its worker. The measured conservative default is `4`. There is no internal queue. Persistent creation throws `ERR_UNTRUSTED_WORKER_CAPACITY`; one-shot execution rejects with `ERR_UNTRUSTED_CODE_CAPACITY`. Sandbox creation from host worker threads fails closed with `ERR_UNTRUSTED_WORKER_ADMISSION_UNAVAILABLE` so terminating a host thread cannot orphan a slot. Slots are released only after sandbox worker exit. See [`docs/worker-admission.md`](docs/worker-admission.md) for backpressure guidance and limitations.
 
 ### `createUntrustedWorker(source[, options])`
 
