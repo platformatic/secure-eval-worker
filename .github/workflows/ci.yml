@@ -15,12 +15,15 @@ concurrency:
 
 jobs:
   test:
-    name: Node.js ${{ matrix.node-version }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+    name: ${{ matrix.os }} / Node.js ${{ matrix.node-version }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
         node-version:
           - 26.3.0
           - 26.x
@@ -44,31 +47,4 @@ jobs:
         run: npm run test:types
 
       - name: Verify package contents
-        run: |
-          npm pack --dry-run --json > "$RUNNER_TEMP/package.json"
-          node --input-type=module <<'EOF'
-          import assert from 'node:assert/strict'
-          import fs from 'node:fs'
-
-          const [pack] = JSON.parse(fs.readFileSync(`${process.env.RUNNER_TEMP}/package.json`, 'utf8'))
-          const actual = pack.files.map(({ path }) => path).sort()
-          const expected = [
-            'LICENSE',
-            'README.md',
-            'docs/deferred-capabilities.md',
-            'docs/error-values.md',
-            'docs/module-dependencies.md',
-            'docs/one-shot-pooling.md',
-            'docs/vercel-labs-run-comparison.md',
-            'docs/worker-admission.md',
-            'package.json',
-            'src/admission.js',
-            'src/host-functions.js',
-            'src/index.d.ts',
-            'src/index.js',
-            'src/internal.js',
-            'src/local-files.js',
-            'src/session.js'
-          ]
-          assert.deepEqual(actual, expected)
-          EOF
+        run: npm run test:package

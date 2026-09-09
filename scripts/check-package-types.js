@@ -5,10 +5,13 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
+const npmExecPath = process.env.npm_execpath
+if (!npmExecPath) throw new Error('npm_execpath is required')
 const temporary = mkdtempSync(join(tmpdir(), 'secure-eval-worker-types-'))
 
 try {
-  const output = execFileSync('npm', [
+  const output = execFileSync(process.execPath, [
+    npmExecPath,
     'pack',
     '--json',
     '--pack-destination',
@@ -19,7 +22,11 @@ try {
   const installedPackage = join(project, 'node_modules', 'secure-eval-worker')
   mkdirSync(installedPackage, { recursive: true })
   execFileSync('tar', ['-xzf', join(temporary, filename), '--strip-components=1', '-C', installedPackage])
-  symlinkSync(join(root, 'node_modules', '@types'), join(project, 'node_modules', '@types'), 'dir')
+  symlinkSync(
+    join(root, 'node_modules', '@types'),
+    join(project, 'node_modules', '@types'),
+    process.platform === 'win32' ? 'junction' : 'dir'
+  )
   cpSync(join(root, 'fixtures', 'types'), project, { recursive: true })
 
   execFileSync(process.execPath, [

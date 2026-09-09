@@ -107,7 +107,7 @@ test('one-shot host functions enforce call and output limits', async () => {
         tools: {
           async value () {
             calls++
-            await new Promise((resolve) => setTimeout(resolve, 20))
+            await new Promise(() => {})
             return 42
           }
         }

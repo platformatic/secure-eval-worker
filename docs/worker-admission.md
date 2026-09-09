@@ -26,18 +26,29 @@ promise with `ERR_UNTRUSTED_CODE_CAPACITY`. Applications that need waiting or
 fairness should implement an application-owned bounded queue before calling
 this package.
 
-Source-string execution acquires a slot immediately before `new Worker()`.
-Local-file execution acquires one before touching the source tree and transfers
-that same lease to the worker after staging. Preparation failures release it
-after staging has stopped and temporary files have been removed. Once a worker
-starts, the slot remains occupied until its `exit` event; calling `terminate()`
-does not release it early. This prevents preparation and termination races from
-exceeding the configured cap. A public staging timeout or cancellation rejects
+Every execution API acquires a slot before inspecting caller-controlled options,
+cloning input, or validating nested policy objects. Local-file execution also
+acquires a preparation slot before touching the source tree and transfers the
+worker lease after staging. Preparation failures release the worker lease after
+staging has stopped and temporary files have been removed. Once a worker starts,
+the slot remains occupied until its `exit` event; calling `terminate()` or
+reaching the bounded public termination-settlement deadline does not release it
+early. This prevents preparation and termination races from exceeding the
+configured cap. A public staging timeout or cancellation rejects
 promptly. Its worker slot is released, while a separate bounded preparation
 slot remains occupied until any in-flight filesystem call settles and cleanup
-finishes. This prevents abandoned preparation from starving ordinary workers
-or allowing unbounded additional scans; avoid roots on filesystems that can
-stall indefinitely.
+finishes. Cleanup gets only a bounded public wait before the session or one-shot
+promise settles; unresolved removal continues in a separately admitted janitor,
+and completed failures are retried with exponential backoff. A stalled removal
+remains in flight. This prevents abandoned preparation from starving
+ordinary workers or allowing unbounded additional scans; avoid source and
+temporary roots on filesystems that can stall indefinitely.
+
+A local worker may hold at most 64 descriptors opened through its constrained
+filesystem facade, and a separate shared counter caps them at 256 process-wide
+regardless of the configured worker limit. Node's worker descriptor tracking
+closes retained descriptors on actual worker exit, when the package releases
+that worker's contribution to the process-wide counter.
 
 ## Default measurement
 

@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
 import { mkdtemp, mkdir, open, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { platform, tmpdir } from 'node:os'
+import { join, sep } from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
@@ -15,6 +15,7 @@ import {
   runUntrustedCode,
   runUntrustedFile
 } from '../src/index.js'
+import { createUntrustedFileSession } from '../src/session.js'
 
 const execFileAsync = promisify(execFile)
 const packageUrl = new URL('../src/index.js', import.meta.url).href
@@ -181,6 +182,99 @@ test('confines filesystem reads and blocks inherited descriptors', async (t) => 
   await inherited.stat()
 })
 
+test('bounds guest-opened descriptors across every filesystem alias', async (t) => {
+  const files = await fixture({
+    'entry.mjs': `
+      import fs, { closeSync, openSync } from 'node:fs'
+      import Module, { createRequire } from 'node:module'
+      const require = createRequire(import.meta.url)
+      export default () => {
+        const path = new URL('./value.txt', import.meta.url)
+        const aliases = [
+          fs,
+          { openSync, closeSync },
+          require('fs'),
+          Module._load('fs'),
+          process.getBuiltinModule('fs')
+        ]
+        const descriptors = []
+        for (let index = 0; index < 64; index++) {
+          descriptors.push(aliases[index % aliases.length].openSync(path, 'r'))
+        }
+        let limitCode
+        try {
+          fs.openSync(path, 'r')
+        } catch (error) {
+          limitCode = error.code
+        }
+        for (let index = 0; index < descriptors.length; index++) {
+          aliases[index % aliases.length].closeSync(descriptors[index])
+        }
+        const reopened = fs.openSync(path, 'r')
+        fs.closeSync(reopened)
+        return limitCode
+      }
+    `,
+    'value.txt': 'bounded'
+  })
+  t.after(() => files.cleanup())
+
+  assert.equal(await runUntrustedFile(files.path('entry.mjs'), {
+    rootDirectory: files.directory,
+    timeoutMs: 5_000
+  }), 'ERR_UNTRUSTED_FILE_DESCRIPTOR_LIMIT')
+})
+
+test('enforces a fixed process-wide descriptor quota and releases it on exit', async (t) => {
+  configureWorkerAdmission({ maxConcurrentWorkers: 5 })
+  const files = await fixture({
+    'entry.mjs': `
+      import fs from 'node:fs'
+      const retained = []
+      export default ({ onMessage }) => onMessage((count) => {
+        let opened = 0
+        try {
+          for (; opened < count; opened++) {
+            retained.push(fs.openSync(new URL('./value.txt', import.meta.url), 'r'))
+          }
+          return { opened }
+        } catch (error) {
+          return { code: error.code, opened }
+        }
+      })
+    `,
+    'value.txt': 'bounded globally'
+  })
+  const sessions = []
+  t.after(async () => {
+    await Promise.all(sessions.map((session) => session.terminate().catch(() => {})))
+    configureWorkerAdmission({ maxConcurrentWorkers: 4 })
+    await files.cleanup()
+  })
+
+  for (let index = 0; index < 5; index++) {
+    const session = await createUntrustedWorkerFromFile(files.path('entry.mjs'), {
+      ...TIMEOUTS,
+      lifetimeTimeoutMs: 15_000,
+      rootDirectory: files.directory
+    })
+    sessions.push(session)
+    await session.ready
+  }
+  for (const session of sessions.slice(0, 4)) {
+    assert.deepEqual(await session.request(64), { opened: 64 })
+  }
+  assert.deepEqual(await sessions[4].request(1), {
+    code: 'ERR_UNTRUSTED_FILE_DESCRIPTOR_CAPACITY',
+    opened: 0
+  })
+
+  const first = sessions.shift()
+  await first.terminate()
+  await first.closed
+  assert.deepEqual(await sessions[3].request(1), { opened: 1 })
+})
+
 test('rejects entries and symlinks outside the trusted root', async (t) => {
   const root = await fixture({ 'inside.mjs': 'export default () => 1' })
   const outside = await fixture({ 'outside.mjs': 'export default () => 2' })
@@ -218,6 +312,31 @@ test('rejects relative symlinks before granting the trusted root', async (t) => 
   await assert.rejects(
     runUntrustedFile(join(root, 'entry.mjs'), {
       rootDirectory: root,
+      timeoutMs: 5_000
+    }),
+    (error) => error.code === 'ERR_UNTRUSTED_MODULE_ROOT'
+  )
+})
+
+test('rejects Windows junctions and accepts canonical case aliases', {
+  skip: platform() !== 'win32'
+}, async (t) => {
+  const root = await fixture({ 'entry.mjs': 'export default () => 42' })
+  const outside = await fixture({ 'outside.txt': 'secret' })
+  t.after(async () => Promise.all([root.cleanup(), outside.cleanup()]))
+
+  assert.equal(await runUntrustedFile(
+    root.path('entry.mjs').toUpperCase(),
+    {
+      rootDirectory: root.directory.toUpperCase(),
+      timeoutMs: 5_000
+    }
+  ), 42)
+
+  await symlink(outside.directory, root.path('junction'), 'junction')
+  await assert.rejects(
+    runUntrustedFile(root.path('entry.mjs'), {
+      rootDirectory: root.directory,
       timeoutMs: 5_000
     }),
     (error) => error.code === 'ERR_UNTRUSTED_MODULE_ROOT'
@@ -465,34 +584,86 @@ test('removes private snapshots after worker exit', async (t) => {
   await assert.rejects(stat(fileURLToPath(persistentUrl)), (error) => error.code === 'ENOENT')
 })
 
+test('persistent cleanup settles while a stalled janitor retains preparation', async (t) => {
+  const files = await fixture({
+    'entry.mjs': `
+      export default ({ onMessage }) => onMessage(() => 42)
+    `
+  })
+  t.after(() => files.cleanup())
+  let releaseWorkerCalls = 0
+  let releasePreparationCalls = 0
+  let resolveJanitor
+  const janitor = new Promise((resolve) => { resolveJanitor = resolve })
+  const rootPathPrefix = files.directory.endsWith(sep)
+    ? files.directory
+    : files.directory + sep
+  const localModule = {
+    entryUrl: pathToFileURL(files.path('entry.mjs')).href,
+    rootPath: files.directory,
+    rootPathPrefix,
+    rootUrlPrefix: pathToFileURL(rootPathPrefix).href,
+    cleanup: () => new Promise(() => {}),
+    cleanupUntilRemoved: () => janitor
+  }
+  const session = createUntrustedFileSession(
+    localModule,
+    TIMEOUTS,
+    false,
+    () => { releaseWorkerCalls++ },
+    () => { releasePreparationCalls++ }
+  )
+  await session.ready
+  await session.terminate()
+  const closed = await Promise.race([
+    session.closed,
+    new Promise((resolve) => setTimeout(() => resolve('stalled'), 1_000))
+  ])
+  assert.notEqual(closed, 'stalled')
+  assert.equal(closed.error.code, 'ERR_UNTRUSTED_WORKER_CLEANUP')
+  assert.equal(releaseWorkerCalls, 1)
+  assert.equal(releasePreparationCalls, 0)
+  resolveJanitor()
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(releasePreparationCalls, 1)
+})
+
 test('surfaces snapshot cleanup failures under host permissions', {
   skip: process.platform === 'win32'
 }, async (t) => {
   const files = await fixture({ 'entry.mjs': 'export default () => 42' })
+  const invalid = await fixture({ 'entry.mjs': 'export default () => 42' })
+  await symlink('../outside', invalid.path('invalid-link'))
   const stagingBase = await mkdtemp(join(tmpdir(), 'secure-eval-worker-staging-test-'))
   t.after(async () => {
     await Promise.all([
       files.cleanup(),
+      invalid.cleanup(),
       rm(stagingBase, { force: true, recursive: true })
     ])
   })
 
   const childSource = `
     import { runUntrustedFile } from ${JSON.stringify(packageUrl)}
-    try {
-      await runUntrustedFile(${JSON.stringify(files.path('entry.mjs'))}, {
-        rootDirectory: ${JSON.stringify(files.directory)},
-        timeoutMs: 5000
-      })
-    } catch (error) {
-      console.log(error.code)
+    const codes = []
+    for (const [entry, root] of ${JSON.stringify([
+      [files.path('entry.mjs'), files.directory],
+      [invalid.path('entry.mjs'), invalid.directory]
+    ])}) {
+      try {
+        await runUntrustedFile(entry, { rootDirectory: root, timeoutMs: 5000 })
+      } catch (error) {
+        codes.push(error.code)
+      }
     }
+    console.log(JSON.stringify(codes))
   `
   const { stdout } = await execFileAsync(process.execPath, [
     '--permission',
     '--allow-worker',
     `--allow-fs-read=${repositoryRoot}`,
     `--allow-fs-read=${files.directory}`,
+    `--allow-fs-read=${invalid.directory}`,
     `--allow-fs-write=${stagingBase}`,
     '--input-type=module',
     '--eval',
@@ -501,11 +672,14 @@ test('surfaces snapshot cleanup failures under host permissions', {
     env: { ...process.env, TMPDIR: stagingBase },
     timeout: 10_000
   })
-  assert.equal(stdout.trim(), 'ERR_UNTRUSTED_CODE_CLEANUP')
-  assert.equal((await readdir(stagingBase)).length, 1)
+  assert.deepEqual(JSON.parse(stdout), [
+    'ERR_UNTRUSTED_CODE_CLEANUP',
+    'ERR_UNTRUSTED_MODULE_CLEANUP'
+  ])
+  assert.equal((await readdir(stagingBase)).length, 2)
 })
 
-test('acquires admission before touching the module root', async (t) => {
+test('acquires admission before touching the module root or input', async (t) => {
   configureWorkerAdmission({ maxConcurrentWorkers: 1 })
   t.after(() => configureWorkerAdmission({ maxConcurrentWorkers: 4 }))
   const active = createUntrustedWorker('await new Promise(() => {})', TIMEOUTS)
@@ -514,10 +688,19 @@ test('acquires admission before touching the module root', async (t) => {
   const files = await fixture({ 'entry.mjs': 'export default () => 42' })
   t.after(() => files.cleanup())
   await symlink('../outside', files.path('invalid-link'))
+  let inputReads = 0
+  const input = Object.defineProperty({}, 'value', {
+    enumerable: true,
+    get () {
+      inputReads++
+      return 42
+    }
+  })
 
   await assert.rejects(
     runUntrustedFile(files.path('entry.mjs'), {
       rootDirectory: files.directory,
+      input,
       timeoutMs: 5_000
     }),
     (error) => error.code === 'ERR_UNTRUSTED_CODE_CAPACITY'
@@ -525,10 +708,28 @@ test('acquires admission before touching the module root', async (t) => {
   await assert.rejects(
     createUntrustedWorkerFromFile(files.path('entry.mjs'), {
       ...TIMEOUTS,
+      input,
       rootDirectory: files.directory
     }),
     (error) => error.code === 'ERR_UNTRUSTED_WORKER_CAPACITY'
   )
+  let optionInspections = 0
+  const uninspectableOptions = new Proxy({}, {
+    ownKeys () {
+      optionInspections++
+      return []
+    }
+  })
+  await assert.rejects(
+    runUntrustedFile(files.path('entry.mjs'), uninspectableOptions),
+    (error) => error.code === 'ERR_UNTRUSTED_CODE_CAPACITY'
+  )
+  await assert.rejects(
+    createUntrustedWorkerFromFile(files.path('entry.mjs'), uninspectableOptions),
+    (error) => error.code === 'ERR_UNTRUSTED_WORKER_CAPACITY'
+  )
+  assert.equal(optionInspections, 0)
+  assert.equal(inputReads, 0)
 
   await active.terminate()
   await ready

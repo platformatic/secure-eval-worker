@@ -1,11 +1,17 @@
 import assert from 'node:assert/strict'
+import { cp, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { test } from 'node:test'
+import { pathToFileURL } from 'node:url'
 import { Worker } from 'node:worker_threads'
 
 import {
   configureWorkerAdmission,
+  createRunner,
   createUntrustedWorker,
-  runUntrustedCode
+  runUntrustedCode,
+  UntrustedWorkerSession
 } from '../src/index.js'
 
 const SESSION_OPTIONS = {
@@ -67,6 +73,120 @@ test('admission rejects rather than queues and releases only after worker exit',
   await next.ready
   assert.equal(await next.request(42), 42)
   await next.terminate()
+})
+
+test('capacity rejection occurs before inspecting input', async (t) => {
+  configureWorkerAdmission({ maxConcurrentWorkers: 1 })
+  const holder = createUntrustedWorker('onMessage(() => 1)', SESSION_OPTIONS)
+  t.after(() => holder.terminate())
+  await holder.ready
+
+  let reads = 0
+  const input = Object.defineProperty({}, 'secret', {
+    enumerable: true,
+    get () {
+      reads++
+      return 42
+    }
+  })
+  await assert.rejects(
+    runUntrustedCode('return input', { input, timeoutMs: 5_000 }),
+    (error) => error.code === 'ERR_UNTRUSTED_CODE_CAPACITY'
+  )
+  assert.throws(
+    () => createUntrustedWorker('', { ...SESSION_OPTIONS, input }),
+    (error) => error.code === 'ERR_UNTRUSTED_WORKER_CAPACITY'
+  )
+  assert.throws(
+    () => new UntrustedWorkerSession('', { ...SESSION_OPTIONS, input }),
+    (error) => error.code === 'ERR_UNTRUSTED_WORKER_CAPACITY'
+  )
+  let optionInspections = 0
+  const uninspectableOptions = new Proxy({}, {
+    ownKeys () {
+      optionInspections++
+      return []
+    }
+  })
+  await assert.rejects(
+    runUntrustedCode('return 42', uninspectableOptions),
+    (error) => error.code === 'ERR_UNTRUSTED_CODE_CAPACITY'
+  )
+  const runner = createRunner({ timeoutMs: 5_000 })
+  await assert.rejects(
+    runner('return 42', uninspectableOptions),
+    (error) => error.code === 'ERR_UNTRUSTED_CODE_CAPACITY'
+  )
+  assert.throws(
+    () => createUntrustedWorker('', uninspectableOptions),
+    (error) => error.code === 'ERR_UNTRUSTED_WORKER_CAPACITY'
+  )
+  assert.throws(
+    () => new UntrustedWorkerSession('', uninspectableOptions),
+    (error) => error.code === 'ERR_UNTRUSTED_WORKER_CAPACITY'
+  )
+  let internalReads = 0
+  const hostileInternalOptions = new Proxy({}, {
+    get () {
+      internalReads++
+      return undefined
+    }
+  })
+  assert.throws(
+    () => new UntrustedWorkerSession('', SESSION_OPTIONS, hostileInternalOptions),
+    (error) => error.code === 'ERR_UNTRUSTED_WORKER_CAPACITY'
+  )
+  assert.equal(optionInspections, 0)
+  assert.equal(internalReads, 0)
+  assert.equal(reads, 0)
+  await holder.terminate()
+})
+
+test('subclass accessors cannot intercept direct-constructor initialization', async () => {
+  configureWorkerAdmission({ maxConcurrentWorkers: 1 })
+  let intercepted = 0
+  class AccessorSession extends UntrustedWorkerSession {
+    set state (value) {
+      intercepted++
+      throw new Error(`state rejected: ${value}`)
+    }
+
+    set startupTimer (value) {
+      intercepted++
+      throw new Error(`timer rejected: ${value}`)
+    }
+  }
+
+  const session = new AccessorSession('onMessage(value => value)', SESSION_OPTIONS)
+  await session.ready
+  assert.equal(await session.request(42), 42)
+  assert.equal(intercepted, 0)
+  await session.terminate()
+
+  const next = createUntrustedWorker('', SESSION_OPTIONS)
+  await next.ready
+  await next.terminate()
+})
+
+test('physical package copies share process-wide admission', async (t) => {
+  configureWorkerAdmission({ maxConcurrentWorkers: 1 })
+  const temporary = await mkdtemp(join(tmpdir(), 'secure-eval-worker-copy-'))
+  const copyRoot = join(temporary, 'copy')
+  await mkdir(copyRoot)
+  await cp(new URL('../src', import.meta.url), join(copyRoot, 'src'), { recursive: true })
+  await writeFile(join(copyRoot, 'package.json'), '{"type":"module"}')
+  t.after(() => rm(temporary, { force: true, recursive: true }))
+  const copy = await import(pathToFileURL(join(copyRoot, 'src/index.js')).href)
+
+  const holder = createUntrustedWorker('onMessage(() => 1)', SESSION_OPTIONS)
+  t.after(() => holder.terminate())
+  await holder.ready
+  await assert.rejects(
+    copy.runUntrustedCode('return 42', { timeoutMs: 5_000 }),
+    (error) => error.code === 'ERR_UNTRUSTED_CODE_CAPACITY'
+  )
+  await holder.terminate()
+  assert.equal(await copy.runUntrustedCode('return 42', { timeoutMs: 5_000 }), 42)
 })
 
 test('host worker threads fail closed instead of orphaning admission slots', async () => {

@@ -17,12 +17,13 @@
     "src"
   ],
   "engines": {
-    "node": ">=26.3.0"
+    "node": ">=26.3.0 <27"
   },
   "scripts": {
     "test": "node --test",
     "test:coverage": "node --test --experimental-test-coverage",
     "test:types": "node scripts/check-package-types.js",
+    "test:package": "node scripts/check-package-contents.js",
     "measure:workers": "node --expose-gc scripts/measure-worker-overhead.js"
   },
   "license": "MIT",

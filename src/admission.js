@@ -3,10 +3,12 @@ import { isMainThread } from 'node:worker_threads'
 import { UntrustedCodeError } from './internal.js'
 
 const DEFAULT_MAX_CONCURRENT_WORKERS = 4
+const MAX_PROCESS_FILE_DESCRIPTORS = 256
 // Keep the original worker key so older and newer package copies continue to
 // share the same process-wide worker counter.
 const STATE_KEY = Symbol.for('secure-eval-worker.admission.main.v1')
 const PREPARATION_STATE_KEY = Symbol.for('secure-eval-worker.admission.preparation.main.v1')
+const DESCRIPTOR_STATE_KEY = Symbol.for('secure-eval-worker.admission.descriptors.main.v1')
 
 function capacityError (message) {
   return new UntrustedCodeError(message, { code: 'ERR_UNTRUSTED_WORKER_CAPACITY' })
@@ -41,6 +43,39 @@ function createState () {
   })
 }
 
+function createDescriptorState () {
+  const slotsBuffer = new SharedArrayBuffer(
+    Int32Array.BYTES_PER_ELEMENT * MAX_PROCESS_FILE_DESCRIPTORS
+  )
+  const slots = new Int32Array(slotsBuffer)
+  const activeOwners = new Set()
+  let nextOwner = 1
+
+  return Object.freeze({
+    createWorkerQuota () {
+      while (activeOwners.has(nextOwner)) {
+        nextOwner = nextOwner === 0x7fffffff ? 1 : nextOwner + 1
+      }
+      const owner = nextOwner
+      activeOwners.add(owner)
+      nextOwner = nextOwner === 0x7fffffff ? 1 : nextOwner + 1
+      let released = false
+      return Object.freeze({
+        slotsBuffer,
+        owner,
+        release () {
+          if (released) return
+          released = true
+          for (let index = 0; index < slots.length; index++) {
+            Atomics.compareExchange(slots, index, owner, 0)
+          }
+          activeOwners.delete(owner)
+        }
+      })
+    }
+  })
+}
+
 function createPreparationState () {
   let activePreparations = 0
   let maxConcurrentPreparations = DEFAULT_MAX_CONCURRENT_WORKERS
@@ -69,6 +104,7 @@ function createPreparationState () {
 
 let state
 let preparationState
+let descriptorState
 if (isMainThread) {
   state = globalThis[STATE_KEY]
   if (state === undefined) {
@@ -91,10 +127,21 @@ if (isMainThread) {
       writable: false
     })
   }
+
+  descriptorState = globalThis[DESCRIPTOR_STATE_KEY]
+  if (descriptorState === undefined) {
+    descriptorState = createDescriptorState()
+    Object.defineProperty(globalThis, DESCRIPTOR_STATE_KEY, {
+      value: descriptorState,
+      configurable: false,
+      enumerable: false,
+      writable: false
+    })
+  }
 }
 
 function requireState () {
-  if (!state || !preparationState) {
+  if (!state || !preparationState || !descriptorState) {
     throw new UntrustedCodeError(
       'Sandbox workers must be created from the main thread so process-wide admission cannot be orphaned',
       { code: 'ERR_UNTRUSTED_WORKER_ADMISSION_UNAVAILABLE' }
@@ -110,6 +157,11 @@ export function acquireWorkerSlot () {
 export function acquireFilePreparationSlot () {
   requireState()
   return preparationState.acquire()
+}
+
+export function createFileDescriptorQuota () {
+  requireState()
+  return descriptorState.createWorkerQuota()
 }
 
 export function configureWorkerAdmission (options) {

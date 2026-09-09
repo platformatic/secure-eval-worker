@@ -11,7 +11,10 @@ import {
 } from './internal.js'
 import { acquireFilePreparationSlot, acquireWorkerSlot } from './admission.js'
 import { validateHostFunctions } from './host-functions.js'
-import { resolveLocalModule } from './local-files.js'
+import {
+  attemptLocalModuleCleanup,
+  resolveLocalModule
+} from './local-files.js'
 import { createUntrustedFileSession, createUntrustedOneShot } from './session.js'
 
 export { configureWorkerAdmission } from './admission.js'
@@ -50,11 +53,26 @@ const RUNNER_DEFAULT_NAMES = new Set([
 export function createRunner (defaultOptions = {}) {
   const defaults = snapshotRunnerDefaults(defaultOptions)
   return function runWithDefaults (source, options = {}) {
-    if (options === null || typeof options !== 'object' || Array.isArray(options)) {
-      throw new TypeError('options must be an object')
+    let releaseWorkerSlot
+    try {
+      releaseWorkerSlot = acquireWorkerSlot()
+    } catch (error) {
+      return Promise.reject(translateSessionError(error, DEFAULT_TIMEOUT_MS))
     }
-    const overrides = snapshotPublicOptions(options, 'options')
-    return runUntrustedCode(source, { ...defaults, ...overrides })
+    try {
+      if (options === null || typeof options !== 'object' || Array.isArray(options)) {
+        throw new TypeError('options must be an object')
+      }
+      const overrides = snapshotPublicOptions(options, 'options')
+      return runUntrustedCodeAdmitted(
+        source,
+        { ...defaults, ...overrides },
+        releaseWorkerSlot
+      )
+    } catch (error) {
+      releaseWorkerSlot()
+      throw error
+    }
   }
 }
 
@@ -66,6 +84,21 @@ export function createRunner (defaultOptions = {}) {
  * complete security boundary for hostile code.
  */
 export function runUntrustedCode (source, options = {}) {
+  let releaseWorkerSlot
+  try {
+    releaseWorkerSlot = acquireWorkerSlot()
+  } catch (error) {
+    return Promise.reject(translateSessionError(error, DEFAULT_TIMEOUT_MS))
+  }
+  try {
+    return runUntrustedCodeAdmitted(source, options, releaseWorkerSlot)
+  } catch (error) {
+    releaseWorkerSlot()
+    throw error
+  }
+}
+
+function runUntrustedCodeAdmitted (source, options, releaseWorkerSlot) {
   if (typeof source !== 'string') throw new TypeError('source must be a string')
   if (options === null || typeof options !== 'object' || Array.isArray(options)) {
     throw new TypeError('options must be an object')
@@ -79,13 +112,13 @@ export function runUntrustedCode (source, options = {}) {
   if (timeoutMs > MAX_TIMEOUT_MS) {
     throw new RangeError(`timeoutMs must not exceed ${MAX_TIMEOUT_MS}`)
   }
-  if (Buffer.byteLength(source, 'utf8') > maxSourceBytes) {
-    throw new RangeError(`source exceeds maxSourceBytes (${maxSourceBytes})`)
-  }
-
-  return runOneShot(options, timeoutMs, timeoutMs, (sessionOptions) => {
-    return createUntrustedOneShot(source, { ...sessionOptions, maxSourceBytes })
-  })
+  return runOneShot(options, timeoutMs, timeoutMs, (sessionOptions, workerSlot) => {
+    return createUntrustedOneShot(
+      source,
+      { ...sessionOptions, maxSourceBytes },
+      workerSlot
+    )
+  }, releaseWorkerSlot)
 }
 
 /**
@@ -94,23 +127,28 @@ export function runUntrustedCode (source, options = {}) {
  */
 export async function runUntrustedFile (modulePath, options = {}) {
   const startedAt = Date.now()
-  options = snapshotFileOptions(options, 'options')
-  snapshotFilePolicies(options)
-  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
-  validatePositiveInteger(timeoutMs, 'timeoutMs')
-  if (timeoutMs > MAX_TIMEOUT_MS) {
-    throw new RangeError(`timeoutMs must not exceed ${MAX_TIMEOUT_MS}`)
-  }
-  const signal = validateSignal(options.signal)
-  if (signal && Reflect.apply(abortSignalAborted, signal, [])) {
-    throw abortError(Reflect.apply(abortSignalReason, signal, []))
-  }
-
   let releaseWorkerSlot
   try {
     releaseWorkerSlot = acquireWorkerSlot()
   } catch (error) {
-    throw translateSessionError(error, timeoutMs)
+    throw translateSessionError(error, DEFAULT_TIMEOUT_MS)
+  }
+
+  let timeoutMs
+  try {
+    options = snapshotFileOptions(options, 'options')
+    timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
+    validatePositiveInteger(timeoutMs, 'timeoutMs')
+    if (timeoutMs > MAX_TIMEOUT_MS) {
+      throw new RangeError(`timeoutMs must not exceed ${MAX_TIMEOUT_MS}`)
+    }
+    const signal = validateSignal(options.signal)
+    if (signal && Reflect.apply(abortSignalAborted, signal, [])) {
+      throw abortError(Reflect.apply(abortSignalReason, signal, []))
+    }
+  } catch (error) {
+    releaseWorkerSlot()
+    throw error
   }
 
   let releasePreparationSlot
@@ -119,6 +157,14 @@ export async function runUntrustedFile (modulePath, options = {}) {
   } catch (error) {
     releaseWorkerSlot()
     throw translateSessionError(error, timeoutMs)
+  }
+
+  try {
+    snapshotFilePolicies(options)
+  } catch (error) {
+    releaseWorkerSlot()
+    releasePreparationSlot()
+    throw error
   }
 
   const localModule = await prepareLocalModule(
@@ -160,7 +206,7 @@ export async function runUntrustedFile (modulePath, options = {}) {
       )
       transferred = true
       return session
-    })
+    }, releaseWorkerSlot)
   } catch (error) {
     primaryError = error
     throw error
@@ -180,24 +226,36 @@ export async function runUntrustedFile (modulePath, options = {}) {
  */
 export async function createUntrustedWorkerFromFile (modulePath, options = {}) {
   const startedAt = Date.now()
-  options = snapshotFileOptions(options, 'options')
-  snapshotFilePolicies(options)
-  const startupTimeoutMs = options.startupTimeoutMs ?? DEFAULT_TIMEOUT_MS
-  validatePositiveInteger(startupTimeoutMs, 'startupTimeoutMs')
-  if (startupTimeoutMs > MAX_TIMEOUT_MS) {
-    throw new RangeError(`startupTimeoutMs must not exceed ${MAX_TIMEOUT_MS}`)
-  }
-  const signal = validateSignal(options.signal)
-  if (signal && Reflect.apply(abortSignalAborted, signal, [])) {
-    throw abortError(Reflect.apply(abortSignalReason, signal, []))
+  const releaseWorkerSlot = acquireWorkerSlot()
+  let startupTimeoutMs
+  try {
+    options = snapshotFileOptions(options, 'options')
+    startupTimeoutMs = options.startupTimeoutMs ?? DEFAULT_TIMEOUT_MS
+    validatePositiveInteger(startupTimeoutMs, 'startupTimeoutMs')
+    if (startupTimeoutMs > MAX_TIMEOUT_MS) {
+      throw new RangeError(`startupTimeoutMs must not exceed ${MAX_TIMEOUT_MS}`)
+    }
+    const signal = validateSignal(options.signal)
+    if (signal && Reflect.apply(abortSignalAborted, signal, [])) {
+      throw abortError(Reflect.apply(abortSignalReason, signal, []))
+    }
+  } catch (error) {
+    releaseWorkerSlot()
+    throw error
   }
 
-  const releaseWorkerSlot = acquireWorkerSlot()
   let releasePreparationSlot
   try {
     releasePreparationSlot = acquireFilePreparationSlot()
   } catch (error) {
     releaseWorkerSlot()
+    throw error
+  }
+  try {
+    snapshotFilePolicies(options)
+  } catch (error) {
+    releaseWorkerSlot()
+    releasePreparationSlot()
     throw error
   }
   const localModule = await prepareLocalModule(
@@ -352,38 +410,57 @@ function releaseAfterPreparationError (error, releasePreparationSlot) {
 }
 
 async function cleanupLocalModule (localModule, releasePreparationSlot, primaryError) {
-  try {
-    await localModule.cleanup()
+  const outcome = await attemptLocalModuleCleanup(localModule)
+  if (outcome.status === 'removed') {
     releasePreparationSlot()
-  } catch (cleanupError) {
-    void localModule.cleanupUntilRemoved().then(
-      releasePreparationSlot,
-      releasePreparationSlot
-    )
-    throw new UntrustedCodeError(
-      'The private module snapshot could not be removed',
-      {
-        code: 'ERR_UNTRUSTED_MODULE_CLEANUP',
-        cause: primaryError
-          ? new AggregateError([primaryError, cleanupError], 'Operation and cleanup failures')
-          : cleanupError
-      }
-    )
+    return
   }
+
+  void localModule.cleanupUntilRemoved().then(
+    releasePreparationSlot,
+    releasePreparationSlot
+  )
+  const cleanupError = outcome.status === 'failed'
+    ? outcome.error
+    : new Error('Snapshot cleanup did not settle before its deadline')
+  throw new UntrustedCodeError(
+    'The private module snapshot could not be removed promptly',
+    {
+      code: 'ERR_UNTRUSTED_MODULE_CLEANUP',
+      cause: primaryError
+        ? new AggregateError([primaryError, cleanupError], 'Operation and cleanup failures')
+        : cleanupError
+    }
+  )
 }
 
-function runOneShot (options, timeoutMs, reportedTimeoutMs, createSession) {
-  // Normalize these here to preserve synchronous source-API option errors and
-  // avoid evaluating caller-controlled properties twice.
-  const environment = sanitizeEnvironment(options.environment)
-  const resourceLimits = validateResourceLimits(options.resourceLimits)
-  const signal = validateSignal(options.signal)
-  if (signal && Reflect.apply(abortSignalAborted, signal, [])) {
-    return Promise.reject(abortError(Reflect.apply(abortSignalReason, signal, [])))
+function runOneShot (
+  options,
+  timeoutMs,
+  reportedTimeoutMs,
+  createSession,
+  preacquiredWorkerSlot
+) {
+  let releaseWorkerSlot = preacquiredWorkerSlot
+  if (releaseWorkerSlot === undefined) {
+    try {
+      releaseWorkerSlot = acquireWorkerSlot()
+    } catch (error) {
+      return Promise.reject(translateSessionError(error, reportedTimeoutMs))
+    }
   }
-
+  let transferred = false
   let session
   try {
+    // Admission precedes nested policy validation and input cloning in the
+    // session constructor, so rejected calls cannot amplify host-side work.
+    const environment = sanitizeEnvironment(options.environment)
+    const resourceLimits = validateResourceLimits(options.resourceLimits)
+    const signal = validateSignal(options.signal)
+    if (signal && Reflect.apply(abortSignalAborted, signal, [])) {
+      throw abortError(Reflect.apply(abortSignalReason, signal, []))
+    }
+
     session = createSession({
       input: options.input,
       language: options.language,
@@ -402,8 +479,10 @@ function runOneShot (options, timeoutMs, reportedTimeoutMs, createSession) {
       startupTimeoutMs: timeoutMs,
       messageTimeoutMs: timeoutMs,
       lifetimeTimeoutMs: timeoutMs
-    })
+    }, releaseWorkerSlot)
+    transferred = true
   } catch (error) {
+    if (!transferred) releaseWorkerSlot()
     if (error?.name === 'AbortError' ||
         error?.code === 'ERR_UNTRUSTED_WORKER_STARTUP_TIMEOUT' ||
         error?.code === 'ERR_UNTRUSTED_WORKER_CAPACITY' ||
@@ -422,7 +501,9 @@ function runOneShot (options, timeoutMs, reportedTimeoutMs, createSession) {
         await session.terminate()
       } catch {}
       const closed = await session.closed
-      if (closed.error?.code === 'ERR_UNTRUSTED_WORKER_CLEANUP') {
+      if (closed.error?.code === 'ERR_UNTRUSTED_WORKER_CLEANUP' ||
+          closed.error?.code === 'ERR_UNTRUSTED_WORKER_TERMINATION_TIMEOUT' ||
+          closed.error?.code === 'ERR_UNTRUSTED_WORKER_TERMINATION') {
         throw translateSessionError(closed.error, reportedTimeoutMs)
       }
     })
@@ -651,6 +732,14 @@ function translateSessionError (error, timeoutMs) {
     ERR_UNTRUSTED_WORKER_CLEANUP: [
       error.message,
       'ERR_UNTRUSTED_CODE_CLEANUP'
+    ],
+    ERR_UNTRUSTED_WORKER_TERMINATION_TIMEOUT: [
+      error.message,
+      'ERR_UNTRUSTED_CODE_TERMINATION_TIMEOUT'
+    ],
+    ERR_UNTRUSTED_WORKER_TERMINATION: [
+      error.message,
+      'ERR_UNTRUSTED_CODE_TERMINATION'
     ],
     ERR_UNTRUSTED_WORKER_EXIT: [
       error.message.replace('The worker exited unexpectedly', 'The worker exited before returning a result'),

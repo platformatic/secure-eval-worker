@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
 import { test } from 'node:test'
 
 import {
@@ -7,6 +8,8 @@ import {
   sanitizeEnvironment,
   UntrustedCodeError
 } from '../src/index.js'
+
+const packageUrl = new URL('../src/index.js', import.meta.url).href
 
 test('createRunner snapshots reusable defaults and applies per-run overrides', async () => {
   const defaults = {
@@ -298,6 +301,62 @@ test('terminates source that exceeds its deadline', async () => {
     runUntrustedCode('while (true) {}', { timeoutMs: 100 }),
     (error) => error.code === 'ERR_UNTRUSTED_CODE_TIMEOUT'
   )
+})
+
+test('termination settlement is bounded during uninterruptible native work', async () => {
+  const childSource = `
+    import { configureWorkerAdmission, runUntrustedCode } from ${JSON.stringify(packageUrl)}
+    configureWorkerAdmission({ maxConcurrentWorkers: 1 })
+    const startedAt = Date.now()
+    try {
+      await runUntrustedCode(\`
+        const { pbkdf2Sync } = await import('node:crypto')
+        pbkdf2Sync('password', 'salt', 1_000_000_000, 32, 'sha256')
+        return 1
+      \`, { timeoutMs: 500 })
+    } catch (error) {
+      let retainedCode
+      try {
+        await runUntrustedCode('return 42', { timeoutMs: 500 })
+      } catch (retainedError) {
+        retainedCode = retainedError.code
+      }
+      console.log(JSON.stringify({
+        code: error.code,
+        elapsedMs: Date.now() - startedAt,
+        retainedCode
+      }))
+    }
+  `
+  const child = spawn(process.execPath, [
+    '--input-type=module',
+    '--eval',
+    childSource
+  ], { stdio: ['ignore', 'pipe', 'pipe'] })
+  const result = await new Promise((resolve, reject) => {
+    let stdout = ''
+    let stderr = ''
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL')
+      reject(new Error(`Child did not report bounded settlement: ${stderr}`))
+    }, 5_000)
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk
+      const line = stdout.trim()
+      if (!line) return
+      clearTimeout(timer)
+      resolve(JSON.parse(line))
+      child.kill('SIGKILL')
+    })
+    child.stderr.on('data', (chunk) => { stderr += chunk })
+    child.once('error', (error) => {
+      clearTimeout(timer)
+      reject(error)
+    })
+  })
+  assert.equal(result.code, 'ERR_UNTRUSTED_CODE_TERMINATION_TIMEOUT')
+  assert.equal(result.retainedCode, 'ERR_UNTRUSTED_CODE_CAPACITY')
+  assert.ok(result.elapsedMs >= 1_500 && result.elapsedMs < 4_500)
 })
 
 test('supports cancellation', async () => {

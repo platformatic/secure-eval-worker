@@ -38,7 +38,10 @@ The sandbox receives `--allow-fs-read` only for the private snapshot, not the
 caller's pathname. Changes made after staging therefore cannot redirect imports
 outside the captured contents. The worker drops its
 nested-worker permission, applies normal hardening, and imports the staged entry
-with Node's native loader. The snapshot is removed after worker exit; cleanup
+with Node's native loader. Snapshot cleanup gets a bounded public wait; an
+unresolved removal remains owned by a separately admitted janitor so `closed`
+and one-shot promises still settle. Completed failures are retried with
+exponential backoff; a stalled operating-system removal remains in flight. Cleanup
 failures are surfaced as `ERR_UNTRUSTED_MODULE_CLEANUP`,
 `ERR_UNTRUSTED_WORKER_CLEANUP`, or `ERR_UNTRUSTED_CODE_CLEANUP`.
 
@@ -53,7 +56,11 @@ The root is an explicit authority grant, not merely a module-search hint.
 Guest code retains a constrained synchronous `node:fs` read facade because
 Node's loader uses those shared exports. Path reads are confined to the staged
 snapshot; descriptor-taking operations accept only descriptors opened through
-that facade, preventing access to parent-open descriptors. Writes,
+that facade, preventing access to parent-open descriptors. Each local worker
+may hold at most 64 guest-opened descriptors, with a fixed process-wide cap of
+256 independent of worker admission. Node's worker descriptor tracking closes
+retained descriptors on actual worker exit, when their process quota is also
+released. Writes,
 `node:fs/promises`, reads outside the snapshot, nested workers, and native
 addons remain unavailable.
 
@@ -64,19 +71,21 @@ reduce ordinary races, but
 portable Node APIs cannot prove containment against an actively adversarial
 parent-directory rename/symlink sequence. Concurrent changes may also make
 staging reject or produce a graph whose files were captured at different
-instants. Use an application-owned immutable tree or an outer OS sandbox when
-that race is in scope.
+instants. The private directory's owner permissions do not protect it from
+another process running under the same OS identity, so the temporary namespace
+and same-identity processes must remain trusted for the snapshot's lifetime.
+Use an application-owned immutable tree or an outer OS sandbox with a separate
+identity when either race is in scope.
 
 When the host uses `--permission`, it needs `--allow-worker`, read permission
 for the source root, and read/write permission for the operating-system
 temporary directory used for staging and cleanup.
 
 Path containment follows the host platform's `realpath()` and `path.relative()`
-semantics. On Windows, canonical drive and UNC roots therefore use Windows'
-case-insensitive path comparison, and cross-drive or cross-share paths are
-outside the root. Junctions and other reparse points that Node reports as
-symbolic links are rejected. Use a dedicated local root and an outer sandbox
-when network shares or reparse-point behavior is part of the threat model.
+semantics. Windows CI covers case-insensitive local-drive containment and
+junction rejection. UNC/network-share roots are not part of the tested local-root
+profile; use a dedicated local root and an outer sandbox when network shares or
+other reparse-point behavior is part of the threat model.
 
 ## Trusted host-side bundling
 

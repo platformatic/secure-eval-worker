@@ -153,6 +153,46 @@ for (const type of ['one-shot', 'script', 'module']) {
     }
   })
 
+  test(`${type} cannot inspect worker environment data through V8 aliases`, async () => {
+    const key = `secure-eval-worker-query-${randomUUID()}`
+    const secret = `query-secret-${randomUUID()}`
+    setEnvironmentData(key, secret)
+    try {
+      const codes = await evaluateInGuest(type, `
+        const namespace = await import('node:v8')
+        const { queryObjects: named } = await import('node:v8')
+        const bareNamespace = await import('v8')
+        const { queryObjects: bareNamed } = await import('v8')
+        const module = await import('node:module')
+        const require = module.createRequire('file:///secure-eval-worker.js')
+        const calls = [
+          named,
+          namespace.queryObjects,
+          namespace.default.queryObjects,
+          bareNamed,
+          bareNamespace.queryObjects,
+          bareNamespace.default.queryObjects,
+          require('node:v8').queryObjects,
+          require('v8').queryObjects,
+          module.Module._load('node:v8').queryObjects,
+          module.Module._load('v8').queryObjects,
+          process.getBuiltinModule('node:v8').queryObjects,
+          process.getBuiltinModule('v8').queryObjects
+        ]
+        return calls.map((call) => {
+          try {
+            return call(Map, { format: 'summary' }).some((value) => value.includes(${JSON.stringify(secret)}))
+          } catch (error) {
+            return error.code
+          }
+        })
+      `)
+      assert.deepEqual(codes, Array(12).fill('ERR_ACCESS_DENIED'))
+    } finally {
+      setEnvironmentData(key, undefined)
+    }
+  })
+
   test(`${type} cannot read worker environment data`, async () => {
     const key = `secure-eval-worker-${randomUUID()}`
     setEnvironmentData(key, 'worker-environment-secret')

@@ -9,7 +9,7 @@ Each worker starts with Node's Permission Model enabled. Source-string workers r
 
 ## Requirements
 
-- Node.js 26.3.0 or newer (`process.permission.drop()` is required)
+- Node.js 26.3.0 through the current Node.js 26.x release (`process.permission.drop()` is required). Future major releases require a new hardening review before support is declared.
 - No permission flags are required when the host uses Node's default mode. If the host itself runs with `--permission`, it must include `--allow-worker`. Path-based execution additionally requires host read permission for the entry/root and read/write permission for the operating-system temporary directory used to create and remove the private snapshot. Each sandbox worker is started with its own reviewed `execArgv`.
 
 ## Usage
@@ -146,7 +146,7 @@ await component.terminate()
 
 Its default export uses the same `{ input, send, onMessage, host }` setup contract as an in-memory module. JavaScript and Node's native erase-only TypeScript module formats are supported according to the selected file extension.
 
-The trusted root is an explicit authority grant. Guest code can use the retained synchronous `node:fs` read facade to read files in its staged snapshot, and imported code can load any Node-supported module or data copied from the root. Never include secrets, native addons, sockets, or unrelated application files in that directory. Filesystem writes, promise-based filesystem APIs, inherited descriptors, and reads outside the snapshot remain disabled. The source filesystem and any process able to mutate it must remain trusted during staging: portable Node APIs cannot prove path containment against an actively adversarial parent-directory rename/symlink race. Concurrent changes can also make staging fail or produce files captured at different instants. Use an application-owned immutable source tree—or an outer OS sandbox—when that race is in scope. The private snapshot is removed after worker exit, and cleanup failures are reported with `ERR_UNTRUSTED_MODULE_CLEANUP`, `ERR_UNTRUSTED_WORKER_CLEANUP`, or `ERR_UNTRUSTED_CODE_CLEANUP`.
+The trusted root is an explicit authority grant. Guest code can use the retained synchronous `node:fs` read facade to read files in its staged snapshot, and imported code can load any Node-supported module or data copied from the root. Never include secrets, native addons, sockets, or unrelated application files in that directory. Filesystem writes, promise-based filesystem APIs, inherited descriptors, and reads outside the snapshot remain disabled. Guest-opened descriptors are capped at 64 per local worker and 256 process-wide, independent of the configured worker limit. Node's worker descriptor tracking closes retained descriptors on actual worker exit, when their process-wide quota is also released. The source filesystem and any process able to mutate it must remain trusted during staging: portable Node APIs cannot prove path containment against an actively adversarial parent-directory rename/symlink race. Concurrent changes can also make staging fail or produce files captured at different instants. The temporary-directory namespace and every same-identity process must remain trusted for the snapshot's lifetime because owner permissions do not isolate processes running as the same OS user. Use an application-owned immutable source tree—or an outer OS sandbox with a separate identity—when either race is in scope. Snapshot cleanup gets a bounded public wait; unresolved removal remains owned by a separately admitted janitor without delaying terminal session settlement, and completed failures are retried with exponential backoff. Cleanup failures are reported with `ERR_UNTRUSTED_MODULE_CLEANUP`, `ERR_UNTRUSTED_WORKER_CLEANUP`, or `ERR_UNTRUSTED_CODE_CLEANUP`.
 
 ### Host functions
 
@@ -199,7 +199,7 @@ Options:
 - `maxInputBytes`, `maxMessageBytes`, `maxOutputMessages`, and `maxOutputBytes`: equivalent to the persistent options below.
 - `diagnostics` and `onDiagnostic`: opt into bounded, sanitized console records as described below.
 
-Every execution uses a new worker. Source-string execution cannot obtain filesystem, network, child-process, native-addon, inspector, WASI, or nested-worker access through supported Node APIs because none of those permissions remain when source starts. Local-file execution retains read access only to its private staged snapshot for native module loading and path-based reads. Known Permission Model gaps and process-wide APIs are additionally disabled before source is loaded. Ordinary guest stdout and stderr writes are discarded rather than forwarded into host logs.
+Every execution uses a new worker. If Node cannot interrupt synchronous native work, the execution promise rejects after an additional bounded termination-settlement window with `ERR_UNTRUSTED_CODE_TERMINATION_TIMEOUT`; admission remains occupied until actual exit. Source-string execution cannot obtain filesystem, network, child-process, native-addon, inspector, WASI, or nested-worker access through supported Node APIs because none of those permissions remain when source starts. Local-file execution retains read access only to its private staged snapshot for native module loading and path-based reads. Known Permission Model gaps and process-wide APIs are additionally disabled before source is loaded. Ordinary guest stdout and stderr writes are discarded rather than forwarded into host logs.
 
 ### `runUntrustedFile(modulePath[, options])`
 
@@ -245,8 +245,8 @@ Session interface:
 - `ready`: promise resolved after script setup or the module's default setup function completes. Setup return values are ignored.
 - `postMessage(value)`: delivers a message without waiting for its return value.
 - `request(value[, { timeoutMs }])`: delivers a message and resolves with the handler's return value.
-- `terminate()`: idempotently terminates the worker.
-- `closed`: promise resolved with `{ code, error }` after worker exit.
+- `terminate()`: idempotently requests worker termination. It rejects with `ERR_UNTRUSTED_WORKER_TERMINATION_TIMEOUT` if the worker does not exit within the bounded settlement window.
+- `closed`: promise resolved with `{ code, error }` after worker exit, or with a termination error when that bounded window expires. Admission and local-file preparation remain occupied until the worker actually exits and snapshot cleanup finishes.
 - Events: `message` for values passed to `send()`, `diagnostic` for opt-in console records, `error` for runtime/session errors, and `exit` for worker exit. Attach an `error` listener when runtime notifications need to be observed.
 
 `onMessage()` registers one handler, and messages are processed serially. Input, posts, requests, replies, unsolicited messages, and host-function arguments/results are copied. Transfer lists and all shared-memory representations—including `SharedArrayBuffer`, shared typed-array/DataView backing stores, and shared `WebAssembly.Memory`—are rejected. Protocol values are restricted to primitives, plain objects and arrays, `ArrayBuffer` and non-shared views, `Date`, `RegExp`, `Map`, and `Set`. Platform objects such as `Blob`, ports, file handles, sockets, cryptographic key objects, and ordinary `Error` values are rejected. Use explicit plain error data when needed; see [`docs/error-values.md`](docs/error-values.md). The exact serialized bytes—not a second representation of the value—are authenticated before deserialization.
@@ -273,11 +273,11 @@ Errors originating from execution use this class and have a machine-readable `co
 
 - Untrusted source is passed via `workerData`; it is never interpolated into the trusted bootstrap source.
 - The worker gets `env: {}` unless an explicit environment is supplied. Never place secrets in that environment.
-- Do not place secrets in `worker_threads.setEnvironmentData()`: Node clones global worker environment data into new workers independently of `WorkerOptions.env`. This module blocks the public getter and heap-snapshot APIs, but avoiding the secret entirely is safer against future or internal APIs.
+- Do not place secrets in `worker_threads.setEnvironmentData()`: Node clones global worker environment data into new workers independently of `WorkerOptions.env`. This module blocks the public getter, heap-snapshot APIs, and `v8.queryObjects()`, but avoiding the secret entirely is safer against future or internal APIs.
 - Both execution modes create a private `MessageChannel` inside the trusted bootstrap, close and hide `parentPort`, freeze the privileged port's prototype chain, and authenticate serialized payloads with a per-session HMAC and monotonic sequence number. Capturing or replaying a port cannot forge control traffic.
 - Before guest execution, the bootstrap disables known same-process escape surfaces not covered by permissions: existing-descriptor access through public modules, legacy network-module aliases, accessor-exported stream constructors, and undocumented native bindings; asynchronous module-loader registration; `node:sqlite`; process signaling and reports; process priority mutation; dangerous V8 profiling/snapshot/flag APIs; async hooks; BroadcastChannel, Web Locks, cross-thread messaging, and inherited worker environment data. Guest `argv` is replaced with a fixed value.
 - Host functions are authority grants. They must validate and authorize every argument, constrain outputs, and avoid exposing generic filesystem or network primitives when a narrower business operation is possible.
-- A timed-out worker is terminated, but Worker resource limits do not constrain `ArrayBuffer`, WebAssembly, native allocations, aggregate CPU, all libuv-thread-pool work, or process-wide out-of-memory failure. Host functions that ignore their abort signal may continue host-side work after termination.
+- A timed-out worker is sent a termination request, but Worker resource limits do not constrain `ArrayBuffer`, WebAssembly, native allocations, aggregate CPU, all libuv-thread-pool work, or process-wide out-of-memory failure. Uninterruptible native work can continue after the public termination promises settle with a termination error; its admission slot remains occupied until the actual worker exit. Host functions that ignore their abort signal may also continue host-side work after termination.
 - JavaScript taming is additional defense in depth, not a substitute for an OS boundary. Future Node APIs, undocumented internals, native/runtime vulnerabilities, or process-wide behavior can invalidate it. Run adversarial multi-tenant code in a separately sandboxed process or container.
 
 ## Development
@@ -287,4 +287,5 @@ npm ci
 npm test
 npm run test:coverage
 npm run test:types
+npm run test:package
 ```

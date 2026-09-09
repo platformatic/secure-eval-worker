@@ -19,7 +19,8 @@ import {
   validatePositiveInteger,
   validateTimeout
 } from './internal.js'
-import { acquireWorkerSlot } from './admission.js'
+import { acquireWorkerSlot, createFileDescriptorQuota } from './admission.js'
+import { attemptLocalModuleCleanup } from './local-files.js'
 import {
   HostFunctionError,
   invokeHostFunction,
@@ -37,10 +38,12 @@ const MIN_MAX_MESSAGE_BYTES = 128
 const DEFAULT_MAX_INPUT_BYTES = 1024 * 1024
 const DEFAULT_MAX_OUTPUT_MESSAGES = 1024
 const DEFAULT_MAX_OUTPUT_BYTES = 16 * 1024 * 1024
+const MAX_LOCAL_OPEN_FILE_DESCRIPTORS = 64
 const DEFAULT_MAX_DIAGNOSTIC_RECORDS = 100
 const DEFAULT_MAX_DIAGNOSTIC_BYTES = 64 * 1024
 const DEFAULT_MAX_DIAGNOSTIC_RECORD_BYTES = 4 * 1024
 const safeArrayBufferIsView = ArrayBuffer.isView
+const hostObjectDefineProperty = Object.defineProperty
 const hostTypedArrayByteLength = Object.getOwnPropertyDescriptor(
   Object.getPrototypeOf(Uint8Array.prototype),
   'byteLength'
@@ -51,11 +54,12 @@ const hostEventTargetRemoveEventListener = EventTarget.prototype.removeEventList
 const hostAbortSignalAborted = Object.getOwnPropertyDescriptor(AbortSignal.prototype, 'aborted').get
 const hostAbortSignalReason = Object.getOwnPropertyDescriptor(AbortSignal.prototype, 'reason').get
 const sessionSecrets = new WeakMap()
+const internalSessionOptions = new WeakMap()
 const diagnosticContextStorage = new AsyncLocalStorage()
 const ONE_SHOT = Symbol('oneShot')
 const LOCAL_MODULE = Symbol('localModule')
-const PREACQUIRED_SLOT = Symbol('preacquiredSlot')
 const PREPARATION_SLOT = Symbol('preparationSlot')
+const TERMINATION_SETTLEMENT_TIMEOUT_MS = 1_000
 
 const SESSION_BOOTSTRAP = String.raw`
 'use strict'
@@ -97,6 +101,8 @@ const safeStructuredClone = globalThis.structuredClone
 const safeV8Deserialize = v8Deserialize
 const safeV8Serialize = v8Serialize
 const reflectApply = Reflect.apply
+const safeAtomics = Atomics
+const hostAtomicsCompareExchange = Atomics.compareExchange
 const SafePromise = Promise
 const SafeError = Error
 const SafeSyntaxError = SyntaxError
@@ -163,6 +169,10 @@ const moduleFileReaders = objectFreeze(Object.fromEntries(
   ].map((name) => [name, fsBuiltin[name]])
 ))
 const moduleFileDescriptors = objectCreate(null)
+moduleFileDescriptors.count = 0
+const processFileDescriptorSlots = workerData.localModule
+  ? new Int32Array(workerData.localModule.globalDescriptorSlots)
+  : undefined
 
 let port
 let rawPostToHost
@@ -311,6 +321,30 @@ function postDiagnostic(level, values) {
   })
 }
 
+function reserveProcessFileDescriptor() {
+  const owner = workerData.localModule.descriptorOwner
+  const start = owner % processFileDescriptorSlots.length
+  for (let offset = 0; offset < processFileDescriptorSlots.length; offset++) {
+    const index = (start + offset) % processFileDescriptorSlots.length
+    if (reflectApply(hostAtomicsCompareExchange, safeAtomics, [
+      processFileDescriptorSlots,
+      index,
+      0,
+      owner
+    ]) === 0) return index
+  }
+  return -1
+}
+
+function releaseProcessFileDescriptor(slot) {
+  reflectApply(hostAtomicsCompareExchange, safeAtomics, [
+    processFileDescriptorSlots,
+    slot,
+    workerData.localModule.descriptorOwner,
+    0
+  ])
+}
+
 function hardenFileSystemForModuleLoading() {
   const descriptorReaders = new Set(['closeSync', 'fstatSync', 'readSync', 'readvSync'])
   for (const [name, descriptor] of Object.entries(objectGetOwnPropertyDescriptors(fsBuiltin))) {
@@ -322,9 +356,26 @@ function hardenFileSystemForModuleLoading() {
         // inherited process descriptors even when their numeric values are
         // guessed by guest code.
         if (name === 'openSync') {
-          const fd = reflectApply(reader, fsBuiltin, args)
-          moduleFileDescriptors[fd] = true
-          return fd
+          if (moduleFileDescriptors.count >= workerData.localModule.maxOpenFileDescriptors) {
+            const error = new RangeError('Worker file descriptor limit exceeded')
+            error.code = 'ERR_UNTRUSTED_FILE_DESCRIPTOR_LIMIT'
+            throw error
+          }
+          const descriptorSlot = reserveProcessFileDescriptor()
+          if (descriptorSlot < 0) {
+            const error = new RangeError('Process file descriptor limit exceeded')
+            error.code = 'ERR_UNTRUSTED_FILE_DESCRIPTOR_CAPACITY'
+            throw error
+          }
+          try {
+            const fd = reflectApply(reader, fsBuiltin, args)
+            moduleFileDescriptors[fd] = descriptorSlot
+            moduleFileDescriptors.count++
+            return fd
+          } catch (error) {
+            releaseProcessFileDescriptor(descriptorSlot)
+            throw error
+          }
         }
         if (reflectApply(setHas, descriptorReaders, [name])) {
           const fd = args[0]
@@ -332,11 +383,12 @@ function hardenFileSystemForModuleLoading() {
             return sandboxDenied('node:fs.' + name)
           }
           if (name === 'closeSync') {
-            try {
-              return reflectApply(reader, fsBuiltin, args)
-            } finally {
-              delete moduleFileDescriptors[fd]
-            }
+            const result = reflectApply(reader, fsBuiltin, args)
+            const descriptorSlot = moduleFileDescriptors[fd]
+            delete moduleFileDescriptors[fd]
+            moduleFileDescriptors.count--
+            releaseProcessFileDescriptor(descriptorSlot)
+            return result
           }
           return reflectApply(reader, fsBuiltin, args)
         }
@@ -414,6 +466,7 @@ function hardenDangerousBuiltins() {
     'setHeapSnapshotNearHeapLimit',
     'startCpuProfile',
     'startHeapProfile',
+    'queryObjects',
     'stopCoverage',
     'takeCoverage',
     'writeHeapSnapshot'
@@ -1123,12 +1176,24 @@ reflectApply(promiseCatch, initialize(), [(error) => {
 })()
 `
 
+function createInternalSessionOptions (releaseWorkerSlot) {
+  const key = Object.freeze({})
+  internalSessionOptions.set(key, Object.freeze({ releaseWorkerSlot }))
+  return key
+}
+
 export function createUntrustedWorker (source, options = {}) {
   return new UntrustedWorkerSession(source, options)
 }
 
-export function createUntrustedOneShot (source, options = {}) {
-  return new UntrustedWorkerSession(source, { ...options, [ONE_SHOT]: true })
+export function createUntrustedOneShot (source, options = {}, releaseWorkerSlot) {
+  return new UntrustedWorkerSession(
+    source,
+    { ...options, [ONE_SHOT]: true },
+    releaseWorkerSlot === undefined
+      ? undefined
+      : createInternalSessionOptions(releaseWorkerSlot)
+  )
 }
 
 export function createUntrustedFileSession (
@@ -1145,158 +1210,219 @@ export function createUntrustedFileSession (
       language: 'javascript',
       [ONE_SHOT]: oneShot,
       [LOCAL_MODULE]: localModule,
-      [PREACQUIRED_SLOT]: releaseWorkerSlot,
       [PREPARATION_SLOT]: releasePreparationSlot
-    })
+    }, createInternalSessionOptions(releaseWorkerSlot))
   } catch (error) {
     releaseWorkerSlot()
     throw error
   }
 }
 
+function defineSessionData (session, name, value) {
+  hostObjectDefineProperty(session, name, {
+    configurable: true,
+    enumerable: true,
+    value,
+    writable: true
+  })
+}
+
+function prepareSessionConfiguration (session, source, rawOptions) {
+  const options = snapshotSessionOptions(rawOptions)
+  const localModule = options[LOCAL_MODULE]
+  const preparationSlot = options[PREPARATION_SLOT]
+  if (preparationSlot !== undefined && typeof preparationSlot !== 'function') {
+    throw new TypeError('Invalid file preparation slot')
+  }
+  const type = options.type ?? 'script'
+  if (type !== 'script' && type !== 'module') {
+    throw new TypeError("type must be 'script' or 'module'")
+  }
+  const language = options.language ?? 'javascript'
+  if (language !== 'javascript' && language !== 'typescript') {
+    throw new TypeError("language must be 'javascript' or 'typescript'")
+  }
+
+  const maxSourceBytes = options.maxSourceBytes ?? DEFAULT_MAX_SOURCE_BYTES
+  const startupTimeoutMs = options.startupTimeoutMs ?? DEFAULT_STARTUP_TIMEOUT_MS
+  defineSessionData(session, 'messageTimeoutMs', options.messageTimeoutMs ?? DEFAULT_MESSAGE_TIMEOUT_MS)
+  defineSessionData(session, 'lifetimeTimeoutMs', options.lifetimeTimeoutMs ?? DEFAULT_LIFETIME_TIMEOUT_MS)
+  defineSessionData(session, 'maxHostFunctionCalls', options.maxHostFunctionCalls ?? DEFAULT_MAX_HOST_FUNCTION_CALLS)
+  defineSessionData(session, 'maxInFlightHostFunctions', options.maxInFlightHostFunctions ?? DEFAULT_MAX_IN_FLIGHT_HOST_FUNCTIONS)
+  defineSessionData(session, 'maxMessageBytes', options.maxMessageBytes ?? DEFAULT_MAX_MESSAGE_BYTES)
+  defineSessionData(session, 'maxInputBytes', options.maxInputBytes ?? DEFAULT_MAX_INPUT_BYTES)
+  defineSessionData(session, 'maxOutputMessages', options.maxOutputMessages ?? DEFAULT_MAX_OUTPUT_MESSAGES)
+  defineSessionData(session, 'maxOutputBytes', options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES)
+  const onDiagnostic = options.onDiagnostic
+  defineSessionData(session, 'diagnostics', validateDiagnostics(options.diagnostics, onDiagnostic))
+  defineSessionData(session, 'onDiagnostic', onDiagnostic)
+  defineSessionData(session, 'diagnosticRecords', 0)
+  defineSessionData(session, 'diagnosticBytes', 0)
+  defineSessionData(session, 'diagnosticSequence', 0)
+  defineSessionData(session, 'diagnosticsHandledSequence', 0)
+  defineSessionData(session, 'deferredDiagnosticEnvelopes', [])
+  defineSessionData(session, 'diagnosticProcessing', Promise.resolve())
+  validateSource(source, maxSourceBytes)
+  if (localModule !== undefined &&
+      (localModule === null || typeof localModule !== 'object' ||
+       typeof localModule.entryUrl !== 'string' || typeof localModule.rootPath !== 'string' ||
+       typeof localModule.rootPathPrefix !== 'string' || typeof localModule.rootUrlPrefix !== 'string' ||
+       typeof localModule.cleanup !== 'function' ||
+       typeof localModule.cleanupUntilRemoved !== 'function')) {
+    throw new TypeError('Invalid local module configuration')
+  }
+  validateTimeout(startupTimeoutMs, 'startupTimeoutMs')
+  validateTimeout(session.messageTimeoutMs, 'messageTimeoutMs')
+  validateTimeout(session.lifetimeTimeoutMs, 'lifetimeTimeoutMs')
+  validatePositiveInteger(session.maxHostFunctionCalls, 'maxHostFunctionCalls')
+  validatePositiveInteger(session.maxInFlightHostFunctions, 'maxInFlightHostFunctions')
+  validatePositiveInteger(session.maxMessageBytes, 'maxMessageBytes')
+  if (session.maxMessageBytes < MIN_MAX_MESSAGE_BYTES) {
+    throw new RangeError(`maxMessageBytes must be at least ${MIN_MAX_MESSAGE_BYTES}`)
+  }
+  validatePositiveInteger(session.maxInputBytes, 'maxInputBytes')
+  validatePositiveInteger(session.maxOutputMessages, 'maxOutputMessages')
+  validatePositiveInteger(session.maxOutputBytes, 'maxOutputBytes')
+
+  const signal = options.signal
+  if (signal !== undefined && !(signal instanceof AbortSignal)) {
+    throw new TypeError('signal must be an AbortSignal')
+  }
+  if (signal && hostReflectApply(hostAbortSignalAborted, signal, [])) {
+    throw abortError(hostReflectApply(hostAbortSignalReason, signal, []))
+  }
+
+  const startedAt = Date.now()
+  const input = cloneWithoutSharedMemory(options.input, 'input')
+  assertSupportedProtocolValue(input, 'input')
+  const serializedInput = v8Serialize(input)
+  if (hostReflectApply(hostTypedArrayByteLength, serializedInput, []) > session.maxInputBytes) {
+    throw new RangeError(`input exceeds maxInputBytes (${session.maxInputBytes})`)
+  }
+  const environment = sanitizeEnvironment(options.environment)
+  const resourceLimits = validateResourceLimits(options.resourceLimits)
+  const hostFunctionConfiguration = validateHostFunctions(options.hostFunctions)
+  if (signal && hostReflectApply(hostAbortSignalAborted, signal, [])) {
+    throw abortError(hostReflectApply(hostAbortSignalReason, signal, []))
+  }
+  const remainingStartupMs = startupTimeoutMs - (Date.now() - startedAt)
+  if (remainingStartupMs <= 0) {
+    throw sessionError(`Startup exceeded ${startupTimeoutMs} ms`, 'ERR_UNTRUSTED_WORKER_STARTUP_TIMEOUT')
+  }
+
+  return {
+    environment,
+    hostFunctionConfiguration,
+    input,
+    language,
+    localModule,
+    maxSourceBytes,
+    options,
+    preparationSlot,
+    resourceLimits,
+    signal,
+    startupTimeoutMs,
+    startedAt,
+    type
+  }
+}
+
 export class UntrustedWorkerSession extends EventEmitter {
-  constructor (source, options = {}) {
+  constructor (source, options = {}, internalOptions) {
     super()
-    if (options === null || typeof options !== 'object' || Array.isArray(options)) {
-      throw new TypeError('options must be an object')
-    }
-    options = snapshotSessionOptions(options)
-
-    const localModule = options[LOCAL_MODULE]
-    const preacquiredSlot = options[PREACQUIRED_SLOT]
-    const preparationSlot = options[PREPARATION_SLOT]
-    if (preacquiredSlot !== undefined && typeof preacquiredSlot !== 'function') {
-      throw new TypeError('Invalid pre-acquired worker slot')
-    }
-    if (preparationSlot !== undefined && typeof preparationSlot !== 'function') {
-      throw new TypeError('Invalid file preparation slot')
-    }
-    const type = options.type ?? 'script'
-    if (type !== 'script' && type !== 'module') {
-      throw new TypeError("type must be 'script' or 'module'")
-    }
-    const language = options.language ?? 'javascript'
-    if (language !== 'javascript' && language !== 'typescript') {
-      throw new TypeError("language must be 'javascript' or 'typescript'")
-    }
-
-    const maxSourceBytes = options.maxSourceBytes ?? DEFAULT_MAX_SOURCE_BYTES
-    const startupTimeoutMs = options.startupTimeoutMs ?? DEFAULT_STARTUP_TIMEOUT_MS
-    this.messageTimeoutMs = options.messageTimeoutMs ?? DEFAULT_MESSAGE_TIMEOUT_MS
-    this.lifetimeTimeoutMs = options.lifetimeTimeoutMs ?? DEFAULT_LIFETIME_TIMEOUT_MS
-    this.maxHostFunctionCalls = options.maxHostFunctionCalls ?? DEFAULT_MAX_HOST_FUNCTION_CALLS
-    this.maxInFlightHostFunctions = options.maxInFlightHostFunctions ?? DEFAULT_MAX_IN_FLIGHT_HOST_FUNCTIONS
-    this.maxMessageBytes = options.maxMessageBytes ?? DEFAULT_MAX_MESSAGE_BYTES
-    this.maxInputBytes = options.maxInputBytes ?? DEFAULT_MAX_INPUT_BYTES
-    this.maxOutputMessages = options.maxOutputMessages ?? DEFAULT_MAX_OUTPUT_MESSAGES
-    this.maxOutputBytes = options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES
-    const onDiagnostic = options.onDiagnostic
-    this.diagnostics = validateDiagnostics(options.diagnostics, onDiagnostic)
-    this.onDiagnostic = onDiagnostic
-    this.diagnosticRecords = 0
-    this.diagnosticBytes = 0
-    this.diagnosticSequence = 0
-    this.diagnosticsHandledSequence = 0
-    this.deferredDiagnosticEnvelopes = []
-    this.diagnosticProcessing = Promise.resolve()
-    validateSource(source, maxSourceBytes)
-    if (localModule !== undefined &&
-        (localModule === null || typeof localModule !== 'object' ||
-         typeof localModule.entryUrl !== 'string' || typeof localModule.rootPath !== 'string' ||
-         typeof localModule.rootPathPrefix !== 'string' || typeof localModule.rootUrlPrefix !== 'string' ||
-         typeof localModule.cleanup !== 'function')) {
-      throw new TypeError('Invalid local module configuration')
-    }
-    validateTimeout(startupTimeoutMs, 'startupTimeoutMs')
-    validateTimeout(this.messageTimeoutMs, 'messageTimeoutMs')
-    validateTimeout(this.lifetimeTimeoutMs, 'lifetimeTimeoutMs')
-    validatePositiveInteger(this.maxHostFunctionCalls, 'maxHostFunctionCalls')
-    validatePositiveInteger(this.maxInFlightHostFunctions, 'maxInFlightHostFunctions')
-    validatePositiveInteger(this.maxMessageBytes, 'maxMessageBytes')
-    if (this.maxMessageBytes < MIN_MAX_MESSAGE_BYTES) {
-      throw new RangeError(`maxMessageBytes must be at least ${MIN_MAX_MESSAGE_BYTES}`)
-    }
-    validatePositiveInteger(this.maxInputBytes, 'maxInputBytes')
-    validatePositiveInteger(this.maxOutputMessages, 'maxOutputMessages')
-    validatePositiveInteger(this.maxOutputBytes, 'maxOutputBytes')
-
-    const signal = options.signal
-    if (signal !== undefined && !(signal instanceof AbortSignal)) {
-      throw new TypeError('signal must be an AbortSignal')
-    }
-    if (signal && hostReflectApply(hostAbortSignalAborted, signal, [])) {
-      throw abortError(hostReflectApply(hostAbortSignalReason, signal, []))
-    }
-
-    const startedAt = Date.now()
-    const input = cloneWithoutSharedMemory(options.input, 'input')
-    assertSupportedProtocolValue(input, 'input')
-    const serializedInput = v8Serialize(input)
-    if (hostReflectApply(hostTypedArrayByteLength, serializedInput, []) > this.maxInputBytes) {
-      throw new RangeError(`input exceeds maxInputBytes (${this.maxInputBytes})`)
-    }
-    const environment = sanitizeEnvironment(options.environment)
-    const resourceLimits = validateResourceLimits(options.resourceLimits)
-    const hostFunctionConfiguration = validateHostFunctions(options.hostFunctions)
-    if (signal && hostReflectApply(hostAbortSignalAborted, signal, [])) {
-      throw abortError(hostReflectApply(hostAbortSignalReason, signal, []))
-    }
-    const remainingStartupMs = startupTimeoutMs - (Date.now() - startedAt)
-    if (remainingStartupMs <= 0) {
-      throw sessionError(`Startup exceeded ${startupTimeoutMs} ms`, 'ERR_UNTRUSTED_WORKER_STARTUP_TIMEOUT')
-    }
-
-    this.state = 'starting'
-    sessionSecrets.set(this, {
-      worker: undefined,
-      port: undefined,
-      protocolSecret: undefined,
-      rawPortPost: undefined,
-      diagnosticPort: undefined,
-      diagnosticSecret: undefined,
-      releaseWorkerSlot: undefined
-    })
-    this.pending = new Map()
-    this.outbound = []
-    this.nextRequestId = 1
-    this.inboundSequence = 0
-    this.outboundSequence = 0
-    this.hostFunctionCalls = 0
-    this.inFlightHostFunctions = 0
-    this.hostFunctions = hostFunctionConfiguration.functions
-    this.hostAbortController = new AbortController()
-    this.sessionId = randomUUID()
-    this.readySettled = false
-    this.failure = undefined
-    this.signal = signal
-    this.onAbort = () => this.fail(abortError(
-      hostReflectApply(hostAbortSignalReason, signal, [])
-    ))
-
-    this.ready = new Promise((resolve, reject) => {
-      this.resolveReady = resolve
-      this.rejectReady = reject
-    })
-    this.closed = new Promise((resolve) => {
-      this.resolveClosed = resolve
-    })
-
-    let releaseWorkerSlot
+    const internal = internalSessionOptions.get(internalOptions)
+    const releaseWorkerSlot = internal
+      ? internal.releaseWorkerSlot
+      : acquireWorkerSlot()
+    let configuration
     try {
-      releaseWorkerSlot = preacquiredSlot ?? acquireWorkerSlot()
+      if (options === null || typeof options !== 'object' || Array.isArray(options)) {
+        throw new TypeError('options must be an object')
+      }
+      configuration = prepareSessionConfiguration(this, source, options)
     } catch (error) {
-      this.resolveClosed({ code: undefined, error })
-      this.state = 'closed'
+      releaseWorkerSlot()
       throw error
     }
-    sessionSecrets.get(this).releaseWorkerSlot = releaseWorkerSlot
+    const {
+      environment,
+      hostFunctionConfiguration,
+      input,
+      language,
+      localModule,
+      maxSourceBytes,
+      options: sessionOptions,
+      preparationSlot,
+      resourceLimits,
+      signal,
+      startupTimeoutMs,
+      startedAt,
+      type
+    } = configuration
+    options = sessionOptions
 
+    try {
+      defineSessionData(this, 'state', 'starting')
+      sessionSecrets.set(this, {
+        worker: undefined,
+        port: undefined,
+        protocolSecret: undefined,
+        rawPortPost: undefined,
+        diagnosticPort: undefined,
+        diagnosticSecret: undefined,
+        releaseWorkerSlot: undefined
+      })
+      defineSessionData(this, 'pending', new Map())
+      defineSessionData(this, 'outbound', [])
+      defineSessionData(this, 'nextRequestId', 1)
+      defineSessionData(this, 'inboundSequence', 0)
+      defineSessionData(this, 'outboundSequence', 0)
+      defineSessionData(this, 'hostFunctionCalls', 0)
+      defineSessionData(this, 'inFlightHostFunctions', 0)
+      defineSessionData(this, 'hostFunctions', hostFunctionConfiguration.functions)
+      defineSessionData(this, 'hostAbortController', new AbortController())
+      defineSessionData(this, 'sessionId', randomUUID())
+      defineSessionData(this, 'readySettled', false)
+      defineSessionData(this, 'closedSettled', false)
+      defineSessionData(this, 'failure', undefined)
+      defineSessionData(this, 'signal', signal)
+      defineSessionData(this, 'termination', undefined)
+      defineSessionData(this, 'startupTimer', undefined)
+      defineSessionData(this, 'lifetimeTimer', undefined)
+      defineSessionData(this, 'onAbort', () => this.fail(abortError(
+        hostReflectApply(hostAbortSignalReason, signal, [])
+      )))
+
+      defineSessionData(this, 'ready', new Promise((resolve, reject) => {
+        defineSessionData(this, 'resolveReady', resolve)
+        defineSessionData(this, 'rejectReady', reject)
+      }))
+      defineSessionData(this, 'closed', new Promise((resolve) => {
+        defineSessionData(this, 'resolveClosed', resolve)
+      }))
+
+      sessionSecrets.get(this).releaseWorkerSlot = releaseWorkerSlot
+    } catch (error) {
+      releaseWorkerSlot()
+      throw error
+    }
+
+    let descriptorQuota
+    try {
+      descriptorQuota = localModule ? createFileDescriptorQuota() : undefined
+    } catch (error) {
+      releaseWorkerSlot()
+      throw error
+    }
     const workerLocalModule = localModule
       ? {
           entryUrl: localModule.entryUrl,
           rootPath: localModule.rootPath,
           rootPathPrefix: localModule.rootPathPrefix,
-          rootUrlPrefix: localModule.rootUrlPrefix
+          rootUrlPrefix: localModule.rootUrlPrefix,
+          maxOpenFileDescriptors: MAX_LOCAL_OPEN_FILE_DESCRIPTORS,
+          descriptorOwner: descriptorQuota.owner,
+          globalDescriptorSlots: descriptorQuota.slotsBuffer
         }
       : undefined
     try {
@@ -1311,6 +1437,7 @@ export class UntrustedWorkerSession extends EventEmitter {
           '--disable-warning=DEP0192'
         ],
         resourceLimits,
+        trackUnmanagedFds: true,
         workerData: {
           source,
           type,
@@ -1330,7 +1457,9 @@ export class UntrustedWorkerSession extends EventEmitter {
         stderr: true
       })
     } catch (error) {
+      descriptorQuota?.release()
       releaseWorkerSlot()
+      this.closedSettled = true
       this.resolveClosed({ code: undefined, error })
       this.state = 'closed'
       throw error
@@ -1338,28 +1467,37 @@ export class UntrustedWorkerSession extends EventEmitter {
 
     const worker = sessionSecrets.get(this).worker
     worker.once('exit', (code) => {
+      descriptorQuota?.release()
       releaseWorkerSlot()
       if (!localModule) {
         this.handleExit(code)
         return
       }
-      void localModule.cleanup().then(() => {
-        preparationSlot?.()
-        this.handleExit(code)
-      }, (error) => {
+      void attemptLocalModuleCleanup(localModule).then((outcome) => {
+        if (outcome.status === 'removed') {
+          preparationSlot?.()
+          this.handleExit(code)
+          return
+        }
+
+        const cleanupError = outcome.status === 'failed'
+          ? outcome.error
+          : new Error('Snapshot cleanup did not settle before its deadline')
         const primaryError = this.failure
         this.failure = sessionError(
-          'The private module snapshot could not be removed',
+          'The private module snapshot could not be removed promptly',
           'ERR_UNTRUSTED_WORKER_CLEANUP',
           primaryError
-            ? new AggregateError([primaryError, error], 'Worker and cleanup failures')
-            : error
+            ? new AggregateError([primaryError, cleanupError], 'Worker and cleanup failures')
+            : cleanupError
         )
         void localModule.cleanupUntilRemoved().then(
           () => preparationSlot?.(),
           () => preparationSlot?.()
         )
         this.handleExit(code)
+      }).catch((error) => {
+        process.nextTick(() => { throw error })
       })
     })
     worker.stdout.resume()
@@ -1496,8 +1634,48 @@ export class UntrustedWorkerSession extends EventEmitter {
       sessionSecrets.get(this).diagnosticPort?.close()
     }
     const worker = sessionSecrets.get(this).worker
-    this.termination = worker ? worker.terminate() : Promise.resolve(undefined)
+    if (!worker) {
+      this.termination = Promise.resolve(undefined)
+      return this.termination
+    }
+
+    const workerTermination = worker.terminate()
+    this.termination = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        const error = sessionError(
+          'The worker did not exit after termination was requested',
+          'ERR_UNTRUSTED_WORKER_TERMINATION_TIMEOUT',
+          this.failure
+        )
+        this.settleWithoutWorkerExit(error)
+        reject(error)
+      }, TERMINATION_SETTLEMENT_TIMEOUT_MS)
+      workerTermination.then(
+        (code) => {
+          clearTimeout(timer)
+          resolve(code)
+        },
+        (cause) => {
+          clearTimeout(timer)
+          const error = sessionError(
+            'The worker could not be terminated',
+            'ERR_UNTRUSTED_WORKER_TERMINATION',
+            cause
+          )
+          this.settleWithoutWorkerExit(error)
+          reject(error)
+        }
+      )
+    })
     return this.termination
+  }
+
+  settleWithoutWorkerExit (error) {
+    if (this.closedSettled) return
+    this.failure = error
+    this.state = 'closed'
+    this.closedSettled = true
+    this.resolveClosed({ code: undefined, error })
   }
 
   handleHandshake (message) {
@@ -1894,7 +2072,10 @@ export class UntrustedWorkerSession extends EventEmitter {
     }
 
     this.state = 'closed'
-    this.resolveClosed({ code, error: this.failure })
+    if (!this.closedSettled) {
+      this.closedSettled = true
+      this.resolveClosed({ code, error: this.failure })
+    }
     try {
       if (errorToEmit) this.emitError(errorToEmit)
     } finally {
@@ -1909,7 +2090,7 @@ export class UntrustedWorkerSession extends EventEmitter {
     this.hostAbortController.abort(error)
     this.rejectReadyOnce(error)
     this.rejectOutstanding(error)
-    void this.terminate()
+    void this.terminate().catch(() => {})
     this.emitError(error)
   }
 
@@ -2001,7 +2182,7 @@ function snapshotSessionOptions (options) {
   const descriptors = Object.getOwnPropertyDescriptors(options)
   for (const key of Reflect.ownKeys(options)) {
     if (typeof key === 'symbol' && key !== ONE_SHOT && key !== LOCAL_MODULE &&
-        key !== PREACQUIRED_SLOT && key !== PREPARATION_SLOT) {
+        key !== PREPARATION_SLOT) {
       throw new TypeError('options must not contain symbol properties')
     }
     const descriptor = descriptors[key]

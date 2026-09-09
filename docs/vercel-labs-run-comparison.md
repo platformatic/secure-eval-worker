@@ -38,7 +38,7 @@ container sandbox.
 | Interrupt and resume | Signed or stored replay continuations | No durable continuation mechanism | Important for approval and authentication workflows |
 | Aggregate admission control | Process-wide worker cap with immediate backpressure | Main-thread process-wide cap with immediate rejection | Closed with fail-closed host-thread restriction |
 | One-shot worker reuse | Pooled workers with fresh QuickJS contexts | A new worker for each one-shot execution | Deliberate no-pool security decision |
-| Runtime support | Node.js 20.19+ and Bun | Node.js 26.3+ | Significant deployment restriction |
+| Runtime support | Node.js 20.19+ and Bun | Node.js >=26.3.0 <27 | Significant deployment restriction |
 | Synchronous guest bindings | Supported for compatibility APIs | Host functions always return promises | Specialized compatibility gap |
 | Guest console | Bounded and sanitized output | Opt-in bounded sanitized diagnostics; discarded by default | Closed |
 | Serialized errors | Supports `Error`, causes, and aggregate errors as data | Errors use dedicated failure channels | Moderate interoperability gap |

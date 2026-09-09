@@ -17,6 +17,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import { abortError, UntrustedCodeError } from './internal.js'
 
 const READ_CHUNK_BYTES = 64 * 1024
+export const SNAPSHOT_CLEANUP_SETTLE_MS = 250
 
 function modulePathError (message, code) {
   return new UntrustedCodeError(message, { code })
@@ -89,7 +90,12 @@ async function copyRegularFile (
 ) {
   let handle
   try {
-    handle = await open(sourcePath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
+    handle = await open(
+      sourcePath,
+      constants.O_RDONLY |
+        (constants.O_NOFOLLOW ?? 0) |
+        (constants.O_NONBLOCK ?? 0)
+    )
     const before = await handle.stat()
     if (!before.isFile()) {
       throw modulePathError(
@@ -211,6 +217,27 @@ async function stageRootTree (rootPath, stagePath, limits, signal) {
   return accounting.stagedFiles
 }
 
+export async function attemptLocalModuleCleanup (
+  localModule,
+  timeoutMs = SNAPSHOT_CLEANUP_SETTLE_MS
+) {
+  let timer
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(Object.freeze({ status: 'pending' })), timeoutMs)
+  })
+  const attempt = Promise.resolve()
+    .then(() => localModule.cleanup())
+    .then(
+      () => Object.freeze({ status: 'removed' }),
+      (error) => Object.freeze({ status: 'failed', error })
+    )
+  try {
+    return await Promise.race([attempt, timeout])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 /**
  * Copy a canonical, bounded module tree into a package-owned staging root.
  * The worker receives access only to this snapshot, never to mutable caller
@@ -272,6 +299,7 @@ export async function resolveLocalModule (modulePath, rootDirectory, limits, sig
   }
   const cleanupUntilRemoved = async () => {
     let warned = false
+    let retryDelayMs = 1_000
     while (!cleaned) {
       try {
         await cleanup()
@@ -283,9 +311,10 @@ export async function resolveLocalModule (modulePath, rootDirectory, limits, sig
           })
         }
         await new Promise((resolve) => {
-          const timer = setTimeout(resolve, 1_000)
+          const timer = setTimeout(resolve, retryDelayMs)
           timer.unref()
         })
+        retryDelayMs = Math.min(retryDelayMs * 2, 60_000)
       }
     }
   }
