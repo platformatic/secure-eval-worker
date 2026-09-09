@@ -164,7 +164,7 @@ for (const type of ['one-shot', 'script', 'module']) {
         const bareNamespace = await import('v8')
         const { queryObjects: bareNamed } = await import('v8')
         const module = await import('node:module')
-        const require = module.createRequire('file:///secure-eval-worker.js')
+        const require = module.createRequire(process.execPath)
         const calls = [
           named,
           namespace.queryObjects,
