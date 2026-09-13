@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
-import { cp, mkdtemp, mkdir, open, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises'
+import { cp, mkdtemp, mkdir, open, readdir, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { platform, tmpdir } from 'node:os'
 import { join, sep } from 'node:path'
 import { test } from 'node:test'
@@ -730,12 +730,13 @@ test('persistent cleanup settles while a stalled janitor retains preparation', a
   let releasePreparationCalls = 0
   let resolveJanitor
   const janitor = new Promise((resolve) => { resolveJanitor = resolve })
-  const rootPathPrefix = files.directory.endsWith(sep)
-    ? files.directory
-    : files.directory + sep
+  const rootPath = await realpath(files.directory)
+  const rootPathPrefix = rootPath.endsWith(sep)
+    ? rootPath
+    : rootPath + sep
   const localModule = {
-    entryUrl: pathToFileURL(files.path('entry.mjs')).href,
-    rootPath: files.directory,
+    entryUrl: pathToFileURL(join(rootPath, 'entry.mjs')).href,
+    rootPath,
     rootPathPrefix,
     rootUrlPrefix: pathToFileURL(rootPathPrefix).href,
     cleanup: () => new Promise(() => {}),
@@ -769,12 +770,13 @@ test('janitor rejection retains unresolved preparation ownership', async (t) => 
   })
   t.after(() => files.cleanup())
   let releasePreparationCalls = 0
-  const rootPathPrefix = files.directory.endsWith(sep)
-    ? files.directory
-    : files.directory + sep
+  const rootPath = await realpath(files.directory)
+  const rootPathPrefix = rootPath.endsWith(sep)
+    ? rootPath
+    : rootPath + sep
   const localModule = {
-    entryUrl: pathToFileURL(files.path('entry.mjs')).href,
-    rootPath: files.directory,
+    entryUrl: pathToFileURL(join(rootPath, 'entry.mjs')).href,
+    rootPath,
     rootPathPrefix,
     rootUrlPrefix: pathToFileURL(rootPathPrefix).href,
     cleanup: () => new Promise(() => {}),
@@ -801,6 +803,9 @@ test('surfaces snapshot cleanup failures under host permissions', {
   const invalid = await fixture({ 'entry.mjs': 'export default () => 42' })
   await symlink('../outside', invalid.path('invalid-link'))
   const stagingBase = await mkdtemp(join(tmpdir(), 'secure-eval-worker-staging-test-'))
+  const canonicalFiles = await realpath(files.directory)
+  const canonicalInvalid = await realpath(invalid.directory)
+  const canonicalStagingBase = await realpath(stagingBase)
   t.after(async () => {
     await Promise.all([
       files.cleanup(),
@@ -813,8 +818,8 @@ test('surfaces snapshot cleanup failures under host permissions', {
     import { runUntrustedFile } from ${JSON.stringify(packageUrl)}
     const codes = []
     for (const [entry, root] of ${JSON.stringify([
-      [files.path('entry.mjs'), files.directory],
-      [invalid.path('entry.mjs'), invalid.directory]
+      [join(canonicalFiles, 'entry.mjs'), canonicalFiles],
+      [join(canonicalInvalid, 'entry.mjs'), canonicalInvalid]
     ])}) {
       try {
         await runUntrustedFile(entry, { rootDirectory: root, timeoutMs: 5000 })
@@ -828,14 +833,14 @@ test('surfaces snapshot cleanup failures under host permissions', {
     '--permission',
     '--allow-worker',
     `--allow-fs-read=${repositoryRoot}`,
-    `--allow-fs-read=${files.directory}`,
-    `--allow-fs-read=${invalid.directory}`,
-    `--allow-fs-write=${stagingBase}`,
+    `--allow-fs-read=${canonicalFiles}`,
+    `--allow-fs-read=${canonicalInvalid}`,
+    `--allow-fs-write=${canonicalStagingBase}`,
     '--input-type=module',
     '--eval',
     childSource
   ], {
-    env: { ...process.env, TMPDIR: stagingBase },
+    env: { ...process.env, TMPDIR: canonicalStagingBase },
     timeout: 10_000
   })
   assert.deepEqual(JSON.parse(stdout), [
