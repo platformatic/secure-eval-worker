@@ -184,7 +184,9 @@ The package includes TypeScript declarations. `runUntrustedCode<Output, Input>()
 
 ### `runUntrustedCode(source[, options])`
 
-Returns a promise for the result.
+Returns a promise for the result. Every unrecognized option is rejected rather
+than ignored, so misspelled security limits cannot silently fall back to a
+different value.
 
 Options:
 
@@ -203,7 +205,7 @@ Every execution uses a new worker. If Node cannot interrupt synchronous native w
 
 ### `runUntrustedFile(modulePath[, options])`
 
-Asynchronously stages a path string or `file:` URL and executes its default-exported function in a fresh worker. Options match `runUntrustedCode()` except `language` and `maxSourceBytes`, plus `rootDirectory`, `maxRootEntries`, `maxFileBytes`, and `maxTotalFileBytes`. `timeoutMs` actively bounds staging, worker startup, and execution. The file extension selects Node's module format and optional native TypeScript stripping.
+Asynchronously stages a path string or `file:` URL and executes its default-exported function in a fresh worker. Options match `runUntrustedCode()` except `language` and `maxSourceBytes`, plus `rootDirectory`, `maxRootEntries`, `maxFileBytes`, and `maxTotalFileBytes`. `timeoutMs` actively bounds staging, worker startup, and execution. The file extension selects Node's module format and optional native TypeScript stripping. Local drive roots and junction rejection are covered on Windows CI; UNC/network-share roots remain outside the tested local-root profile.
 
 ### `createUntrustedWorkerFromFile(modulePath[, options])`
 
@@ -240,6 +242,11 @@ Options:
 - `onDiagnostic(record)`: optional callback receiving frozen `{ level, text }` records; providing it enables default diagnostic limits.
 - `maxSourceBytes`, `environment`, `resourceLimits`, and `signal`: equivalent to the one-shot options.
 
+`UntrustedWorkerSession` is security-sensitive and final: constructing a subclass
+throws. Its public lifecycle methods are installed as immutable own methods, while
+internal handlers and mutable control state are private, so caller-defined properties
+cannot replace trusted termination and cleanup behavior.
+
 Session interface:
 
 - `ready`: promise resolved after script setup or the module's default setup function completes. Setup return values are ignored.
@@ -249,7 +256,7 @@ Session interface:
 - `closed`: promise resolved with `{ code, error }` after worker exit, or with a termination error when that bounded window expires. Admission and local-file preparation remain occupied until the worker actually exits and snapshot cleanup finishes.
 - Events: `message` for values passed to `send()`, `diagnostic` for opt-in console records, `error` for runtime/session errors, and `exit` for worker exit. Attach an `error` listener when runtime notifications need to be observed.
 
-`onMessage()` registers one handler, and messages are processed serially. Input, posts, requests, replies, unsolicited messages, and host-function arguments/results are copied. Transfer lists and all shared-memory representations—including `SharedArrayBuffer`, shared typed-array/DataView backing stores, and shared `WebAssembly.Memory`—are rejected. Protocol values are restricted to primitives, plain objects and arrays, `ArrayBuffer` and non-shared views, `Date`, `RegExp`, `Map`, and `Set`. Platform objects such as `Blob`, ports, file handles, sockets, cryptographic key objects, and ordinary `Error` values are rejected. Use explicit plain error data when needed; see [`docs/error-values.md`](docs/error-values.md). The exact serialized bytes—not a second representation of the value—are authenticated before deserialization.
+`onMessage()` registers one handler, and messages are processed serially. Input, posts, requests, replies, unsolicited messages, and host-function arguments/results are copied. Transfer lists and all shared-memory representations—including `SharedArrayBuffer`, shared typed-array/DataView backing stores, and shared `WebAssembly.Memory`—are rejected. Protocol values are restricted to primitives, plain objects and arrays containing only enumerable data properties, `ArrayBuffer` and non-shared views, `Date`, `RegExp`, `Map`, and `Set`. Custom class instances; accessors, symbols, and non-enumerable properties on plain objects or arrays; and platform objects such as `Blob`, ports, file handles, sockets, cryptographic key objects, and ordinary `Error` values are rejected before cloning. Null-prototype objects are accepted as data but Node's structured clone normalizes them to ordinary objects at the worker boundary. Use explicit plain error data when needed; see [`docs/error-values.md`](docs/error-values.md). The exact serialized bytes—not a second representation of the value—are authenticated before deserialization.
 
 Diagnostics use a separate private channel, key, sequence, and byte/count budgets. Control replies carry a diagnostic watermark, so asynchronous callbacks for earlier records settle first. Formatting never reads object properties or invokes custom inspection. Strings have terminal control characters escaped. A callback cannot request from its own session because waiting would deadlock; this throws `ERR_UNTRUSTED_WORKER_REENTRANT_DIAGNOSTIC`. A callback failure uses `ERR_UNTRUSTED_WORKER_DIAGNOSTIC_CALLBACK` for sessions and `ERR_UNTRUSTED_CODE_DIAGNOSTIC_CALLBACK` for one-shot calls; the default remains complete suppression.
 
@@ -275,7 +282,7 @@ Errors originating from execution use this class and have a machine-readable `co
 - The worker gets `env: {}` unless an explicit environment is supplied. Never place secrets in that environment.
 - Do not place secrets in `worker_threads.setEnvironmentData()`: Node clones global worker environment data into new workers independently of `WorkerOptions.env`. This module blocks the public getter, heap-snapshot APIs, and `v8.queryObjects()`, but avoiding the secret entirely is safer against future or internal APIs.
 - Both execution modes create a private `MessageChannel` inside the trusted bootstrap, close and hide `parentPort`, freeze the privileged port's prototype chain, and authenticate serialized payloads with a per-session HMAC and monotonic sequence number. Capturing or replaying a port cannot forge control traffic.
-- Before guest execution, the bootstrap disables known same-process escape surfaces not covered by permissions: existing-descriptor access through public modules, legacy network-module aliases, accessor-exported stream constructors, and undocumented native bindings; asynchronous module-loader registration; `node:sqlite`; process signaling and reports; process priority mutation; dangerous V8 profiling/snapshot/flag APIs; async hooks; BroadcastChannel, Web Locks, cross-thread messaging, and inherited worker environment data. Guest `argv` is replaced with a fixed value.
+- Before guest execution, the bootstrap disables known same-process escape surfaces not covered by permissions: existing-descriptor access through public modules, legacy network-module aliases, accessor-exported stream constructors, and undocumented native bindings; asynchronous module-loader registration; `node:sqlite`; process signaling and reports; process priority mutation; guest-facing V8 hooks, serializers, profilers, snapshot callbacks, flag mutation, and object queries; async hooks; BroadcastChannel, Web Locks, cross-thread messaging, inherited worker environment data, and host identity/resource metadata APIs. Guest `argv`, current-directory reporting, executable arguments, executable path, and global module search paths are replaced with fixed or empty virtual values. The read-only `v8.startupSnapshot.isBuildingSnapshot()` probe remains available because Node's TypeScript erasure depends on it; callable V8 capabilities are otherwise denied. Node exposes `process.argv0` as a non-configurable worker property, so it remains visible through global, ESM, CommonJS, and `process.getBuiltinModule()` aliases; launch the host with a non-sensitive `argv0` value when this metadata matters.
 - Host functions are authority grants. They must validate and authorize every argument, constrain outputs, and avoid exposing generic filesystem or network primitives when a narrower business operation is possible.
 - A timed-out worker is sent a termination request, but Worker resource limits do not constrain `ArrayBuffer`, WebAssembly, native allocations, aggregate CPU, all libuv-thread-pool work, or process-wide out-of-memory failure. Uninterruptible native work can continue after the public termination promises settle with a termination error; its admission slot remains occupied until the actual worker exit. Host functions that ignore their abort signal may also continue host-side work after termination.
 - JavaScript taming is additional defense in depth, not a substitute for an OS boundary. Future Node APIs, undocumented internals, native/runtime vulnerabilities, or process-wide behavior can invalidate it. Run adversarial multi-tenant code in a separately sandboxed process or container.

@@ -2,6 +2,7 @@ import { AsyncLocalStorage } from 'node:async_hooks'
 import { Buffer } from 'node:buffer'
 import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto'
 import { EventEmitter } from 'node:events'
+import { Readable } from 'node:stream'
 import { deserialize as v8Deserialize, serialize as v8Serialize } from 'node:v8'
 import { MessagePort, Worker } from 'node:worker_threads'
 
@@ -42,24 +43,174 @@ const MAX_LOCAL_OPEN_FILE_DESCRIPTORS = 64
 const DEFAULT_MAX_DIAGNOSTIC_RECORDS = 100
 const DEFAULT_MAX_DIAGNOSTIC_BYTES = 64 * 1024
 const DEFAULT_MAX_DIAGNOSTIC_RECORD_BYTES = 4 * 1024
+const SafeAbortController = AbortController
+const SafeMap = Map
+const SafePromise = Promise
 const safeArrayBufferIsView = ArrayBuffer.isView
+const hostArrayIsArray = Array.isArray
+const hostArrayPush = Array.prototype.push
+const hostArrayShift = Array.prototype.shift
+const hostArraySplice = Array.prototype.splice
+const hostClearTimeout = globalThis.clearTimeout
+const hostDateNow = Date.now
+const hostHmacPrototype = Object.getPrototypeOf(createHmac('sha256', 'capture'))
+const hostHmacDigest = hostHmacPrototype.digest
+const hostHmacUpdate = hostHmacPrototype.update
+const hostObjectCreate = Object.create
 const hostObjectDefineProperty = Object.defineProperty
+const hostObjectFreeze = Object.freeze
+const hostObjectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor
+const hostObjectGetOwnPropertyDescriptors = Object.getOwnPropertyDescriptors
+const hostObjectHasOwn = Object.hasOwn
+const hostPromiseCatch = Promise.prototype.catch
+const hostPromiseReject = Promise.reject
+const hostPromiseResolve = Promise.resolve
+const hostPromiseThen = Promise.prototype.then
+const hostSetTimeout = globalThis.setTimeout
 const hostTypedArrayByteLength = Object.getOwnPropertyDescriptor(
   Object.getPrototypeOf(Uint8Array.prototype),
   'byteLength'
 ).get
 const hostReflectApply = Reflect.apply
+const hostReflectOwnKeys = Reflect.ownKeys
+const hostMapClear = Map.prototype.clear
+const hostMapDelete = Map.prototype.delete
+const hostMapGet = Map.prototype.get
+const hostMapHas = Map.prototype.has
+const hostMapSet = Map.prototype.set
+const hostMapValues = Map.prototype.values
+const hostMapIteratorNext = Object.getPrototypeOf(new SafeMap().values()).next
+const hostSetHas = Set.prototype.has
+const hostEventEmitterEmit = EventEmitter.prototype.emit
+const hostEventEmitterListenerCount = EventEmitter.prototype.listenerCount
+const hostEventEmitterOn = EventEmitter.prototype.on
+const hostEventEmitterOnce = EventEmitter.prototype.once
+const hostEventEmitterRemoveAllListeners = EventEmitter.prototype.removeAllListeners
+const hostMessagePortClose = MessagePort.prototype.close
+const hostMessagePortPostMessage = MessagePort.prototype.postMessage
+const hostMessagePortStart = MessagePort.prototype.start
+const hostMessagePortOn = Object.getPrototypeOf(MessagePort.prototype).on
+const hostReadableResume = Readable.prototype.resume
+const hostWorkerStderr = Object.getOwnPropertyDescriptor(Worker.prototype, 'stderr').get
+const hostWorkerStdout = Object.getOwnPropertyDescriptor(Worker.prototype, 'stdout').get
+const hostWorkerTerminate = Worker.prototype.terminate
+const hostWeakMapGet = WeakMap.prototype.get
+const hostWeakMapSet = WeakMap.prototype.set
 const hostEventTargetAddEventListener = EventTarget.prototype.addEventListener
 const hostEventTargetRemoveEventListener = EventTarget.prototype.removeEventListener
+const hostAbortControllerAbort = AbortController.prototype.abort
+const hostAbortControllerSignal = Object.getOwnPropertyDescriptor(
+  AbortController.prototype,
+  'signal'
+).get
 const hostAbortSignalAborted = Object.getOwnPropertyDescriptor(AbortSignal.prototype, 'aborted').get
 const hostAbortSignalReason = Object.getOwnPropertyDescriptor(AbortSignal.prototype, 'reason').get
+const hostAsyncLocalStorageGetStore = AsyncLocalStorage.prototype.getStore
+const hostAsyncLocalStorageRun = AsyncLocalStorage.prototype.run
+const hostBufferFrom = Buffer.from
+const hostNumberIsSafeInteger = Number.isSafeInteger
+const hostProcessNextTick = process.nextTick
+const hostStringSlice = String.prototype.slice
 const sessionSecrets = new WeakMap()
+const sessionData = new WeakMap()
 const internalSessionOptions = new WeakMap()
 const diagnosticContextStorage = new AsyncLocalStorage()
+
+function getSessionSecrets (session) {
+  return hostReflectApply(hostWeakMapGet, sessionSecrets, [session])
+}
+
+function getSessionData (session) {
+  return hostReflectApply(hostWeakMapGet, sessionData, [session])
+}
+
+function resolveHostPromise (value) {
+  return hostReflectApply(hostPromiseResolve, SafePromise, [value])
+}
+
+function rejectHostPromise (error) {
+  return hostReflectApply(hostPromiseReject, SafePromise, [error])
+}
+
+function thenHostPromise (promise, onFulfilled, onRejected) {
+  return hostReflectApply(hostPromiseThen, promise, [onFulfilled, onRejected])
+}
+
+function catchHostPromise (promise, onRejected) {
+  return hostReflectApply(hostPromiseCatch, promise, [onRejected])
+}
+
+function closeHostMessagePort (port) {
+  if (port) hostReflectApply(hostMessagePortClose, port, [])
+}
+
+function emitHostEvent (emitter, type, value) {
+  return hostReflectApply(hostEventEmitterEmit, emitter, [type, value])
+}
+
+function trustedWorkerEmit (...arguments_) {
+  return hostReflectApply(hostEventEmitterEmit, this, arguments_)
+}
+
+function trustedWorkerOn (...arguments_) {
+  return hostReflectApply(hostEventEmitterOn, this, arguments_)
+}
+
+function trustedWorkerOnce (...arguments_) {
+  return hostReflectApply(hostEventEmitterOnce, this, arguments_)
+}
+
+function trustedWorkerRemoveAllListeners (...arguments_) {
+  return hostReflectApply(hostEventEmitterRemoveAllListeners, this, arguments_)
+}
+
+class SafeWorker extends Worker {}
+
+for (const [name, value] of [
+  ['emit', trustedWorkerEmit],
+  ['on', trustedWorkerOn],
+  ['once', trustedWorkerOnce],
+  ['removeAllListeners', trustedWorkerRemoveAllListeners]
+]) {
+  hostObjectDefineProperty(SafeWorker.prototype, name, {
+    configurable: false,
+    enumerable: false,
+    value,
+    writable: false
+  })
+}
+hostObjectFreeze(SafeWorker.prototype)
+
 const ONE_SHOT = Symbol('oneShot')
 const LOCAL_MODULE = Symbol('localModule')
 const PREPARATION_SLOT = Symbol('preparationSlot')
 const TERMINATION_SETTLEMENT_TIMEOUT_MS = 1_000
+const SESSION_OPTION_NAMES = new Set([
+  'type',
+  'language',
+  'input',
+  'environment',
+  'resourceLimits',
+  'signal',
+  'startupTimeoutMs',
+  'messageTimeoutMs',
+  'lifetimeTimeoutMs',
+  'maxSourceBytes',
+  'maxMessageBytes',
+  'maxInputBytes',
+  'maxOutputMessages',
+  'maxOutputBytes',
+  'hostFunctions',
+  'maxHostFunctionCalls',
+  'maxInFlightHostFunctions',
+  'diagnostics',
+  'onDiagnostic'
+])
+const REQUEST_OPTION_NAMES = new Set(['timeoutMs'])
+const DIAGNOSTIC_LEVELS = new Set([
+  'assert', 'debug', 'dir', 'error', 'info', 'log', 'table', 'trace', 'warn'
+])
+let trustedSessionMethods
 
 const SESSION_BOOTSTRAP = String.raw`
 'use strict'
@@ -108,6 +259,7 @@ const SafeError = Error
 const SafeSyntaxError = SyntaxError
 const SafeString = String
 const SafeNumber = Number
+const SafeWeakSet = WeakSet
 const numberIsSafeInteger = Number.isSafeInteger
 const promiseThen = Promise.prototype.then
 const promiseCatch = Promise.prototype.catch
@@ -155,6 +307,27 @@ const objectGetPrototypeOf = Object.getPrototypeOf
 const objectGetOwnPropertyDescriptors = Object.getOwnPropertyDescriptors
 const objectHasOwn = Object.hasOwn
 const objectPrototype = Object.prototype
+const arrayPrototype = Array.prototype
+const arrayBufferPrototype = ArrayBuffer.prototype
+const datePrototype = Date.prototype
+const regexpPrototype = RegExp.prototype
+const mapPrototype = Map.prototype
+const setPrototype = Set.prototype
+const allowedViewPrototypes = new Set([
+  DataView.prototype,
+  Int8Array.prototype,
+  Uint8Array.prototype,
+  Uint8ClampedArray.prototype,
+  Int16Array.prototype,
+  Uint16Array.prototype,
+  Int32Array.prototype,
+  Uint32Array.prototype,
+  Float32Array.prototype,
+  Float64Array.prototype,
+  BigInt64Array.prototype,
+  BigUint64Array.prototype,
+  Buffer.prototype
+])
 const stringSlice = String.prototype.slice
 const stringSplit = String.prototype.split
 const stringIndexOf = String.prototype.indexOf
@@ -240,11 +413,12 @@ function replaceProperty(target, name, value) {
   }
 }
 
-function denyFunctions(target, prefix) {
+function denyFunctions(target, prefix, allowedNames) {
   for (const [name, descriptor] of Object.entries(objectGetOwnPropertyDescriptors(target))) {
     // Several security-sensitive builtins expose callable constructors through
     // configurable accessors rather than ordinary value properties.
-    if (!('value' in descriptor) || typeof descriptor.value === 'function') {
+    if ((!allowedNames || !reflectApply(setHas, allowedNames, [name])) &&
+        (!('value' in descriptor) || typeof descriptor.value === 'function')) {
       replaceProperty(target, name, function deniedBuiltin() {
         return sandboxDenied(prefix + '.' + name)
       })
@@ -428,6 +602,9 @@ function hardenDangerousBuiltins() {
 
   // Asynchronous customization hooks execute in an InternalWorker, which does
   // not inherit this realm's permission drop or builtin hardening.
+  const hiddenGlobalPaths = objectFreeze([])
+  replaceProperty(moduleBuiltin, 'globalPaths', hiddenGlobalPaths)
+  replaceProperty(moduleBuiltin.Module, 'globalPaths', hiddenGlobalPaths)
   for (const name of [
     'register',
     'registerHooks',
@@ -442,6 +619,35 @@ function hardenDangerousBuiltins() {
   denyFunctions(sqliteBuiltin, 'node:sqlite')
 
   replaceProperty(processBuiltin, 'argv', objectFreeze(['node', '[secure-eval-worker]']))
+  replaceProperty(processBuiltin, 'execArgv', objectFreeze([]))
+  replaceProperty(
+    processBuiltin,
+    'execPath',
+    processBuiltin.platform === 'win32'
+      ? 'C:\\secure-eval-worker\\node.exe'
+      : '/secure-eval-worker/node'
+  )
+  replaceProperty(processBuiltin, 'cwd', () => {
+    return processBuiltin.platform === 'win32'
+      ? 'C:\\secure-eval-worker'
+      : '/secure-eval-worker'
+  })
+  for (const name of [
+    'availableMemory',
+    'constrainedMemory',
+    'cpuUsage',
+    'getegid',
+    'geteuid',
+    'getgid',
+    'getgroups',
+    'getuid',
+    'memoryUsage',
+    'resourceUsage',
+    'umask',
+    'uptime'
+  ]) {
+    replaceProperty(processBuiltin, name, () => sandboxDenied('process.' + name))
+  }
   // Undocumented native bindings bypass public-module taming and can operate
   // directly on the process-wide descriptor table.
   for (const name of ['binding', '_linkedBinding', 'dlopen']) {
@@ -460,19 +666,27 @@ function hardenDangerousBuiltins() {
   replaceProperty(processBuiltin, 'report', objectFreeze(deniedReport))
 
   denyFunctions(osBuiltin, 'node:os')
-  for (const name of [
-    'getHeapSnapshot',
-    'setFlagsFromString',
-    'setHeapSnapshotNearHeapLimit',
-    'startCpuProfile',
-    'startHeapProfile',
-    'queryObjects',
-    'stopCoverage',
-    'takeCoverage',
-    'writeHeapSnapshot'
-  ]) {
-    replaceProperty(v8Builtin, name, () => sandboxDenied('node:v8.' + name))
+  // Keep the protocol's previously captured serializer functions private and
+  // deny the complete guest-facing V8 module so new profiling, snapshot, or
+  // object-query APIs cannot bypass an incomplete name list. V8 also exposes
+  // callable APIs through nested namespaces such as promiseHooks and
+  // startupSnapshot, so deny every object-valued namespace generically.
+  const v8Descriptors = objectGetOwnPropertyDescriptors(v8Builtin)
+  const v8Names = reflectOwnKeys(v8Descriptors)
+  const startupSnapshotCompatibility = new Set(['isBuildingSnapshot'])
+  for (let index = 0; index < v8Names.length; index++) {
+    const name = v8Names[index]
+    const descriptor = v8Descriptors[name]
+    if ('value' in descriptor && descriptor.value !== null &&
+        typeof descriptor.value === 'object') {
+      denyFunctions(
+        descriptor.value,
+        'node:v8.' + name,
+        name === 'startupSnapshot' ? startupSnapshotCompatibility : undefined
+      )
+    }
   }
+  denyFunctions(v8Builtin, 'node:v8')
   denyFunctions(seaBuiltin, 'node:sea')
 
   replaceProperty(workerThreadsBuiltin, 'BroadcastChannel', function DeniedBroadcastChannel() {
@@ -534,7 +748,7 @@ function assertNoSharedMemory(value, label) {
   if (value === null || typeof value !== 'object') return
 
   const pending = [value]
-  const seen = new WeakSet()
+  const seen = new SafeWeakSet()
   while (pending.length > 0) {
     const current = reflectApply(arrayPop, pending, [])
     if (current === null || typeof current !== 'object') continue
@@ -582,21 +796,23 @@ function assertNoSharedMemory(value, label) {
       continue
     }
 
-    for (const key of reflectOwnKeys(current)) {
-      reflectApply(arrayPush, pending, [current[key]])
+    const keys = reflectOwnKeys(current)
+    for (let index = 0; index < keys.length; index++) {
+      reflectApply(arrayPush, pending, [current[keys[index]]])
     }
   }
 }
 
 function cloneValue(value, label) {
+  assertSupportedProtocolValue(value, label)
   const cloned = safeStructuredClone(value)
   assertNoSharedMemory(cloned, label)
   return cloned
 }
 
-function assertSupportedProtocolValue(value) {
+function assertSupportedProtocolValue(value, label) {
   const pending = [value]
-  const seen = new WeakSet()
+  const seen = new SafeWeakSet()
   while (pending.length > 0) {
     const current = reflectApply(arrayPop, pending, [])
     if (current === null) continue
@@ -607,26 +823,69 @@ function assertSupportedProtocolValue(value) {
     if (reflectApply(weakSetHas, seen, [current])) continue
     reflectApply(weakSetAdd, seen, [current])
 
-    if (isSharedArrayBuffer(current)) throw new TypeError('Unsupported protocol value')
+    if (isSharedArrayBuffer(current)) {
+      throw new TypeError(label + ' must not contain shared memory')
+    }
+    const memoryBuffer = getWasmMemoryBuffer(current)
+    if (memoryBuffer !== undefined) {
+      if (isSharedArrayBuffer(memoryBuffer)) {
+        throw new TypeError(label + ' must not contain shared memory')
+      }
+      throw new TypeError('Unsupported protocol value')
+    }
+    let branded = false
     try {
       reflectApply(arrayBufferByteLength, current, [])
-      continue
+      branded = true
     } catch {}
-    if (reflectApply(arrayBufferIsView, ArrayBuffer, [current])) continue
+    if (branded) {
+      if (objectGetPrototypeOf(current) !== arrayBufferPrototype) {
+        throw new TypeError('Unsupported protocol value')
+      }
+      continue
+    }
+    if (reflectApply(arrayBufferIsView, ArrayBuffer, [current])) {
+      if (isSharedArrayBuffer(getViewBuffer(current))) {
+        throw new TypeError(label + ' must not contain shared memory')
+      }
+      if (!reflectApply(setHas, allowedViewPrototypes, [objectGetPrototypeOf(current)])) {
+        throw new TypeError('Unsupported protocol value')
+      }
+      continue
+    }
     try {
       reflectApply(dateTime, current, [])
+      branded = true
+    } catch {
+      branded = false
+    }
+    if (branded) {
+      if (objectGetPrototypeOf(current) !== datePrototype) {
+        throw new TypeError('Unsupported protocol value')
+      }
       continue
-    } catch {}
+    }
     try {
       reflectApply(regexpSource, current, [])
+      branded = true
+    } catch {
+      branded = false
+    }
+    if (branded) {
+      if (objectGetPrototypeOf(current) !== regexpPrototype) {
+        throw new TypeError('Unsupported protocol value')
+      }
       continue
-    } catch {}
+    }
 
     let iterator
     try {
       iterator = reflectApply(mapEntries, current, [])
     } catch {}
     if (iterator) {
+      if (objectGetPrototypeOf(current) !== mapPrototype) {
+        throw new TypeError('Unsupported protocol value')
+      }
       while (true) {
         const item = reflectApply(mapIteratorNext, iterator, [])
         if (item.done) break
@@ -640,6 +899,9 @@ function assertSupportedProtocolValue(value) {
       iterator = undefined
     }
     if (iterator) {
+      if (objectGetPrototypeOf(current) !== setPrototype) {
+        throw new TypeError('Unsupported protocol value')
+      }
       while (true) {
         const item = reflectApply(setIteratorNext, iterator, [])
         if (item.done) break
@@ -648,20 +910,29 @@ function assertSupportedProtocolValue(value) {
       continue
     }
 
+    const isArray = reflectApply(arrayIsArray, Array, [current])
     const prototype = objectGetPrototypeOf(current)
-    if (!reflectApply(arrayIsArray, Array, [current]) &&
-        prototype !== objectPrototype && prototype !== null) {
+    if ((isArray && prototype !== arrayPrototype) ||
+        (!isArray && prototype !== objectPrototype && prototype !== null)) {
       throw new TypeError('Unsupported protocol value')
     }
-    for (const key of reflectOwnKeys(current)) {
+    const descriptors = objectGetOwnPropertyDescriptors(current)
+    const keys = reflectOwnKeys(current)
+    for (let index = 0; index < keys.length; index++) {
+      const key = keys[index]
+      if (isArray && key === 'length') continue
       if (typeof key === 'symbol') throw new TypeError('Unsupported protocol value')
-      reflectApply(arrayPush, pending, [current[key]])
+      const descriptor = descriptors[key]
+      if (!descriptor.enumerable || !('value' in descriptor)) {
+        throw new TypeError('Unsupported protocol value')
+      }
+      reflectApply(arrayPush, pending, [descriptor.value])
     }
   }
 }
 
 function serializeProtocolBody(body) {
-  assertSupportedProtocolValue(body)
+  assertSupportedProtocolValue(body, 'message')
   const serialized = safeV8Serialize(body)
   const byteLength = reflectApply(typedArrayByteLength, serialized, [])
   if (byteLength > workerData.maxMessageBytes) {
@@ -733,7 +1004,7 @@ function authenticateHostMessage(envelope) {
   }
   if (!authenticated) throw new Error('Unauthenticated host protocol message')
   const body = safeV8Deserialize(serialized)
-  assertSupportedProtocolValue(body)
+  assertSupportedProtocolValue(body, 'message')
   inboundSequence = envelope.sequence
   return body
 }
@@ -746,10 +1017,13 @@ function limitedString(value, fallback) {
 function virtualizeModuleLocations(value) {
   if (!workerData.localModule || typeof value !== 'string') return value
   let result = value
-  for (const [location, replacement] of [
+  const replacements = [
     [workerData.localModule.rootUrlPrefix, 'secure-eval-worker-files/'],
     [workerData.localModule.rootPathPrefix, 'secure-eval-worker-files/']
-  ]) {
+  ]
+  for (let index = 0; index < replacements.length; index++) {
+    const location = replacements[index][0]
+    const replacement = replacements[index][1]
     result = reflectApply(arrayJoin, reflectApply(stringSplit, result, [location]), [replacement])
   }
   return result
@@ -809,20 +1083,23 @@ function normalizedGuestStack(stack, name, message) {
 function cloneError(error) {
   try {
     if (error instanceof Error) {
-      const name = limitedString(error.name, 'Error')
-      const message = virtualizeModuleLocations(
+      const name = sanitizeDiagnosticText(limitedString(error.name, 'Error'))
+      const message = sanitizeDiagnosticText(virtualizeModuleLocations(
         limitedString(error.message, 'Untrusted component failed')
-      )
+      ))
+      const code = limitedString(error.code, undefined)
       return {
         name,
         message,
         stack: normalizedGuestStack(error.stack, name, message),
-        code: limitedString(error.code, undefined)
+        code: code === undefined ? undefined : sanitizeDiagnosticText(code)
       }
     }
     return {
       name: 'Error',
-      message: limitedString(error, 'Untrusted component threw a non-Error value')
+      message: sanitizeDiagnosticText(
+        limitedString(error, 'Untrusted component threw a non-Error value')
+      )
     }
   } catch {
     return { name: 'Error', message: 'Untrusted component failed' }
@@ -1177,8 +1454,11 @@ reflectApply(promiseCatch, initialize(), [(error) => {
 `
 
 function createInternalSessionOptions (releaseWorkerSlot) {
-  const key = Object.freeze({})
-  internalSessionOptions.set(key, Object.freeze({ releaseWorkerSlot }))
+  const key = hostObjectFreeze({})
+  hostReflectApply(hostWeakMapSet, internalSessionOptions, [
+    key,
+    hostObjectFreeze({ releaseWorkerSlot })
+  ])
   return key
 }
 
@@ -1219,16 +1499,21 @@ export function createUntrustedFileSession (
 }
 
 function defineSessionData (session, name, value) {
+  getSessionData(session)[name] = value
+}
+
+function defineSessionPublicPromise (session, name, value) {
   hostObjectDefineProperty(session, name, {
-    configurable: true,
+    configurable: false,
     enumerable: true,
     value,
-    writable: true
+    writable: false
   })
 }
 
 function prepareSessionConfiguration (session, source, rawOptions) {
-  const options = snapshotSessionOptions(rawOptions)
+  const data = getSessionData(session)
+  const options = snapshotSessionOptions(rawOptions, SESSION_OPTION_NAMES, true)
   const localModule = options[LOCAL_MODULE]
   const preparationSlot = options[PREPARATION_SLOT]
   if (preparationSlot !== undefined && typeof preparationSlot !== 'function') {
@@ -1261,7 +1546,7 @@ function prepareSessionConfiguration (session, source, rawOptions) {
   defineSessionData(session, 'diagnosticSequence', 0)
   defineSessionData(session, 'diagnosticsHandledSequence', 0)
   defineSessionData(session, 'deferredDiagnosticEnvelopes', [])
-  defineSessionData(session, 'diagnosticProcessing', Promise.resolve())
+  defineSessionData(session, 'diagnosticProcessing', resolveHostPromise())
   validateSource(source, maxSourceBytes)
   if (localModule !== undefined &&
       (localModule === null || typeof localModule !== 'object' ||
@@ -1272,17 +1557,17 @@ function prepareSessionConfiguration (session, source, rawOptions) {
     throw new TypeError('Invalid local module configuration')
   }
   validateTimeout(startupTimeoutMs, 'startupTimeoutMs')
-  validateTimeout(session.messageTimeoutMs, 'messageTimeoutMs')
-  validateTimeout(session.lifetimeTimeoutMs, 'lifetimeTimeoutMs')
-  validatePositiveInteger(session.maxHostFunctionCalls, 'maxHostFunctionCalls')
-  validatePositiveInteger(session.maxInFlightHostFunctions, 'maxInFlightHostFunctions')
-  validatePositiveInteger(session.maxMessageBytes, 'maxMessageBytes')
-  if (session.maxMessageBytes < MIN_MAX_MESSAGE_BYTES) {
+  validateTimeout(data.messageTimeoutMs, 'messageTimeoutMs')
+  validateTimeout(data.lifetimeTimeoutMs, 'lifetimeTimeoutMs')
+  validatePositiveInteger(data.maxHostFunctionCalls, 'maxHostFunctionCalls')
+  validatePositiveInteger(data.maxInFlightHostFunctions, 'maxInFlightHostFunctions')
+  validatePositiveInteger(data.maxMessageBytes, 'maxMessageBytes')
+  if (data.maxMessageBytes < MIN_MAX_MESSAGE_BYTES) {
     throw new RangeError(`maxMessageBytes must be at least ${MIN_MAX_MESSAGE_BYTES}`)
   }
-  validatePositiveInteger(session.maxInputBytes, 'maxInputBytes')
-  validatePositiveInteger(session.maxOutputMessages, 'maxOutputMessages')
-  validatePositiveInteger(session.maxOutputBytes, 'maxOutputBytes')
+  validatePositiveInteger(data.maxInputBytes, 'maxInputBytes')
+  validatePositiveInteger(data.maxOutputMessages, 'maxOutputMessages')
+  validatePositiveInteger(data.maxOutputBytes, 'maxOutputBytes')
 
   const signal = options.signal
   if (signal !== undefined && !(signal instanceof AbortSignal)) {
@@ -1292,12 +1577,12 @@ function prepareSessionConfiguration (session, source, rawOptions) {
     throw abortError(hostReflectApply(hostAbortSignalReason, signal, []))
   }
 
-  const startedAt = Date.now()
+  const startedAt = hostReflectApply(hostDateNow, Date, [])
   const input = cloneWithoutSharedMemory(options.input, 'input')
   assertSupportedProtocolValue(input, 'input')
   const serializedInput = v8Serialize(input)
-  if (hostReflectApply(hostTypedArrayByteLength, serializedInput, []) > session.maxInputBytes) {
-    throw new RangeError(`input exceeds maxInputBytes (${session.maxInputBytes})`)
+  if (hostReflectApply(hostTypedArrayByteLength, serializedInput, []) > data.maxInputBytes) {
+    throw new RangeError(`input exceeds maxInputBytes (${data.maxInputBytes})`)
   }
   const environment = sanitizeEnvironment(options.environment)
   const resourceLimits = validateResourceLimits(options.resourceLimits)
@@ -1305,7 +1590,7 @@ function prepareSessionConfiguration (session, source, rawOptions) {
   if (signal && hostReflectApply(hostAbortSignalAborted, signal, [])) {
     throw abortError(hostReflectApply(hostAbortSignalReason, signal, []))
   }
-  const remainingStartupMs = startupTimeoutMs - (Date.now() - startedAt)
+  const remainingStartupMs = startupTimeoutMs - (hostReflectApply(hostDateNow, Date, []) - startedAt)
   if (remainingStartupMs <= 0) {
     throw sessionError(`Startup exceeded ${startupTimeoutMs} ms`, 'ERR_UNTRUSTED_WORKER_STARTUP_TIMEOUT')
   }
@@ -1328,15 +1613,39 @@ function prepareSessionConfiguration (session, source, rawOptions) {
 }
 
 export class UntrustedWorkerSession extends EventEmitter {
+  get state () {
+    return getSessionData(this).state
+  }
+
   constructor (source, options = {}, internalOptions) {
-    super()
-    const internal = internalSessionOptions.get(internalOptions)
+    const internal = hostReflectApply(hostWeakMapGet, internalSessionOptions, [internalOptions])
     const releaseWorkerSlot = internal
       ? internal.releaseWorkerSlot
       : acquireWorkerSlot()
+    if (new.target !== UntrustedWorkerSession) {
+      releaseWorkerSlot()
+      throw new TypeError('UntrustedWorkerSession cannot be subclassed')
+    }
+    try {
+      super()
+      for (let index = 0; index < trustedSessionMethods.length; index++) {
+        const name = trustedSessionMethods[index][0]
+        const method = trustedSessionMethods[index][1]
+        hostObjectDefineProperty(this, name, {
+          configurable: false,
+          enumerable: false,
+          value: method,
+          writable: false
+        })
+      }
+      hostReflectApply(hostWeakMapSet, sessionData, [this, hostObjectCreate(null)])
+    } catch (error) {
+      releaseWorkerSlot()
+      throw error
+    }
     let configuration
     try {
-      if (options === null || typeof options !== 'object' || Array.isArray(options)) {
+      if (options === null || typeof options !== 'object' || hostArrayIsArray(options)) {
         throw new TypeError('options must be an object')
       }
       configuration = prepareSessionConfiguration(this, source, options)
@@ -1362,8 +1671,8 @@ export class UntrustedWorkerSession extends EventEmitter {
     options = sessionOptions
 
     try {
-      defineSessionData(this, 'state', 'starting')
-      sessionSecrets.set(this, {
+      getSessionData(this).state = 'starting'
+      hostReflectApply(hostWeakMapSet, sessionSecrets, [this, {
         worker: undefined,
         port: undefined,
         protocolSecret: undefined,
@@ -1371,8 +1680,8 @@ export class UntrustedWorkerSession extends EventEmitter {
         diagnosticPort: undefined,
         diagnosticSecret: undefined,
         releaseWorkerSlot: undefined
-      })
-      defineSessionData(this, 'pending', new Map())
+      }])
+      defineSessionData(this, 'pending', new SafeMap())
       defineSessionData(this, 'outbound', [])
       defineSessionData(this, 'nextRequestId', 1)
       defineSessionData(this, 'inboundSequence', 0)
@@ -1380,28 +1689,28 @@ export class UntrustedWorkerSession extends EventEmitter {
       defineSessionData(this, 'hostFunctionCalls', 0)
       defineSessionData(this, 'inFlightHostFunctions', 0)
       defineSessionData(this, 'hostFunctions', hostFunctionConfiguration.functions)
-      defineSessionData(this, 'hostAbortController', new AbortController())
+      defineSessionData(this, 'hostAbortController', new SafeAbortController())
       defineSessionData(this, 'sessionId', randomUUID())
-      defineSessionData(this, 'readySettled', false)
-      defineSessionData(this, 'closedSettled', false)
-      defineSessionData(this, 'failure', undefined)
+      getSessionData(this).readySettled = false
+      getSessionData(this).closedSettled = false
+      getSessionData(this).failure = undefined
       defineSessionData(this, 'signal', signal)
-      defineSessionData(this, 'termination', undefined)
-      defineSessionData(this, 'startupTimer', undefined)
-      defineSessionData(this, 'lifetimeTimer', undefined)
-      defineSessionData(this, 'onAbort', () => this.fail(abortError(
+      getSessionData(this).termination = undefined
+      getSessionData(this).startupTimer = undefined
+      getSessionData(this).lifetimeTimer = undefined
+      defineSessionData(this, 'onAbort', () => this.#fail(abortError(
         hostReflectApply(hostAbortSignalReason, signal, [])
       )))
 
-      defineSessionData(this, 'ready', new Promise((resolve, reject) => {
+      defineSessionPublicPromise(this, 'ready', new SafePromise((resolve, reject) => {
         defineSessionData(this, 'resolveReady', resolve)
         defineSessionData(this, 'rejectReady', reject)
       }))
-      defineSessionData(this, 'closed', new Promise((resolve) => {
+      defineSessionPublicPromise(this, 'closed', new SafePromise((resolve) => {
         defineSessionData(this, 'resolveClosed', resolve)
       }))
 
-      sessionSecrets.get(this).releaseWorkerSlot = releaseWorkerSlot
+      getSessionSecrets(this).releaseWorkerSlot = releaseWorkerSlot
     } catch (error) {
       releaseWorkerSlot()
       throw error
@@ -1425,17 +1734,17 @@ export class UntrustedWorkerSession extends EventEmitter {
           globalDescriptorSlots: descriptorQuota.slotsBuffer
         }
       : undefined
+    const workerExecArgv = ['--permission', '--allow-worker']
+    if (localModule) {
+      workerExecArgv[workerExecArgv.length] = `--allow-fs-read=${localModule.rootPath}`
+    }
+    workerExecArgv[workerExecArgv.length] = '--disable-warning=PERM0006'
+    workerExecArgv[workerExecArgv.length] = '--disable-warning=DEP0192'
     try {
-      sessionSecrets.get(this).worker = new Worker(SESSION_BOOTSTRAP, {
+      getSessionSecrets(this).worker = new SafeWorker(SESSION_BOOTSTRAP, {
         eval: true,
         env: environment,
-        execArgv: [
-          '--permission',
-          '--allow-worker',
-          ...(localModule ? [`--allow-fs-read=${localModule.rootPath}`] : []),
-          '--disable-warning=PERM0006',
-          '--disable-warning=DEP0192'
-        ],
+        execArgv: workerExecArgv,
         resourceLimits,
         trackUnmanagedFds: true,
         workerData: {
@@ -1446,10 +1755,10 @@ export class UntrustedWorkerSession extends EventEmitter {
           input,
           maxSourceBytes,
           hostFunctionManifest: hostFunctionConfiguration.manifest,
-          maxMessageBytes: this.maxMessageBytes,
-          maxOutputMessages: this.maxOutputMessages,
-          maxOutputBytes: this.maxOutputBytes,
-          diagnostics: this.diagnostics,
+          maxMessageBytes: getSessionData(this).maxMessageBytes,
+          maxOutputMessages: getSessionData(this).maxOutputMessages,
+          maxOutputBytes: getSessionData(this).maxOutputBytes,
+          diagnostics: getSessionData(this).diagnostics,
           localModule: workerLocalModule
         },
         name: 'secure-eval-worker-session',
@@ -1459,294 +1768,331 @@ export class UntrustedWorkerSession extends EventEmitter {
     } catch (error) {
       descriptorQuota?.release()
       releaseWorkerSlot()
-      this.closedSettled = true
-      this.resolveClosed({ code: undefined, error })
-      this.state = 'closed'
+      getSessionData(this).closedSettled = true
+      getSessionData(this).resolveClosed({ code: undefined, error })
+      getSessionData(this).state = 'closed'
       throw error
     }
 
-    const worker = sessionSecrets.get(this).worker
-    worker.once('exit', (code) => {
+    const worker = getSessionSecrets(this).worker
+    hostReflectApply(hostEventEmitterOn, worker, ['exit', (code) => {
       descriptorQuota?.release()
       releaseWorkerSlot()
       if (!localModule) {
-        this.handleExit(code)
+        this.#handleExit(code)
         return
       }
-      void attemptLocalModuleCleanup(localModule).then((outcome) => {
+      const cleanup = thenHostPromise(attemptLocalModuleCleanup(localModule), (outcome) => {
         if (outcome.status === 'removed') {
           preparationSlot?.()
-          this.handleExit(code)
+          this.#handleExit(code)
           return
         }
 
         const cleanupError = outcome.status === 'failed'
           ? outcome.error
           : new Error('Snapshot cleanup did not settle before its deadline')
-        const primaryError = this.failure
-        this.failure = sessionError(
+        const primaryError = getSessionData(this).failure
+        getSessionData(this).failure = sessionError(
           'The private module snapshot could not be removed promptly',
           'ERR_UNTRUSTED_WORKER_CLEANUP',
           primaryError
             ? new AggregateError([primaryError, cleanupError], 'Worker and cleanup failures')
             : cleanupError
         )
-        void localModule.cleanupUntilRemoved().then(
+        void thenHostPromise(
+          localModule.cleanupUntilRemoved(),
           () => preparationSlot?.(),
-          () => preparationSlot?.()
+          () => {}
         )
-        this.handleExit(code)
-      }).catch((error) => {
-        process.nextTick(() => { throw error })
+        this.#handleExit(code)
       })
-    })
-    worker.stdout.resume()
-    worker.stderr.resume()
-    worker.on('message', (message) => this.handleHandshake(message))
-    worker.on('messageerror', () => {
-      this.fail(sessionError(
-        'The worker handshake could not be deserialized',
-        'ERR_UNTRUSTED_WORKER_PROTOCOL'
-      ))
-    })
-    worker.once('error', (error) => {
-      this.fail(sessionError('The worker failed', 'ERR_UNTRUSTED_WORKER', error))
-    })
+      void catchHostPromise(cleanup, (error) => {
+        hostReflectApply(hostProcessNextTick, process, [() => { throw error }])
+      })
+    }])
 
-    const startupDelay = startupTimeoutMs - (Date.now() - startedAt)
-    if (startupDelay <= 0) {
-      this.fail(sessionError(
-        `Startup exceeded ${startupTimeoutMs} ms`,
-        'ERR_UNTRUSTED_WORKER_STARTUP_TIMEOUT'
-      ))
-    } else {
-      this.startupTimer = setTimeout(() => {
-        this.fail(sessionError(
+    try {
+      const stdout = hostReflectApply(hostWorkerStdout, worker, [])
+      const stderr = hostReflectApply(hostWorkerStderr, worker, [])
+      hostReflectApply(hostReadableResume, stdout, [])
+      hostReflectApply(hostReadableResume, stderr, [])
+      hostReflectApply(hostEventEmitterOn, worker, [
+        'message',
+        (message) => this.#handleHandshake(message)
+      ])
+      hostReflectApply(hostEventEmitterOn, worker, ['messageerror', () => {
+        this.#fail(sessionError(
+          'The worker handshake could not be deserialized',
+          'ERR_UNTRUSTED_WORKER_PROTOCOL'
+        ))
+      }])
+      hostReflectApply(hostEventEmitterOn, worker, ['error', (error) => {
+        this.#fail(sessionError('The worker failed', 'ERR_UNTRUSTED_WORKER', error))
+      }])
+
+      const startupDelay = startupTimeoutMs - (hostReflectApply(hostDateNow, Date, []) - startedAt)
+      if (startupDelay <= 0) {
+        this.#fail(sessionError(
           `Startup exceeded ${startupTimeoutMs} ms`,
           'ERR_UNTRUSTED_WORKER_STARTUP_TIMEOUT'
         ))
-      }, startupDelay)
-    }
-
-    if (signal) {
-      try {
-        hostReflectApply(hostEventTargetAddEventListener, signal, [
-          'abort',
-          this.onAbort,
-          { once: true }
-        ])
-        if (hostReflectApply(hostAbortSignalAborted, signal, [])) {
-          this.fail(abortError(hostReflectApply(hostAbortSignalReason, signal, [])))
-        }
-      } catch (error) {
-        this.fail(sessionError(
-          'The cancellation signal could not be observed',
-          'ERR_UNTRUSTED_WORKER_ABORT_SIGNAL',
-          error
-        ))
+      } else {
+        getSessionData(this).startupTimer = hostSetTimeout(() => {
+          this.#fail(sessionError(
+            `Startup exceeded ${startupTimeoutMs} ms`,
+            'ERR_UNTRUSTED_WORKER_STARTUP_TIMEOUT'
+          ))
+        }, startupDelay)
       }
+
+      if (signal) {
+        try {
+          hostReflectApply(hostEventTargetAddEventListener, signal, [
+            'abort',
+            getSessionData(this).onAbort,
+            { once: true }
+          ])
+          if (hostReflectApply(hostAbortSignalAborted, signal, [])) {
+            this.#fail(abortError(hostReflectApply(hostAbortSignalReason, signal, [])))
+          }
+        } catch (error) {
+          this.#fail(sessionError(
+            'The cancellation signal could not be observed',
+            'ERR_UNTRUSTED_WORKER_ABORT_SIGNAL',
+            error
+          ))
+        }
+      }
+    } catch (error) {
+      this.#fail(sessionError(
+        'The worker could not be initialized safely',
+        'ERR_UNTRUSTED_WORKER',
+        error
+      ))
     }
   }
 
   postMessage (value) {
-    this.assertOpen()
+    this.#assertOpen()
     const cloned = cloneWithoutSharedMemory(value, 'message')
-    this.assertOpen()
+    this.#assertOpen()
     const body = { type: 'message', value: cloned }
-    const serialized = assertProtocolBody(body, 'message', this.maxMessageBytes)
-    const send = () => this.sendProtocol(body, serialized)
-    if (this.state === 'ready') send()
-    else this.outbound.push(send)
+    const serialized = assertProtocolBody(body, 'message', getSessionData(this).maxMessageBytes)
+    const send = () => this.#sendProtocol(body, serialized)
+    if (getSessionData(this).state === 'ready') send()
+    else hostReflectApply(hostArrayPush, getSessionData(this).outbound, [send])
   }
 
   request (value, options = {}) {
-    this.assertOpen()
-    if (isHostFunctionContextActiveForSession(this.sessionId)) {
+    this.#assertOpen()
+    if (isHostFunctionContextActiveForSession(getSessionData(this).sessionId)) {
       throw sessionError(
         'Host functions cannot make reentrant requests to their own session',
         'ERR_UNTRUSTED_WORKER_REENTRANT_REQUEST'
       )
     }
-    const diagnosticStore = diagnosticContextStorage.getStore()
+    const diagnosticStore = hostReflectApply(
+      hostAsyncLocalStorageGetStore,
+      diagnosticContextStorage,
+      []
+    )
     if (diagnosticStore?.active && diagnosticStore.session === this) {
       throw sessionError(
         'Diagnostic callbacks cannot make reentrant requests to their own session',
         'ERR_UNTRUSTED_WORKER_REENTRANT_DIAGNOSTIC'
       )
     }
-    if (options === null || typeof options !== 'object' || Array.isArray(options)) {
+    if (options === null || typeof options !== 'object' || hostArrayIsArray(options)) {
       throw new TypeError('request options must be an object')
     }
-    options = snapshotSessionOptions(options)
-    const timeoutMs = options.timeoutMs ?? this.messageTimeoutMs
+    options = snapshotSessionOptions(options, REQUEST_OPTION_NAMES)
+    this.#assertOpen()
+    const timeoutMs = options.timeoutMs ?? getSessionData(this).messageTimeoutMs
     validateTimeout(timeoutMs, 'timeoutMs')
-    const deadline = Date.now() + timeoutMs
+    const deadline = hostReflectApply(hostDateNow, Date, []) + timeoutMs
     const cloned = cloneWithoutSharedMemory(value, 'message')
-    this.assertOpen()
-    const id = this.nextRequestId++
+    this.#assertOpen()
+    const id = getSessionData(this).nextRequestId++
     const body = { type: 'request', id, value: cloned }
-    const serialized = assertProtocolBody(body, 'message', this.maxMessageBytes)
-    const remainingMs = deadline - Date.now()
+    const serialized = assertProtocolBody(body, 'message', getSessionData(this).maxMessageBytes)
+    const remainingMs = deadline - hostReflectApply(hostDateNow, Date, [])
     if (remainingMs <= 0) {
       const error = sessionError(
         `Message handling exceeded ${timeoutMs} ms`,
         'ERR_UNTRUSTED_WORKER_MESSAGE_TIMEOUT'
       )
-      this.fail(error)
-      return Promise.reject(error)
+      this.#fail(error)
+      return rejectHostPromise(error)
     }
 
-    return new Promise((resolve, reject) => {
+    return new SafePromise((resolve, reject) => {
       const pending = { resolve, reject, timer: undefined, deadline, timeoutMs }
       const expire = () => {
-        if (!this.pending.delete(id)) return
+        if (!hostReflectApply(hostMapDelete, getSessionData(this).pending, [id])) return
         const error = sessionError(
           `Message handling exceeded ${timeoutMs} ms`,
           'ERR_UNTRUSTED_WORKER_MESSAGE_TIMEOUT'
         )
         reject(error)
-        this.fail(error)
+        this.#fail(error)
       }
-      pending.timer = setTimeout(expire, remainingMs)
-      this.pending.set(id, pending)
+      pending.timer = hostSetTimeout(expire, remainingMs)
+      hostReflectApply(hostMapSet, getSessionData(this).pending, [id, pending])
       const send = () => {
-        if (this.state !== 'ready' || !this.pending.has(id)) return
-        this.sendProtocol(body, serialized)
-        if (Date.now() >= deadline) expire()
+        if (getSessionData(this).state !== 'ready' ||
+            !hostReflectApply(hostMapHas, getSessionData(this).pending, [id])) return
+        this.#sendProtocol(body, serialized)
+        if (hostReflectApply(hostDateNow, Date, []) >= deadline) expire()
       }
 
-      if (this.state === 'ready') send()
-      else this.outbound.push(send)
+      if (getSessionData(this).state === 'ready') send()
+      else hostReflectApply(hostArrayPush, getSessionData(this).outbound, [send])
     })
   }
 
   terminate () {
-    if (this.termination) return this.termination
-    if (this.state !== 'closed') {
+    if (getSessionData(this).termination) return getSessionData(this).termination
+    if (getSessionData(this).state !== 'closed') {
       const error = sessionError('The session was terminated', 'ERR_UNTRUSTED_WORKER_TERMINATED')
-      this.rejectReadyOnce(error)
-      this.rejectOutstanding(error)
-      this.state = 'closing'
-      this.hostAbortController.abort(error)
-      clearTimeout(this.startupTimer)
-      clearTimeout(this.lifetimeTimer)
-      sessionSecrets.get(this).port?.close()
-      sessionSecrets.get(this).diagnosticPort?.close()
+      this.#rejectReadyOnce(error)
+      this.#rejectOutstanding(error)
+      getSessionData(this).state = 'closing'
+      hostReflectApply(
+        hostAbortControllerAbort,
+        getSessionData(this).hostAbortController,
+        [error]
+      )
+      hostClearTimeout(getSessionData(this).startupTimer)
+      hostClearTimeout(getSessionData(this).lifetimeTimer)
+      closeHostMessagePort(getSessionSecrets(this).port)
+      closeHostMessagePort(getSessionSecrets(this).diagnosticPort)
     }
-    const worker = sessionSecrets.get(this).worker
+    const worker = getSessionSecrets(this).worker
     if (!worker) {
-      this.termination = Promise.resolve(undefined)
-      return this.termination
+      getSessionData(this).termination = resolveHostPromise(undefined)
+      return getSessionData(this).termination
     }
 
-    const workerTermination = worker.terminate()
-    this.termination = new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
+    const workerTermination = hostReflectApply(hostWorkerTerminate, worker, [])
+    getSessionData(this).termination = new SafePromise((resolve, reject) => {
+      const timer = hostSetTimeout(() => {
         const error = sessionError(
           'The worker did not exit after termination was requested',
           'ERR_UNTRUSTED_WORKER_TERMINATION_TIMEOUT',
-          this.failure
+          getSessionData(this).failure
         )
-        this.settleWithoutWorkerExit(error)
+        this.#settleWithoutWorkerExit(error)
         reject(error)
       }, TERMINATION_SETTLEMENT_TIMEOUT_MS)
-      workerTermination.then(
+      thenHostPromise(
+        workerTermination,
         (code) => {
-          clearTimeout(timer)
+          hostClearTimeout(timer)
           resolve(code)
         },
         (cause) => {
-          clearTimeout(timer)
+          hostClearTimeout(timer)
           const error = sessionError(
             'The worker could not be terminated',
             'ERR_UNTRUSTED_WORKER_TERMINATION',
             cause
           )
-          this.settleWithoutWorkerExit(error)
+          this.#settleWithoutWorkerExit(error)
           reject(error)
         }
       )
     })
-    return this.termination
+    return getSessionData(this).termination
   }
 
-  settleWithoutWorkerExit (error) {
-    if (this.closedSettled) return
-    this.failure = error
-    this.state = 'closed'
-    this.closedSettled = true
-    this.resolveClosed({ code: undefined, error })
+  #settleWithoutWorkerExit (error) {
+    if (getSessionData(this).closedSettled) return
+    getSessionData(this).failure = error
+    getSessionData(this).state = 'closed'
+    getSessionData(this).closedSettled = true
+    getSessionData(this).resolveClosed({ code: undefined, error })
   }
 
-  handleHandshake (message) {
-    const secrets = sessionSecrets.get(this)
+  #handleHandshake (message) {
+    const secrets = getSessionSecrets(this)
     if (secrets.port) {
-      this.fail(sessionError('Unexpected parent-port message', 'ERR_UNTRUSTED_WORKER_PROTOCOL'))
+      this.#fail(sessionError('Unexpected parent-port message', 'ERR_UNTRUSTED_WORKER_PROTOCOL'))
       return
     }
     if (message?.type === 'bootstrap-error') {
-      this.fail(remoteError(message.error, 'ERR_UNTRUSTED_WORKER_BOOTSTRAP'))
+      this.#fail(remoteError(message.error, 'ERR_UNTRUSTED_WORKER_BOOTSTRAP'))
       return
     }
-    const validDiagnosticHandshake = this.diagnostics.enabled
+    const validDiagnosticHandshake = getSessionData(this).diagnostics.enabled
       ? message?.diagnosticPort instanceof MessagePort &&
         typeof message.diagnosticSecret === 'string' && message.diagnosticSecret.length >= 32
       : message?.diagnosticPort === undefined && message?.diagnosticSecret === undefined
     if (message?.type !== 'session-port' || !(message.port instanceof MessagePort) ||
         typeof message.protocolSecret !== 'string' || message.protocolSecret.length < 32 ||
         !validDiagnosticHandshake) {
-      this.fail(sessionError('Invalid worker handshake', 'ERR_UNTRUSTED_WORKER_PROTOCOL'))
+      this.#fail(sessionError('Invalid worker handshake', 'ERR_UNTRUSTED_WORKER_PROTOCOL'))
       return
     }
 
     secrets.port = message.port
     secrets.protocolSecret = message.protocolSecret
-    secrets.rawPortPost = secrets.port.postMessage.bind(secrets.port)
-    if (this.diagnostics.enabled) {
+    secrets.rawPortPost = (value) => hostReflectApply(
+      hostMessagePortPostMessage,
+      secrets.port,
+      [value]
+    )
+    if (getSessionData(this).diagnostics.enabled) {
       secrets.diagnosticPort = message.diagnosticPort
       secrets.diagnosticSecret = message.diagnosticSecret
-      secrets.diagnosticPort.on('message', (message) => {
+      hostReflectApply(hostMessagePortOn, secrets.diagnosticPort, ['message', (message) => {
         let record
         let sequence
         try {
-          record = this.authenticateDiagnostic(message)
-          sequence = this.diagnosticSequence
+          record = this.#authenticateDiagnostic(message)
+          sequence = getSessionData(this).diagnosticSequence
         } catch (error) {
-          this.fail(error)
+          this.#fail(error)
           return
         }
-        this.diagnosticProcessing = this.diagnosticProcessing
-          .then(() => this.handleDiagnostic(record, sequence))
-          .catch((error) => this.fail(error))
-      })
-      secrets.diagnosticPort.on('messageerror', () => {
-        this.fail(sessionError(
+        const processing = thenHostPromise(
+          getSessionData(this).diagnosticProcessing,
+          () => this.#handleDiagnostic(record, sequence)
+        )
+        getSessionData(this).diagnosticProcessing = catchHostPromise(processing, (error) => {
+          try {
+            this.#fail(error)
+          } catch {}
+        })
+      }])
+      hostReflectApply(hostMessagePortOn, secrets.diagnosticPort, ['messageerror', () => {
+        this.#fail(sessionError(
           'The worker diagnostic message could not be deserialized',
           'ERR_UNTRUSTED_WORKER_DIAGNOSTIC_PROTOCOL'
         ))
-      })
-      secrets.diagnosticPort.start()
+      }])
+      hostReflectApply(hostMessagePortStart, secrets.diagnosticPort, [])
     }
-    secrets.worker.removeAllListeners('message')
-    secrets.port.on('message', (message) => {
+    hostReflectApply(hostEventEmitterRemoveAllListeners, secrets.worker, ['message'])
+    hostReflectApply(hostMessagePortOn, secrets.port, ['message', (message) => {
       try {
-        this.handleMessage(this.authenticateMessage(message))
+        this.#handleMessage(this.#authenticateMessage(message))
       } catch (error) {
-        this.fail(error)
+        this.#fail(error)
       }
-    })
-    secrets.port.on('messageerror', () => {
-      this.fail(sessionError(
+    }])
+    hostReflectApply(hostMessagePortOn, secrets.port, ['messageerror', () => {
+      this.#fail(sessionError(
         'The worker protocol message could not be deserialized',
         'ERR_UNTRUSTED_WORKER_PROTOCOL'
       ))
-    })
-    secrets.port.start()
+    }])
+    hostReflectApply(hostMessagePortStart, secrets.port, [])
   }
 
-  sendProtocol (body, serialized = serializeProtocolBody(body, this.maxMessageBytes)) {
-    const sequence = ++this.outboundSequence
-    const secrets = sessionSecrets.get(this)
+  #sendProtocol (body, serialized = serializeProtocolBody(body, getSessionData(this).maxMessageBytes)) {
+    const sequence = ++getSessionData(this).outboundSequence
+    const secrets = getSessionSecrets(this)
     secrets.rawPortPost({
       sequence,
       payload: serialized,
@@ -1754,9 +2100,9 @@ export class UntrustedWorkerSession extends EventEmitter {
     })
   }
 
-  authenticateMessage (message) {
+  #authenticateMessage (message) {
     if (message === null || typeof message !== 'object' ||
-        !Number.isSafeInteger(message.sequence) || message.sequence !== this.inboundSequence + 1 ||
+        !hostReflectApply(hostNumberIsSafeInteger, Number, [message.sequence]) || message.sequence !== getSessionData(this).inboundSequence + 1 ||
         message.payload === null || typeof message.payload !== 'object' ||
         !hostReflectApply(safeArrayBufferIsView, ArrayBuffer, [message.payload]) ||
         typeof message.mac !== 'string') {
@@ -1765,16 +2111,16 @@ export class UntrustedWorkerSession extends EventEmitter {
 
     assertNoSharedMemory(message.payload, 'protocol payload')
     const byteLength = hostReflectApply(hostTypedArrayByteLength, message.payload, [])
-    if (byteLength > this.maxMessageBytes) {
+    if (byteLength > getSessionData(this).maxMessageBytes) {
       throw sessionError('Worker protocol message is too large', 'ERR_UNTRUSTED_WORKER_PROTOCOL')
     }
-    const expected = Buffer.from(protocolMac(
-      sessionSecrets.get(this).protocolSecret,
+    const expected = hostReflectApply(hostBufferFrom, Buffer, [protocolMac(
+      getSessionSecrets(this).protocolSecret,
       'worker-to-host',
       message.sequence,
       message.payload
-    ), 'base64')
-    const actual = Buffer.from(message.mac, 'base64')
+    ), 'base64'])
+    const actual = hostReflectApply(hostBufferFrom, Buffer, [message.mac, 'base64'])
     if (expected.length !== actual.length || !timingSafeEqual(expected, actual)) {
       throw sessionError('Unauthenticated worker protocol message', 'ERR_UNTRUSTED_WORKER_PROTOCOL')
     }
@@ -1785,14 +2131,14 @@ export class UntrustedWorkerSession extends EventEmitter {
     } catch {
       throw sessionError('Invalid worker protocol payload', 'ERR_UNTRUSTED_WORKER_PROTOCOL')
     }
-    this.inboundSequence = message.sequence
+    getSessionData(this).inboundSequence = message.sequence
     return body
   }
 
-  authenticateDiagnostic (message) {
+  #authenticateDiagnostic (message) {
     if (message === null || typeof message !== 'object' ||
-        !Number.isSafeInteger(message.sequence) ||
-        message.sequence !== this.diagnosticSequence + 1 ||
+        !hostReflectApply(hostNumberIsSafeInteger, Number, [message.sequence]) ||
+        message.sequence !== getSessionData(this).diagnosticSequence + 1 ||
         message.payload === null || typeof message.payload !== 'object' ||
         !hostReflectApply(safeArrayBufferIsView, ArrayBuffer, [message.payload]) ||
         typeof message.mac !== 'string') {
@@ -1803,21 +2149,21 @@ export class UntrustedWorkerSession extends EventEmitter {
     }
     assertNoSharedMemory(message.payload, 'diagnostic payload')
     const byteLength = hostReflectApply(hostTypedArrayByteLength, message.payload, [])
-    if (byteLength > this.diagnostics.maxRecordBytes ||
-        this.diagnosticRecords >= this.diagnostics.maxRecords ||
-        this.diagnosticBytes + byteLength > this.diagnostics.maxBytes) {
+    if (byteLength > getSessionData(this).diagnostics.maxRecordBytes ||
+        getSessionData(this).diagnosticRecords >= getSessionData(this).diagnostics.maxRecords ||
+        getSessionData(this).diagnosticBytes + byteLength > getSessionData(this).diagnostics.maxBytes) {
       throw sessionError(
         'Worker diagnostic limit exceeded',
         'ERR_UNTRUSTED_WORKER_DIAGNOSTIC_PROTOCOL'
       )
     }
-    const expected = Buffer.from(protocolMac(
-      sessionSecrets.get(this).diagnosticSecret,
+    const expected = hostReflectApply(hostBufferFrom, Buffer, [protocolMac(
+      getSessionSecrets(this).diagnosticSecret,
       'worker-diagnostic-to-host',
       message.sequence,
       message.payload
-    ), 'base64')
-    const actual = Buffer.from(message.mac, 'base64')
+    ), 'base64'])
+    const actual = hostReflectApply(hostBufferFrom, Buffer, [message.mac, 'base64'])
     if (expected.length !== actual.length || !timingSafeEqual(expected, actual)) {
       throw sessionError(
         'Unauthenticated worker diagnostic message',
@@ -1834,27 +2180,27 @@ export class UntrustedWorkerSession extends EventEmitter {
       )
     }
     if (record === null || typeof record !== 'object' ||
-        !['assert', 'debug', 'dir', 'error', 'info', 'log', 'table', 'trace', 'warn'].includes(record.level) ||
-        typeof record.text !== 'string' || Reflect.ownKeys(record).length !== 2) {
+        !hostReflectApply(hostSetHas, DIAGNOSTIC_LEVELS, [record.level]) ||
+        typeof record.text !== 'string' || hostReflectOwnKeys(record).length !== 2) {
       throw sessionError(
         'Invalid worker diagnostic payload',
         'ERR_UNTRUSTED_WORKER_DIAGNOSTIC_PROTOCOL'
       )
     }
-    this.diagnosticSequence = message.sequence
-    this.diagnosticRecords++
-    this.diagnosticBytes += byteLength
-    return Object.freeze({ level: record.level, text: record.text })
+    getSessionData(this).diagnosticSequence = message.sequence
+    getSessionData(this).diagnosticRecords++
+    getSessionData(this).diagnosticBytes += byteLength
+    return hostObjectFreeze({ level: record.level, text: record.text })
   }
 
-  async handleDiagnostic (record, sequence) {
-    if (this.state === 'closing' || this.state === 'closed') return
+  async #handleDiagnostic (record, sequence) {
+    if (getSessionData(this).state === 'closing' || getSessionData(this).state === 'closed') return
     const store = { active: true, session: this }
     try {
-      await diagnosticContextStorage.run(store, async () => {
-        if (this.onDiagnostic) await this.onDiagnostic(record)
-        this.emit('diagnostic', record)
-      })
+      await hostReflectApply(hostAsyncLocalStorageRun, diagnosticContextStorage, [store, async () => {
+        if (getSessionData(this).onDiagnostic) await getSessionData(this).onDiagnostic(record)
+        emitHostEvent(this, 'diagnostic', record)
+      }])
     } catch (error) {
       throw sessionError(
         'The diagnostic callback failed',
@@ -1864,91 +2210,95 @@ export class UntrustedWorkerSession extends EventEmitter {
     } finally {
       store.active = false
     }
-    this.diagnosticsHandledSequence = sequence
-    while (this.deferredDiagnosticEnvelopes.length > 0 &&
-           this.deferredDiagnosticEnvelopes[0].diagnosticSequence <= sequence) {
-      this.handleMessage(this.deferredDiagnosticEnvelopes.shift(), true)
-      if (this.state === 'closing' || this.state === 'closed') return
+    getSessionData(this).diagnosticsHandledSequence = sequence
+    while (getSessionData(this).deferredDiagnosticEnvelopes.length > 0 &&
+           getSessionData(this).deferredDiagnosticEnvelopes[0].diagnosticSequence <= sequence) {
+      this.#handleMessage(
+        hostReflectApply(hostArrayShift, getSessionData(this).deferredDiagnosticEnvelopes, []),
+        true
+      )
+      if (getSessionData(this).state === 'closing' || getSessionData(this).state === 'closed') return
     }
   }
 
-  handleMessage (envelope, diagnosticsReady = false) {
-    if (this.state === 'closing' || this.state === 'closed') return
+  #handleMessage (envelope, diagnosticsReady = false) {
+    if (getSessionData(this).state === 'closing' || getSessionData(this).state === 'closed') return
     if (envelope === null || typeof envelope !== 'object' || typeof envelope.type !== 'string' ||
-        !Number.isSafeInteger(envelope.diagnosticSequence) || envelope.diagnosticSequence < 0) {
-      this.fail(sessionError('Invalid worker protocol message', 'ERR_UNTRUSTED_WORKER_PROTOCOL'))
+        !hostReflectApply(hostNumberIsSafeInteger, Number, [envelope.diagnosticSequence]) ||
+        envelope.diagnosticSequence < 0) {
+      this.#fail(sessionError('Invalid worker protocol message', 'ERR_UNTRUSTED_WORKER_PROTOCOL'))
       return
     }
     if (!diagnosticsReady &&
-        (this.deferredDiagnosticEnvelopes.length > 0 ||
-         envelope.diagnosticSequence > this.diagnosticsHandledSequence)) {
-      if (!this.diagnostics.enabled && envelope.diagnosticSequence !== 0) {
-        this.fail(sessionError('Invalid worker protocol message', 'ERR_UNTRUSTED_WORKER_PROTOCOL'))
+        (getSessionData(this).deferredDiagnosticEnvelopes.length > 0 ||
+         envelope.diagnosticSequence > getSessionData(this).diagnosticsHandledSequence)) {
+      if (!getSessionData(this).diagnostics.enabled && envelope.diagnosticSequence !== 0) {
+        this.#fail(sessionError('Invalid worker protocol message', 'ERR_UNTRUSTED_WORKER_PROTOCOL'))
       } else {
-        this.deferredDiagnosticEnvelopes.push(envelope)
+        hostReflectApply(hostArrayPush, getSessionData(this).deferredDiagnosticEnvelopes, [envelope])
       }
       return
     }
 
     if (envelope.type === 'host-call') {
-      this.handleHostCall(envelope)
+      this.#handleHostCall(envelope)
       return
     }
 
     try {
       if ('value' in envelope) assertNoSharedMemory(envelope.value, 'message')
     } catch (error) {
-      this.fail(error)
+      this.#fail(error)
       return
     }
 
     if (envelope.type === 'ready') {
-      if (this.state !== 'starting') {
-        this.fail(sessionError('Unexpected ready message', 'ERR_UNTRUSTED_WORKER_PROTOCOL'))
+      if (getSessionData(this).state !== 'starting') {
+        this.#fail(sessionError('Unexpected ready message', 'ERR_UNTRUSTED_WORKER_PROTOCOL'))
         return
       }
-      clearTimeout(this.startupTimer)
-      this.state = 'ready'
-      this.readySettled = true
-      this.resolveReady(envelope.value)
-      this.lifetimeTimer = setTimeout(() => {
-        this.fail(sessionError(
-          `Session lifetime exceeded ${this.lifetimeTimeoutMs} ms`,
+      hostClearTimeout(getSessionData(this).startupTimer)
+      getSessionData(this).state = 'ready'
+      getSessionData(this).readySettled = true
+      getSessionData(this).resolveReady(envelope.value)
+      getSessionData(this).lifetimeTimer = hostSetTimeout(() => {
+        this.#fail(sessionError(
+          `Session lifetime exceeded ${getSessionData(this).lifetimeTimeoutMs} ms`,
           'ERR_UNTRUSTED_WORKER_LIFETIME_TIMEOUT'
         ))
-      }, this.lifetimeTimeoutMs)
-      const outbound = this.outbound.splice(0)
-      for (const send of outbound) send()
+      }, getSessionData(this).lifetimeTimeoutMs)
+      const outbound = hostReflectApply(hostArraySplice, getSessionData(this).outbound, [0])
+      for (let index = 0; index < outbound.length; index++) outbound[index]()
       return
     }
 
     if (envelope.type === 'message') {
-      this.emit('message', envelope.value)
+      emitHostEvent(this, 'message', envelope.value)
       return
     }
     if (envelope.type === 'runtime-error') {
-      this.emitError(remoteError(envelope.error))
+      this.#emitError(remoteError(envelope.error))
       return
     }
     if (envelope.type === 'fatal') {
-      this.fail(remoteError(envelope.error, 'ERR_UNTRUSTED_WORKER_BOOTSTRAP'))
+      this.#fail(remoteError(envelope.error, 'ERR_UNTRUSTED_WORKER_BOOTSTRAP'))
       return
     }
     if (envelope.type === 'response' || envelope.type === 'request-error') {
-      const pending = this.pending.get(envelope.id)
+      const pending = hostReflectApply(hostMapGet, getSessionData(this).pending, [envelope.id])
       if (!pending) {
-        this.fail(sessionError('Unknown request response', 'ERR_UNTRUSTED_WORKER_PROTOCOL'))
+        this.#fail(sessionError('Unknown request response', 'ERR_UNTRUSTED_WORKER_PROTOCOL'))
         return
       }
-      this.pending.delete(envelope.id)
-      clearTimeout(pending.timer)
-      if (Date.now() >= pending.deadline) {
+      hostReflectApply(hostMapDelete, getSessionData(this).pending, [envelope.id])
+      hostClearTimeout(pending.timer)
+      if (hostReflectApply(hostDateNow, Date, []) >= pending.deadline) {
         const error = sessionError(
           `Message handling exceeded ${pending.timeoutMs} ms`,
           'ERR_UNTRUSTED_WORKER_MESSAGE_TIMEOUT'
         )
         pending.reject(error)
-        this.fail(error)
+        this.#fail(error)
       } else if (envelope.type === 'response') {
         pending.resolve(envelope.value)
       } else {
@@ -1957,89 +2307,105 @@ export class UntrustedWorkerSession extends EventEmitter {
       return
     }
 
-    this.fail(sessionError('Unknown worker protocol message', 'ERR_UNTRUSTED_WORKER_PROTOCOL'))
+    this.#fail(sessionError('Unknown worker protocol message', 'ERR_UNTRUSTED_WORKER_PROTOCOL'))
   }
 
-  handleHostCall (envelope) {
-    if (this.state !== 'starting' && this.state !== 'ready') return
-    if (!Number.isSafeInteger(envelope.id) || envelope.id <= 0 ||
-        typeof envelope.name !== 'string' || !Array.isArray(envelope.arguments)) {
-      this.fail(sessionError('Invalid host function request', 'ERR_UNTRUSTED_WORKER_PROTOCOL'))
+  #handleHostCall (envelope) {
+    if (getSessionData(this).state !== 'starting' && getSessionData(this).state !== 'ready') return
+    if (!hostReflectApply(hostNumberIsSafeInteger, Number, [envelope.id]) || envelope.id <= 0 ||
+        typeof envelope.name !== 'string' || !hostArrayIsArray(envelope.arguments)) {
+      this.#fail(sessionError('Invalid host function request', 'ERR_UNTRUSTED_WORKER_PROTOCOL'))
       return
     }
 
     try {
       assertNoSharedMemory(envelope.arguments, 'host function arguments')
     } catch (error) {
-      this.sendHostFunctionError(envelope.id, error)
+      this.#sendHostFunctionError(envelope.id, error)
       return
     }
 
-    const hostFunction = this.hostFunctions.get(envelope.name)
+    const hostFunction = hostReflectApply(
+      hostMapGet,
+      getSessionData(this).hostFunctions,
+      [envelope.name]
+    )
     if (!hostFunction) {
-      this.sendHostFunctionError(envelope.id, sessionError(
+      this.#sendHostFunctionError(envelope.id, sessionError(
         `Unknown host function: ${envelope.name}`,
         'ERR_UNTRUSTED_WORKER_HOST_FUNCTION'
       ))
       return
     }
-    if (this.hostFunctionCalls >= this.maxHostFunctionCalls) {
-      this.fail(sessionError(
+    if (getSessionData(this).hostFunctionCalls >= getSessionData(this).maxHostFunctionCalls) {
+      this.#fail(sessionError(
         'Host function call limit exceeded',
         'ERR_UNTRUSTED_WORKER_HOST_FUNCTION_LIMIT'
       ))
       return
     }
-    if (this.inFlightHostFunctions >= this.maxInFlightHostFunctions) {
-      this.fail(sessionError(
+    if (getSessionData(this).inFlightHostFunctions >= getSessionData(this).maxInFlightHostFunctions) {
+      this.#fail(sessionError(
         'Concurrent host function limit exceeded',
         'ERR_UNTRUSTED_WORKER_HOST_FUNCTION_LIMIT'
       ))
       return
     }
 
-    this.hostFunctionCalls++
-    this.inFlightHostFunctions++
-    const requestIndex = this.hostFunctionCalls
-    void this.invokeHostFunction(envelope, hostFunction, requestIndex).catch(() => {})
+    getSessionData(this).hostFunctionCalls++
+    getSessionData(this).inFlightHostFunctions++
+    const requestIndex = getSessionData(this).hostFunctionCalls
+    void catchHostPromise(
+      this.#invokeHostFunction(envelope, hostFunction, requestIndex),
+      () => {}
+    )
   }
 
-  async invokeHostFunction (envelope, hostFunction, requestIndex) {
+  async #invokeHostFunction (envelope, hostFunction, requestIndex) {
     try {
       const value = await invokeHostFunction(hostFunction, envelope.arguments, {
-        abortSignal: this.hostAbortController.signal,
-        sessionId: this.sessionId,
-        requestId: `${this.sessionId}:${envelope.id}`,
+        abortSignal: hostReflectApply(
+          hostAbortControllerSignal,
+          getSessionData(this).hostAbortController,
+          []
+        ),
+        sessionId: getSessionData(this).sessionId,
+        requestId: `${getSessionData(this).sessionId}:${envelope.id}`,
         requestIndex,
         hostFunctionName: envelope.name
       })
-      if (this.hostAbortController.signal.aborted ||
-          (this.state !== 'starting' && this.state !== 'ready')) return
+      const hostAbortSignal = hostReflectApply(
+        hostAbortControllerSignal,
+        getSessionData(this).hostAbortController,
+        []
+      )
+      if (hostReflectApply(hostAbortSignalAborted, hostAbortSignal, []) ||
+          (getSessionData(this).state !== 'starting' && getSessionData(this).state !== 'ready')) return
       const cloned = cloneWithoutSharedMemory(value, 'host function result')
       assertProtocolSerializable(cloned, 'host function result')
-      if (this.state === 'starting' || this.state === 'ready') {
-        this.sendProtocol({ type: 'host-result', id: envelope.id, value: cloned })
+      if (getSessionData(this).state === 'starting' || getSessionData(this).state === 'ready') {
+        this.#sendProtocol({ type: 'host-result', id: envelope.id, value: cloned })
       }
     } catch (error) {
-      if (this.state === 'starting' || this.state === 'ready') {
-        this.sendHostFunctionError(envelope.id, error)
+      if (getSessionData(this).state === 'starting' || getSessionData(this).state === 'ready') {
+        this.#sendHostFunctionError(envelope.id, error)
       }
     } finally {
-      this.inFlightHostFunctions--
+      getSessionData(this).inFlightHostFunctions--
     }
   }
 
-  sendHostFunctionError (id, error) {
-    if (!sessionSecrets.get(this).port ||
-        (this.state !== 'starting' && this.state !== 'ready')) return
+  #sendHostFunctionError (id, error) {
+    if (!getSessionSecrets(this).port ||
+        (getSessionData(this).state !== 'starting' && getSessionData(this).state !== 'ready')) return
     try {
-      this.sendProtocol({
+      this.#sendProtocol({
         type: 'host-error',
         id,
         error: serializeHostError(error)
       })
     } catch (protocolError) {
-      this.fail(sessionError(
+      this.#fail(sessionError(
         'Host function error exceeded protocol limits',
         'ERR_UNTRUSTED_WORKER_PROTOCOL',
         protocolError
@@ -2047,84 +2413,99 @@ export class UntrustedWorkerSession extends EventEmitter {
     }
   }
 
-  handleExit (code) {
-    clearTimeout(this.startupTimer)
-    clearTimeout(this.lifetimeTimer)
-    if (this.signal) {
+  #handleExit (code) {
+    hostClearTimeout(getSessionData(this).startupTimer)
+    hostClearTimeout(getSessionData(this).lifetimeTimer)
+    if (getSessionData(this).signal) {
       try {
-        hostReflectApply(hostEventTargetRemoveEventListener, this.signal, ['abort', this.onAbort])
+        hostReflectApply(hostEventTargetRemoveEventListener, getSessionData(this).signal, ['abort', getSessionData(this).onAbort])
       } catch {}
     }
-    sessionSecrets.get(this).port?.close()
-    sessionSecrets.get(this).diagnosticPort?.close()
+    closeHostMessagePort(getSessionSecrets(this).port)
+    closeHostMessagePort(getSessionSecrets(this).diagnosticPort)
 
     let errorToEmit
-    if (this.state !== 'closing' && this.state !== 'closed') {
-      errorToEmit = this.failure ?? sessionError(
+    if (getSessionData(this).state !== 'closing' && getSessionData(this).state !== 'closed') {
+      errorToEmit = getSessionData(this).failure ?? sessionError(
         `The worker exited unexpectedly (code ${code})`,
         'ERR_UNTRUSTED_WORKER_EXIT'
       )
-      this.failure = errorToEmit
-      this.state = 'closing'
-      this.hostAbortController.abort(errorToEmit)
-      this.rejectOutstanding(errorToEmit)
-      this.rejectReadyOnce(errorToEmit)
+      getSessionData(this).failure = errorToEmit
+      getSessionData(this).state = 'closing'
+      hostReflectApply(
+        hostAbortControllerAbort,
+        getSessionData(this).hostAbortController,
+        [errorToEmit]
+      )
+      this.#rejectOutstanding(errorToEmit)
+      this.#rejectReadyOnce(errorToEmit)
     }
 
-    this.state = 'closed'
-    if (!this.closedSettled) {
-      this.closedSettled = true
-      this.resolveClosed({ code, error: this.failure })
+    getSessionData(this).state = 'closed'
+    if (!getSessionData(this).closedSettled) {
+      getSessionData(this).closedSettled = true
+      getSessionData(this).resolveClosed({ code, error: getSessionData(this).failure })
     }
     try {
-      if (errorToEmit) this.emitError(errorToEmit)
+      if (errorToEmit) this.#emitError(errorToEmit)
     } finally {
-      this.emit('exit', code)
+      emitHostEvent(this, 'exit', code)
     }
   }
 
-  fail (error) {
-    if (this.state === 'closing' || this.state === 'closed') return
-    this.failure = error
-    this.state = 'closing'
-    this.hostAbortController.abort(error)
-    this.rejectReadyOnce(error)
-    this.rejectOutstanding(error)
-    void this.terminate().catch(() => {})
-    this.emitError(error)
+  #fail (error) {
+    if (getSessionData(this).state === 'closing' || getSessionData(this).state === 'closed') return
+    getSessionData(this).failure = error
+    getSessionData(this).state = 'closing'
+    hostReflectApply(
+      hostAbortControllerAbort,
+      getSessionData(this).hostAbortController,
+      [error]
+    )
+    this.#rejectReadyOnce(error)
+    this.#rejectOutstanding(error)
+    const termination = this.terminate()
+    hostReflectApply(hostPromiseCatch, termination, [() => {}])
+    this.#emitError(error)
   }
 
-  rejectReadyOnce (error) {
-    if (this.readySettled) return
-    this.readySettled = true
-    this.rejectReady(error)
+  #rejectReadyOnce (error) {
+    if (getSessionData(this).readySettled) return
+    getSessionData(this).readySettled = true
+    getSessionData(this).rejectReady(error)
   }
 
-  rejectOutstanding (error) {
-    for (const pending of this.pending.values()) {
-      clearTimeout(pending.timer)
-      pending.reject(error)
+  #rejectOutstanding (error) {
+    const pendingMap = getSessionData(this).pending
+    const iterator = hostReflectApply(hostMapValues, pendingMap, [])
+    while (true) {
+      const item = hostReflectApply(hostMapIteratorNext, iterator, [])
+      if (item.done) break
+      hostClearTimeout(item.value.timer)
+      item.value.reject(error)
     }
-    this.pending.clear()
-    this.outbound.length = 0
+    hostReflectApply(hostMapClear, pendingMap, [])
+    getSessionData(this).outbound.length = 0
   }
 
-  emitError (error) {
-    if (this.listenerCount('error') > 0) this.emit('error', error)
+  #emitError (error) {
+    if (hostReflectApply(hostEventEmitterListenerCount, this, ['error']) > 0) {
+      emitHostEvent(this, 'error', error)
+    }
   }
 
-  assertOpen () {
-    if (this.state === 'closing' || this.state === 'closed') {
-      throw this.failure ?? sessionError('The session is closed', 'ERR_UNTRUSTED_WORKER_CLOSED')
+  #assertOpen () {
+    if (getSessionData(this).state === 'closing' || getSessionData(this).state === 'closed') {
+      throw getSessionData(this).failure ?? sessionError('The session is closed', 'ERR_UNTRUSTED_WORKER_CLOSED')
     }
   }
 }
 
 function protocolMac (secret, direction, sequence, serialized) {
   const hmac = createHmac('sha256', secret)
-  hmac.update(`${direction}\0${sequence}\0`)
-  hmac.update(serialized)
-  return hmac.digest('base64')
+  hostReflectApply(hostHmacUpdate, hmac, [`${direction}\0${sequence}\0`])
+  hostReflectApply(hostHmacUpdate, hmac, [serialized])
+  return hostReflectApply(hostHmacDigest, hmac, ['base64'])
 }
 
 function serializeProtocolBody (body, maxMessageBytes) {
@@ -2164,9 +2545,11 @@ function serializeHostError (error) {
       return {
         name: 'HostFunctionError',
         message: typeof error.message === 'string'
-          ? error.message.slice(0, 8_192)
+          ? hostReflectApply(hostStringSlice, error.message, [0, 8_192])
           : 'Host function failed',
-        code: typeof error.code === 'string' ? error.code.slice(0, 8_192) : 'ERR_HOST_FUNCTION'
+        code: typeof error.code === 'string'
+          ? hostReflectApply(hostStringSlice, error.code, [0, 8_192])
+          : 'ERR_HOST_FUNCTION'
       }
     }
   } catch {}
@@ -2177,13 +2560,25 @@ function serializeHostError (error) {
   }
 }
 
-function snapshotSessionOptions (options) {
-  const snapshot = Object.create(null)
-  const descriptors = Object.getOwnPropertyDescriptors(options)
-  for (const key of Reflect.ownKeys(options)) {
-    if (typeof key === 'symbol' && key !== ONE_SHOT && key !== LOCAL_MODULE &&
-        key !== PREPARATION_SLOT) {
-      throw new TypeError('options must not contain symbol properties')
+trustedSessionMethods = Object.freeze(Object.entries(
+  Object.getOwnPropertyDescriptors(UntrustedWorkerSession.prototype)
+).filter(([name, descriptor]) => {
+  return name !== 'constructor' && 'value' in descriptor && typeof descriptor.value === 'function'
+}).map(([name, descriptor]) => Object.freeze([name, descriptor.value])))
+
+function snapshotSessionOptions (options, allowedNames, allowInternalSymbols = false) {
+  const snapshot = hostObjectCreate(null)
+  const descriptors = hostObjectGetOwnPropertyDescriptors(options)
+  const keys = hostReflectOwnKeys(options)
+  for (let index = 0; index < keys.length; index++) {
+    const key = keys[index]
+    if (typeof key === 'symbol') {
+      if (!allowInternalSymbols || (key !== ONE_SHOT && key !== LOCAL_MODULE &&
+          key !== PREPARATION_SLOT)) {
+        throw new TypeError('options must not contain symbol properties')
+      }
+    } else if (!hostReflectApply(hostSetHas, allowedNames, [key])) {
+      throw new TypeError(`Unknown option: ${key}`)
     }
     const descriptor = descriptors[key]
     if (!descriptor.enumerable || !('value' in descriptor)) {
@@ -2202,11 +2597,11 @@ function validateDiagnostics (diagnostics, onDiagnostic) {
     throw new TypeError('onDiagnostic cannot be used when diagnostics is false')
   }
   if (diagnostics === undefined || diagnostics === false) {
-    if (onDiagnostic === undefined) return Object.freeze({ enabled: false })
+    if (onDiagnostic === undefined) return hostObjectFreeze({ enabled: false })
     diagnostics = true
   }
   if (diagnostics !== true &&
-      (diagnostics === null || typeof diagnostics !== 'object' || Array.isArray(diagnostics))) {
+      (diagnostics === null || typeof diagnostics !== 'object' || hostArrayIsArray(diagnostics))) {
     throw new TypeError('diagnostics must be a boolean or an options object')
   }
 
@@ -2216,13 +2611,18 @@ function validateDiagnostics (diagnostics, onDiagnostic) {
     maxRecordBytes: DEFAULT_MAX_DIAGNOSTIC_RECORD_BYTES
   }
   if (diagnostics !== true) {
-    const keys = Reflect.ownKeys(diagnostics)
-    if (keys.some((key) => typeof key === 'symbol')) {
-      throw new TypeError('diagnostics must not contain symbol properties')
+    const keys = hostReflectOwnKeys(diagnostics)
+    for (let index = 0; index < keys.length; index++) {
+      if (typeof keys[index] === 'symbol') {
+        throw new TypeError('diagnostics must not contain symbol properties')
+      }
     }
-    for (const key of keys) {
-      if (!Object.hasOwn(values, key)) throw new TypeError(`Unknown diagnostics option: ${key}`)
-      const descriptor = Object.getOwnPropertyDescriptor(diagnostics, key)
+    for (let index = 0; index < keys.length; index++) {
+      const key = keys[index]
+      if (!hostReflectApply(hostObjectHasOwn, Object, [values, key])) {
+        throw new TypeError(`Unknown diagnostics option: ${key}`)
+      }
+      const descriptor = hostReflectApply(hostObjectGetOwnPropertyDescriptor, Object, [diagnostics, key])
       if (!descriptor.enumerable || !('value' in descriptor)) {
         throw new TypeError(`diagnostics.${key} must be an enumerable data property`)
       }
@@ -2233,7 +2633,7 @@ function validateDiagnostics (diagnostics, onDiagnostic) {
   if (values.maxRecordBytes > values.maxBytes) {
     throw new RangeError('diagnostics.maxRecordBytes must not exceed diagnostics.maxBytes')
   }
-  return Object.freeze({ enabled: true, ...values })
+  return hostObjectFreeze({ enabled: true, ...values })
 }
 
 function sessionError (message, code, cause) {

@@ -13,6 +13,7 @@ import { acquireFilePreparationSlot, acquireWorkerSlot } from './admission.js'
 import { validateHostFunctions } from './host-functions.js'
 import {
   attemptLocalModuleCleanup,
+  getLocalModuleCleanupUntilRemoved,
   resolveLocalModule
 } from './local-files.js'
 import { createUntrustedFileSession, createUntrustedOneShot } from './session.js'
@@ -26,10 +27,39 @@ const DEFAULT_TIMEOUT_MS = 1_000
 const DEFAULT_MAX_ROOT_ENTRIES = 10_000
 const DEFAULT_MAX_FILE_BYTES = 1024 * 1024
 const DEFAULT_MAX_TOTAL_FILE_BYTES = 16 * 1024 * 1024
+const SafeAbortController = AbortController
+const SafePromise = Promise
+const abortControllerAbort = AbortController.prototype.abort
+const abortControllerSignal = Object.getOwnPropertyDescriptor(
+  AbortController.prototype,
+  'signal'
+).get
 const eventTargetAddEventListener = EventTarget.prototype.addEventListener
 const eventTargetRemoveEventListener = EventTarget.prototype.removeEventListener
 const abortSignalAborted = Object.getOwnPropertyDescriptor(AbortSignal.prototype, 'aborted').get
 const abortSignalReason = Object.getOwnPropertyDescriptor(AbortSignal.prototype, 'reason').get
+const safeReflectApply = Reflect.apply
+const safeReflectOwnKeys = Reflect.ownKeys
+const safeSetHas = Set.prototype.has
+const safeArrayIsArray = Array.isArray
+const safeObjectAssign = Object.assign
+const safeObjectCreate = Object.create
+const safeObjectDefineProperty = Object.defineProperty
+const safeObjectEntries = Object.entries
+const safeObjectFreeze = Object.freeze
+const safeObjectGetOwnPropertyDescriptors = Object.getOwnPropertyDescriptors
+const safeObjectKeys = Object.keys
+const safePromiseCatch = Promise.prototype.catch
+const safePromiseFinally = Promise.prototype.finally
+const safePromiseRace = Promise.race
+const safePromiseReject = Promise.reject
+const safePromiseThen = Promise.prototype.then
+const safeClearTimeout = globalThis.clearTimeout
+const safeDateNow = Date.now
+const safeSetTimeout = globalThis.setTimeout
+const safeWeakMapGet = WeakMap.prototype.get
+const safeWeakMapSet = WeakMap.prototype.set
+const preparationCleanupUntilRemovedByError = new WeakMap()
 const RUNNER_DEFAULT_NAMES = new Set([
   'timeoutMs',
   'maxSourceBytes',
@@ -46,6 +76,63 @@ const RUNNER_DEFAULT_NAMES = new Set([
   'diagnostics',
   'onDiagnostic'
 ])
+const ONE_SHOT_OPTION_NAMES = new Set([
+  ...RUNNER_DEFAULT_NAMES,
+  'input',
+  'signal'
+])
+const FILE_POLICY_OPTION_NAMES = [
+  'rootDirectory',
+  'maxRootEntries',
+  'maxFileBytes',
+  'maxTotalFileBytes'
+]
+const ONE_SHOT_FILE_OPTION_NAMES = new Set([
+  ...ONE_SHOT_OPTION_NAMES,
+  ...FILE_POLICY_OPTION_NAMES
+])
+const PERSISTENT_OPTION_NAMES = new Set([
+  'type',
+  'language',
+  'input',
+  'environment',
+  'resourceLimits',
+  'signal',
+  'startupTimeoutMs',
+  'messageTimeoutMs',
+  'lifetimeTimeoutMs',
+  'maxSourceBytes',
+  'maxMessageBytes',
+  'maxInputBytes',
+  'maxOutputMessages',
+  'maxOutputBytes',
+  'hostFunctions',
+  'maxHostFunctionCalls',
+  'maxInFlightHostFunctions',
+  'diagnostics',
+  'onDiagnostic'
+])
+const PERSISTENT_FILE_OPTION_NAMES = new Set([
+  ...PERSISTENT_OPTION_NAMES,
+  ...FILE_POLICY_OPTION_NAMES
+])
+const DIAGNOSTIC_OPTION_NAMES = new Set(['maxRecords', 'maxBytes', 'maxRecordBytes'])
+
+function thenSafePromise (promise, onFulfilled, onRejected) {
+  return safeReflectApply(safePromiseThen, promise, [onFulfilled, onRejected])
+}
+
+function catchSafePromise (promise, onRejected) {
+  return safeReflectApply(safePromiseCatch, promise, [onRejected])
+}
+
+function finallySafePromise (promise, onFinally) {
+  return safeReflectApply(safePromiseFinally, promise, [onFinally])
+}
+
+function rejectSafePromise (error) {
+  return safeReflectApply(safePromiseReject, SafePromise, [error])
+}
 
 /**
  * Create a callable with snapshotted defaults for one-shot execution.
@@ -57,13 +144,13 @@ export function createRunner (defaultOptions = {}) {
     try {
       releaseWorkerSlot = acquireWorkerSlot()
     } catch (error) {
-      return Promise.reject(translateSessionError(error, DEFAULT_TIMEOUT_MS))
+      return rejectSafePromise(translateSessionError(error, DEFAULT_TIMEOUT_MS))
     }
     try {
-      if (options === null || typeof options !== 'object' || Array.isArray(options)) {
+      if (options === null || typeof options !== 'object' || safeArrayIsArray(options)) {
         throw new TypeError('options must be an object')
       }
-      const overrides = snapshotPublicOptions(options, 'options')
+      const overrides = snapshotPublicOptions(options, 'options', ONE_SHOT_OPTION_NAMES)
       return runUntrustedCodeAdmitted(
         source,
         { ...defaults, ...overrides },
@@ -88,7 +175,7 @@ export function runUntrustedCode (source, options = {}) {
   try {
     releaseWorkerSlot = acquireWorkerSlot()
   } catch (error) {
-    return Promise.reject(translateSessionError(error, DEFAULT_TIMEOUT_MS))
+    return rejectSafePromise(translateSessionError(error, DEFAULT_TIMEOUT_MS))
   }
   try {
     return runUntrustedCodeAdmitted(source, options, releaseWorkerSlot)
@@ -100,10 +187,10 @@ export function runUntrustedCode (source, options = {}) {
 
 function runUntrustedCodeAdmitted (source, options, releaseWorkerSlot) {
   if (typeof source !== 'string') throw new TypeError('source must be a string')
-  if (options === null || typeof options !== 'object' || Array.isArray(options)) {
+  if (options === null || typeof options !== 'object' || safeArrayIsArray(options)) {
     throw new TypeError('options must be an object')
   }
-  options = snapshotPublicOptions(options, 'options')
+  options = snapshotPublicOptions(options, 'options', ONE_SHOT_OPTION_NAMES)
 
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
   const maxSourceBytes = options.maxSourceBytes ?? DEFAULT_MAX_SOURCE_BYTES
@@ -126,7 +213,7 @@ function runUntrustedCodeAdmitted (source, options, releaseWorkerSlot) {
  * module must default-export a function receiving the one-shot input.
  */
 export async function runUntrustedFile (modulePath, options = {}) {
-  const startedAt = Date.now()
+  const startedAt = safeReflectApply(safeDateNow, Date, [])
   let releaseWorkerSlot
   try {
     releaseWorkerSlot = acquireWorkerSlot()
@@ -136,15 +223,15 @@ export async function runUntrustedFile (modulePath, options = {}) {
 
   let timeoutMs
   try {
-    options = snapshotFileOptions(options, 'options')
+    options = snapshotFileOptions(options, 'options', ONE_SHOT_FILE_OPTION_NAMES)
     timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
     validatePositiveInteger(timeoutMs, 'timeoutMs')
     if (timeoutMs > MAX_TIMEOUT_MS) {
       throw new RangeError(`timeoutMs must not exceed ${MAX_TIMEOUT_MS}`)
     }
     const signal = validateSignal(options.signal)
-    if (signal && Reflect.apply(abortSignalAborted, signal, [])) {
-      throw abortError(Reflect.apply(abortSignalReason, signal, []))
+    if (signal && safeReflectApply(abortSignalAborted, signal, [])) {
+      throw abortError(safeReflectApply(abortSignalReason, signal, []))
     }
   } catch (error) {
     releaseWorkerSlot()
@@ -170,7 +257,7 @@ export async function runUntrustedFile (modulePath, options = {}) {
   const localModule = await prepareLocalModule(
     modulePath,
     options,
-    timeoutMs - (Date.now() - startedAt),
+    timeoutMs - (safeReflectApply(safeDateNow, Date, []) - startedAt),
     new UntrustedCodeError(`Execution exceeded ${timeoutMs} ms`, {
       code: 'ERR_UNTRUSTED_CODE_TIMEOUT'
     }),
@@ -178,7 +265,7 @@ export async function runUntrustedFile (modulePath, options = {}) {
     releasePreparationSlot
   )
 
-  const remainingTimeoutMs = timeoutMs - (Date.now() - startedAt)
+  const remainingTimeoutMs = timeoutMs - (safeReflectApply(safeDateNow, Date, []) - startedAt)
   if (remainingTimeoutMs <= 0) {
     releaseWorkerSlot()
     const timeoutError = new UntrustedCodeError(`Execution exceeded ${timeoutMs} ms`, {
@@ -225,19 +312,19 @@ export async function runUntrustedFile (modulePath, options = {}) {
  * for the session.
  */
 export async function createUntrustedWorkerFromFile (modulePath, options = {}) {
-  const startedAt = Date.now()
+  const startedAt = safeReflectApply(safeDateNow, Date, [])
   const releaseWorkerSlot = acquireWorkerSlot()
   let startupTimeoutMs
   try {
-    options = snapshotFileOptions(options, 'options')
+    options = snapshotFileOptions(options, 'options', PERSISTENT_FILE_OPTION_NAMES)
     startupTimeoutMs = options.startupTimeoutMs ?? DEFAULT_TIMEOUT_MS
     validatePositiveInteger(startupTimeoutMs, 'startupTimeoutMs')
     if (startupTimeoutMs > MAX_TIMEOUT_MS) {
       throw new RangeError(`startupTimeoutMs must not exceed ${MAX_TIMEOUT_MS}`)
     }
     const signal = validateSignal(options.signal)
-    if (signal && Reflect.apply(abortSignalAborted, signal, [])) {
-      throw abortError(Reflect.apply(abortSignalReason, signal, []))
+    if (signal && safeReflectApply(abortSignalAborted, signal, [])) {
+      throw abortError(safeReflectApply(abortSignalReason, signal, []))
     }
   } catch (error) {
     releaseWorkerSlot()
@@ -261,7 +348,7 @@ export async function createUntrustedWorkerFromFile (modulePath, options = {}) {
   const localModule = await prepareLocalModule(
     modulePath,
     options,
-    startupTimeoutMs - (Date.now() - startedAt),
+    startupTimeoutMs - (safeReflectApply(safeDateNow, Date, []) - startedAt),
     new UntrustedCodeError(`Startup exceeded ${startupTimeoutMs} ms`, {
       code: 'ERR_UNTRUSTED_WORKER_STARTUP_TIMEOUT'
     }),
@@ -269,7 +356,7 @@ export async function createUntrustedWorkerFromFile (modulePath, options = {}) {
     releasePreparationSlot
   )
 
-  const remainingStartupMs = startupTimeoutMs - (Date.now() - startedAt)
+  const remainingStartupMs = startupTimeoutMs - (safeReflectApply(safeDateNow, Date, []) - startedAt)
   if (remainingStartupMs <= 0) {
     releaseWorkerSlot()
     const timeoutError = new UntrustedCodeError(`Startup exceeded ${startupTimeoutMs} ms`, {
@@ -312,37 +399,38 @@ async function prepareLocalModule (
     throw timeoutError
   }
 
-  const controller = new AbortController()
+  const controller = new SafeAbortController()
+  const controllerSignal = safeReflectApply(abortControllerSignal, controller, [])
   const callerSignal = options.signal
   let rejectInterruption
-  const interruption = new Promise((resolve, reject) => {
+  const interruption = new SafePromise((resolve, reject) => {
     rejectInterruption = reject
   })
   const interrupt = (error) => {
-    if (controller.signal.aborted) return
-    controller.abort(error)
+    if (safeReflectApply(abortSignalAborted, controllerSignal, [])) return
+    safeReflectApply(abortControllerAbort, controller, [error])
     rejectInterruption(error)
   }
   const onAbort = () => interrupt(abortError(
-    Reflect.apply(abortSignalReason, callerSignal, [])
+    safeReflectApply(abortSignalReason, callerSignal, [])
   ))
   if (callerSignal) {
     try {
-      Reflect.apply(eventTargetAddEventListener, callerSignal, [
+      safeReflectApply(eventTargetAddEventListener, callerSignal, [
         'abort',
         onAbort,
         { once: true }
       ])
-      if (Reflect.apply(abortSignalAborted, callerSignal, [])) onAbort()
+      if (safeReflectApply(abortSignalAborted, callerSignal, [])) onAbort()
     } catch (error) {
       releaseWorkerSlot()
       releasePreparationSlot()
       throw error
     }
   }
-  const timer = setTimeout(() => interrupt(timeoutError), timeoutMs)
+  const timer = safeSetTimeout(() => interrupt(timeoutError), timeoutMs)
 
-  const preparation = resolveLocalModule(
+  const preparationRequest = resolveLocalModule(
     modulePath,
     options.rootDirectory,
     {
@@ -350,9 +438,10 @@ async function prepareLocalModule (
       maxFileBytes: options.maxFileBytes,
       maxTotalFileBytes: options.maxTotalFileBytes
     },
-    controller.signal
-  ).then(async (localModule) => {
-    if (controller.signal.aborted) {
+    controllerSignal
+  )
+  const preparation = thenSafePromise(preparationRequest, async (localModule) => {
+    if (safeReflectApply(abortSignalAborted, controllerSignal, [])) {
       try {
         await localModule.cleanup()
       } catch (cleanupError) {
@@ -360,27 +449,29 @@ async function prepareLocalModule (
           'The private module snapshot could not be removed',
           { code: 'ERR_UNTRUSTED_MODULE_CLEANUP', cause: cleanupError }
         )
-        Object.defineProperty(error, 'cleanupUntilRemoved', {
-          value: localModule.cleanupUntilRemoved
-        })
+        safeReflectApply(safeWeakMapSet, preparationCleanupUntilRemovedByError, [
+          error,
+          localModule.cleanupUntilRemoved
+        ])
         throw error
       }
-      throw controller.signal.reason
+      throw safeReflectApply(abortSignalReason, controllerSignal, [])
     }
     return localModule
   })
   // A filesystem request may settle after the public deadline. Preparation
   // can never continue into worker creation.
-  void preparation.catch(() => {})
+  void catchSafePromise(preparation, () => {})
 
   try {
-    return await Promise.race([preparation, interruption])
+    return await safeReflectApply(safePromiseRace, SafePromise, [[preparation, interruption]])
   } catch (error) {
     releaseWorkerSlot()
-    if (controller.signal.aborted) {
+    if (safeReflectApply(abortSignalAborted, controllerSignal, [])) {
       // Keep abandoned filesystem work independently bounded without starving
       // ordinary worker admission if an operating-system request never settles.
-      void preparation.then(
+      void thenSafePromise(
+        preparation,
         releasePreparationSlot,
         (preparationError) => releaseAfterPreparationError(
           preparationError,
@@ -392,21 +483,35 @@ async function prepareLocalModule (
     }
     throw error
   } finally {
-    clearTimeout(timer)
+    safeClearTimeout(timer)
     if (callerSignal) {
       try {
-        Reflect.apply(eventTargetRemoveEventListener, callerSignal, ['abort', onAbort])
+        safeReflectApply(eventTargetRemoveEventListener, callerSignal, ['abort', onAbort])
       } catch {}
     }
   }
 }
 
 function releaseAfterPreparationError (error, releasePreparationSlot) {
-  if (typeof error?.cleanupUntilRemoved === 'function') {
-    void error.cleanupUntilRemoved().then(releasePreparationSlot, releasePreparationSlot)
-  } else {
-    releasePreparationSlot()
+  let cleanupUntilRemoved
+  if ((typeof error === 'object' && error !== null) || typeof error === 'function') {
+    cleanupUntilRemoved = safeReflectApply(
+      safeWeakMapGet,
+      preparationCleanupUntilRemovedByError,
+      [error]
+    ) ?? getLocalModuleCleanupUntilRemoved(error)
   }
+  if (cleanupUntilRemoved === undefined) {
+    releasePreparationSlot()
+    return
+  }
+  let cleanup
+  try {
+    cleanup = cleanupUntilRemoved()
+  } catch {
+    return
+  }
+  void thenSafePromise(cleanup, releasePreparationSlot, () => {})
 }
 
 async function cleanupLocalModule (localModule, releasePreparationSlot, primaryError) {
@@ -416,9 +521,10 @@ async function cleanupLocalModule (localModule, releasePreparationSlot, primaryE
     return
   }
 
-  void localModule.cleanupUntilRemoved().then(
+  void thenSafePromise(
+    localModule.cleanupUntilRemoved(),
     releasePreparationSlot,
-    releasePreparationSlot
+    () => {}
   )
   const cleanupError = outcome.status === 'failed'
     ? outcome.error
@@ -446,7 +552,7 @@ function runOneShot (
     try {
       releaseWorkerSlot = acquireWorkerSlot()
     } catch (error) {
-      return Promise.reject(translateSessionError(error, reportedTimeoutMs))
+      return rejectSafePromise(translateSessionError(error, reportedTimeoutMs))
     }
   }
   let transferred = false
@@ -457,8 +563,8 @@ function runOneShot (
     const environment = sanitizeEnvironment(options.environment)
     const resourceLimits = validateResourceLimits(options.resourceLimits)
     const signal = validateSignal(options.signal)
-    if (signal && Reflect.apply(abortSignalAborted, signal, [])) {
-      throw abortError(Reflect.apply(abortSignalReason, signal, []))
+    if (signal && safeReflectApply(abortSignalAborted, signal, [])) {
+      throw abortError(safeReflectApply(abortSignalReason, signal, []))
     }
 
     session = createSession({
@@ -487,31 +593,30 @@ function runOneShot (
         error?.code === 'ERR_UNTRUSTED_WORKER_STARTUP_TIMEOUT' ||
         error?.code === 'ERR_UNTRUSTED_WORKER_CAPACITY' ||
         error?.code === 'ERR_UNTRUSTED_WORKER_ADMISSION_UNAVAILABLE') {
-      return Promise.reject(translateSessionError(error, reportedTimeoutMs))
+      return rejectSafePromise(translateSessionError(error, reportedTimeoutMs))
     }
     throw error
   }
 
-  return session.ready
-    .catch((error) => {
-      throw translateSessionError(error, reportedTimeoutMs)
-    })
-    .finally(async () => {
-      try {
-        await session.terminate()
-      } catch {}
-      const closed = await session.closed
-      if (closed.error?.code === 'ERR_UNTRUSTED_WORKER_CLEANUP' ||
-          closed.error?.code === 'ERR_UNTRUSTED_WORKER_TERMINATION_TIMEOUT' ||
-          closed.error?.code === 'ERR_UNTRUSTED_WORKER_TERMINATION') {
-        throw translateSessionError(closed.error, reportedTimeoutMs)
-      }
-    })
+  const translatedReady = catchSafePromise(session.ready, (error) => {
+    throw translateSessionError(error, reportedTimeoutMs)
+  })
+  return finallySafePromise(translatedReady, async () => {
+    try {
+      await session.terminate()
+    } catch {}
+    const closed = await session.closed
+    if (closed.error?.code === 'ERR_UNTRUSTED_WORKER_CLEANUP' ||
+        closed.error?.code === 'ERR_UNTRUSTED_WORKER_TERMINATION_TIMEOUT' ||
+        closed.error?.code === 'ERR_UNTRUSTED_WORKER_TERMINATION') {
+      throw translateSessionError(closed.error, reportedTimeoutMs)
+    }
+  })
 }
 
 function snapshotFilePolicies (options) {
-  const policyInput = Object.create(null)
-  for (const name of [
+  const policyInput = safeObjectCreate(null)
+  const policyNames = [
     'environment',
     'resourceLimits',
     'maxMessageBytes',
@@ -523,20 +628,25 @@ function snapshotFilePolicies (options) {
     'maxInFlightHostFunctions',
     'diagnostics',
     'onDiagnostic'
-  ]) {
+  ]
+  for (let index = 0; index < policyNames.length; index++) {
+    const name = policyNames[index]
     if (name in options) policyInput[name] = options[name]
   }
-  Object.assign(options, snapshotRunnerDefaults(policyInput))
+  safeObjectAssign(options, snapshotRunnerDefaults(policyInput))
 
   const input = cloneWithoutSharedMemory(options.input, 'input')
   assertSupportedProtocolValue(input, 'input')
   options.input = input
 
-  for (const [name, defaultValue] of [
+  const fileLimits = [
     ['maxRootEntries', DEFAULT_MAX_ROOT_ENTRIES],
     ['maxFileBytes', DEFAULT_MAX_FILE_BYTES],
     ['maxTotalFileBytes', DEFAULT_MAX_TOTAL_FILE_BYTES]
-  ]) {
+  ]
+  for (let index = 0; index < fileLimits.length; index++) {
+    const name = fileLimits[index][0]
+    const defaultValue = fileLimits[index][1]
     const value = options[name] ?? defaultValue
     validatePositiveInteger(value, name)
     options[name] = value
@@ -553,27 +663,42 @@ function validateSignal (signal) {
   return signal
 }
 
-function snapshotFileOptions (options, label) {
-  if (options === null || typeof options !== 'object' || Array.isArray(options)) {
+function snapshotFileOptions (options, label, allowedNames) {
+  if (options === null || typeof options !== 'object' || safeArrayIsArray(options)) {
     throw new TypeError(`${label} must be an object`)
   }
   const snapshot = snapshotPublicOptions(options, label)
-  for (const unsupported of ['language', 'maxSourceBytes', 'type']) {
+  const unsupportedNames = ['language', 'maxSourceBytes', 'type']
+  for (let index = 0; index < unsupportedNames.length; index++) {
+    const unsupported = unsupportedNames[index]
     if (unsupported in snapshot) {
       throw new TypeError(`${unsupported} is not supported for local module files`)
+    }
+  }
+  const keys = safeObjectKeys(snapshot)
+  for (let index = 0; index < keys.length; index++) {
+    const key = keys[index]
+    if (!safeReflectApply(safeSetHas, allowedNames, [key])) {
+      throw new TypeError(`Unknown option: ${key}`)
     }
   }
   return snapshot
 }
 
-function snapshotPublicOptions (options, label) {
-  const keys = Reflect.ownKeys(options)
-  if (keys.some((key) => typeof key === 'symbol')) {
-    throw new TypeError(`${label} must not contain symbol properties`)
+function snapshotPublicOptions (options, label, allowedNames) {
+  const keys = safeReflectOwnKeys(options)
+  for (let index = 0; index < keys.length; index++) {
+    if (typeof keys[index] === 'symbol') {
+      throw new TypeError(`${label} must not contain symbol properties`)
+    }
   }
-  const snapshot = Object.create(null)
-  const descriptors = Object.getOwnPropertyDescriptors(options)
-  for (const key of keys) {
+  const snapshot = safeObjectCreate(null)
+  const descriptors = safeObjectGetOwnPropertyDescriptors(options)
+  for (let index = 0; index < keys.length; index++) {
+    const key = keys[index]
+    if (allowedNames && !safeReflectApply(safeSetHas, allowedNames, [key])) {
+      throw new TypeError(`Unknown option: ${key}`)
+    }
     const descriptor = descriptors[key]
     if (!descriptor.enumerable || !('value' in descriptor)) {
       throw new TypeError(`${label}.${key} must be an enumerable data property`)
@@ -584,21 +709,24 @@ function snapshotPublicOptions (options, label) {
 }
 
 function snapshotRunnerDefaults (options) {
-  if (options === null || typeof options !== 'object' || Array.isArray(options)) {
+  if (options === null || typeof options !== 'object' || safeArrayIsArray(options)) {
     throw new TypeError('runner defaults must be an object')
   }
-  const keys = Reflect.ownKeys(options)
-  if (keys.some((key) => typeof key === 'symbol')) {
-    throw new TypeError('runner defaults must not contain symbol properties')
+  const keys = safeReflectOwnKeys(options)
+  for (let index = 0; index < keys.length; index++) {
+    if (typeof keys[index] === 'symbol') {
+      throw new TypeError('runner defaults must not contain symbol properties')
+    }
   }
 
-  const snapshot = Object.create(null)
-  const descriptors = Object.getOwnPropertyDescriptors(options)
-  for (const key of keys) {
+  const snapshot = safeObjectCreate(null)
+  const descriptors = safeObjectGetOwnPropertyDescriptors(options)
+  for (let index = 0; index < keys.length; index++) {
+    const key = keys[index]
     if (key === 'input' || key === 'signal') {
       throw new TypeError(`${key} must be supplied per run`)
     }
-    if (!RUNNER_DEFAULT_NAMES.has(key)) {
+    if (!safeReflectApply(safeSetHas, RUNNER_DEFAULT_NAMES, [key])) {
       throw new TypeError(`Unknown runner default: ${key}`)
     }
     const descriptor = descriptors[key]
@@ -618,7 +746,7 @@ function snapshotRunnerDefaults (options) {
       throw new RangeError(`timeoutMs must not exceed ${MAX_TIMEOUT_MS}`)
     }
   }
-  for (const name of [
+  const limitNames = [
     'maxSourceBytes',
     'maxMessageBytes',
     'maxInputBytes',
@@ -626,7 +754,9 @@ function snapshotRunnerDefaults (options) {
     'maxOutputBytes',
     'maxHostFunctionCalls',
     'maxInFlightHostFunctions'
-  ]) {
+  ]
+  for (let index = 0; index < limitNames.length; index++) {
+    const name = limitNames[index]
     if (name in snapshot) validatePositiveInteger(snapshot[name], name)
   }
   if ('maxMessageBytes' in snapshot && snapshot.maxMessageBytes < 128) {
@@ -643,14 +773,17 @@ function snapshotRunnerDefaults (options) {
   }
   if ('diagnostics' in snapshot && snapshot.diagnostics !== true && snapshot.diagnostics !== false) {
     if (snapshot.diagnostics === null || typeof snapshot.diagnostics !== 'object' ||
-        Array.isArray(snapshot.diagnostics)) {
+        safeArrayIsArray(snapshot.diagnostics)) {
       throw new TypeError('diagnostics must be a boolean or an options object')
     }
-    const diagnostics = Object.create(null)
-    for (const [name, descriptor] of Object.entries(
-      Object.getOwnPropertyDescriptors(snapshot.diagnostics)
-    )) {
-      if (!['maxRecords', 'maxBytes', 'maxRecordBytes'].includes(name)) {
+    const diagnostics = safeObjectCreate(null)
+    const diagnosticEntries = safeObjectEntries(
+      safeObjectGetOwnPropertyDescriptors(snapshot.diagnostics)
+    )
+    for (let index = 0; index < diagnosticEntries.length; index++) {
+      const name = diagnosticEntries[index][0]
+      const descriptor = diagnosticEntries[index][1]
+      if (!safeReflectApply(safeSetHas, DIAGNOSTIC_OPTION_NAMES, [name])) {
         throw new TypeError(`Unknown diagnostics option: ${name}`)
       }
       if (!descriptor.enumerable || !('value' in descriptor)) {
@@ -659,42 +792,53 @@ function snapshotRunnerDefaults (options) {
       validatePositiveInteger(descriptor.value, `diagnostics.${name}`)
       diagnostics[name] = descriptor.value
     }
-    if (Reflect.ownKeys(snapshot.diagnostics).some((key) => typeof key === 'symbol')) {
-      throw new TypeError('diagnostics must not contain symbol properties')
+    const diagnosticKeys = safeReflectOwnKeys(snapshot.diagnostics)
+    for (let index = 0; index < diagnosticKeys.length; index++) {
+      if (typeof diagnosticKeys[index] === 'symbol') {
+        throw new TypeError('diagnostics must not contain symbol properties')
+      }
     }
     const maxBytes = diagnostics.maxBytes ?? 64 * 1024
     const maxRecordBytes = diagnostics.maxRecordBytes ?? 4 * 1024
     if (maxRecordBytes > maxBytes) {
       throw new RangeError('diagnostics.maxRecordBytes must not exceed diagnostics.maxBytes')
     }
-    snapshot.diagnostics = Object.freeze(diagnostics)
+    snapshot.diagnostics = safeObjectFreeze(diagnostics)
   }
   if (snapshot.diagnostics === false && 'onDiagnostic' in snapshot) {
     throw new TypeError('onDiagnostic cannot be used when diagnostics is false')
   }
 
-  return Object.freeze(snapshot)
+  return safeObjectFreeze(snapshot)
 }
 
 function snapshotHostFunctions (hostFunctions) {
-  const snapshot = Object.create(null)
-  for (const [namespace, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(hostFunctions))) {
-    const group = Object.create(null)
-    for (const [name, functionDescriptor] of Object.entries(
-      Object.getOwnPropertyDescriptors(descriptor.value)
-    )) {
-      Object.defineProperty(group, name, {
+  const snapshot = safeObjectCreate(null)
+  const namespaceEntries = safeObjectEntries(
+    safeObjectGetOwnPropertyDescriptors(hostFunctions)
+  )
+  for (let namespaceIndex = 0; namespaceIndex < namespaceEntries.length; namespaceIndex++) {
+    const namespace = namespaceEntries[namespaceIndex][0]
+    const descriptor = namespaceEntries[namespaceIndex][1]
+    const group = safeObjectCreate(null)
+    const functionEntries = safeObjectEntries(
+      safeObjectGetOwnPropertyDescriptors(descriptor.value)
+    )
+    for (let functionIndex = 0; functionIndex < functionEntries.length; functionIndex++) {
+      const name = functionEntries[functionIndex][0]
+      const functionDescriptor = functionEntries[functionIndex][1]
+      safeObjectDefineProperty(group, name, {
         value: functionDescriptor.value,
         enumerable: true
       })
     }
-    Object.freeze(group)
-    Object.defineProperty(snapshot, namespace, {
+    safeObjectFreeze(group)
+    safeObjectDefineProperty(snapshot, namespace, {
       value: group,
       enumerable: true
     })
   }
-  return Object.freeze(snapshot)
+  return safeObjectFreeze(snapshot)
 }
 
 function translateSessionError (error, timeoutMs) {

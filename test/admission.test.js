@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { createHook } from 'node:async_hooks'
 import { cp, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -142,30 +143,108 @@ test('capacity rejection occurs before inspecting input', async (t) => {
   await holder.terminate()
 })
 
-test('subclass accessors cannot intercept direct-constructor initialization', async () => {
+test('subclass construction is rejected after admission without invoking accessors', async () => {
   configureWorkerAdmission({ maxConcurrentWorkers: 1 })
   let intercepted = 0
   class AccessorSession extends UntrustedWorkerSession {
-    set state (value) {
-      intercepted++
-      throw new Error(`state rejected: ${value}`)
-    }
-
-    set startupTimer (value) {
-      intercepted++
-      throw new Error(`timer rejected: ${value}`)
-    }
+    set _events (value) { intercepted++ }
+    set _eventsCount (value) { intercepted++ }
+    set _maxListeners (value) { intercepted++ }
+    fail () { intercepted++ }
   }
 
-  const session = new AccessorSession('onMessage(value => value)', SESSION_OPTIONS)
-  await session.ready
-  assert.equal(await session.request(42), 42)
+  const holder = createUntrustedWorker('', SESSION_OPTIONS)
+  await holder.ready
+  assert.throws(
+    () => new AccessorSession('', SESSION_OPTIONS),
+    (error) => error.code === 'ERR_UNTRUSTED_WORKER_CAPACITY'
+  )
   assert.equal(intercepted, 0)
-  await session.terminate()
+  await holder.terminate()
+
+  assert.throws(
+    () => new AccessorSession('', SESSION_OPTIONS),
+    /cannot be subclassed/
+  )
+  assert.equal(intercepted, 0)
 
   const next = createUntrustedWorker('', SESSION_OPTIONS)
+  assert.throws(
+    () => Object.defineProperty(next, 'terminate', { value: () => {} }),
+    /Cannot redefine property/
+  )
   await next.ready
   await next.terminate()
+})
+
+test('post-spawn setup resists poisoned worker lifecycle methods', async () => {
+  configureWorkerAdmission({ maxConcurrentWorkers: 1 })
+  const lifecycleNames = ['emit', 'once', 'removeAllListeners']
+  const originalDescriptors = lifecycleNames.map((name) => [
+    name,
+    Object.getOwnPropertyDescriptor(Worker.prototype, name)
+  ])
+  let session
+  try {
+    const options = new Proxy(SESSION_OPTIONS, {
+      ownKeys (target) {
+        Worker.prototype.emit = () => false
+        Worker.prototype.once = () => { throw new Error('poisoned Worker.once') }
+        Worker.prototype.removeAllListeners = () => {
+          throw new Error('poisoned Worker.removeAllListeners')
+        }
+        return Reflect.ownKeys(target)
+      }
+    })
+    session = createUntrustedWorker('onMessage(value => value)', options)
+    await session.ready
+    assert.equal(await session.request(42), 42)
+    await session.terminate()
+    await session.closed
+  } finally {
+    for (const [name, descriptor] of originalDescriptors) {
+      if (descriptor) Object.defineProperty(Worker.prototype, name, descriptor)
+      else delete Worker.prototype[name]
+    }
+    await session?.terminate().catch(() => {})
+  }
+
+  const replacement = createUntrustedWorker('', SESSION_OPTIONS)
+  await replacement.ready
+  await replacement.terminate()
+  await replacement.closed
+})
+
+test('worker constructor failures release admission', async () => {
+  configureWorkerAdmission({ maxConcurrentWorkers: 1 })
+  let hook
+  try {
+    const options = new Proxy(SESSION_OPTIONS, {
+      ownKeys (target) {
+        if (!hook) {
+          hook = createHook({
+            init (asyncId, type, triggerAsyncId, resource) {
+              if (type === 'WORKER') Object.preventExtensions(resource)
+            }
+          })
+          hook.enable()
+        }
+        return Reflect.ownKeys(target)
+      }
+    })
+    assert.throws(
+      () => createUntrustedWorker('onMessage(value => value)', options),
+      /object is not extensible/
+    )
+    hook.disable()
+  } finally {
+    hook?.disable()
+  }
+
+  const replacement = createUntrustedWorker('', SESSION_OPTIONS)
+  await replacement.ready
+  await replacement.terminate()
+  await replacement.closed
 })
 
 test('physical package copies share process-wide admission', async (t) => {

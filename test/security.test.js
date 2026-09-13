@@ -9,7 +9,12 @@ import { DatabaseSync } from 'node:sqlite'
 import { test } from 'node:test'
 import { getEnvironmentData, setEnvironmentData } from 'node:worker_threads'
 
-import { createUntrustedWorker, runUntrustedCode } from '../src/index.js'
+import {
+  createUntrustedWorker,
+  createUntrustedWorkerFromFile,
+  runUntrustedCode,
+  runUntrustedFile
+} from '../src/index.js'
 
 const SECURITY_TIMEOUTS = {
   startupTimeoutMs: 5_000,
@@ -20,6 +25,41 @@ const SECURITY_TIMEOUTS = {
 async function evaluateInGuest (type, source, options = {}) {
   if (type === 'one-shot') {
     return runUntrustedCode(source, { timeoutMs: 5_000, ...options })
+  }
+
+  if (type === 'file-one-shot' || type === 'file-module') {
+    const root = fs.mkdtempSync(join(tmpdir(), 'secure-eval-security-files-'))
+    const entry = join(root, 'entry.mjs')
+    const fileSource = type === 'file-one-shot'
+      ? `export default async () => { ${source} }`
+      : `export default async ({ onMessage }) => {
+          const result = await (async () => { ${source} })()
+          onMessage(() => result)
+        }`
+    fs.writeFileSync(entry, fileSource)
+    try {
+      if (type === 'file-one-shot') {
+        return await runUntrustedFile(entry, {
+          rootDirectory: root,
+          timeoutMs: 5_000,
+          ...options
+        })
+      }
+      const session = await createUntrustedWorkerFromFile(entry, {
+        rootDirectory: root,
+        ...SECURITY_TIMEOUTS,
+        ...options
+      })
+      try {
+        await session.ready
+        return await session.request(null)
+      } finally {
+        await session.terminate()
+        await session.closed
+      }
+    } finally {
+      fs.rmSync(root, { force: true, recursive: true })
+    }
   }
 
   const componentSource = type === 'script'
@@ -44,7 +84,9 @@ async function evaluateInGuest (type, source, options = {}) {
   }
 }
 
-for (const type of ['one-shot', 'script', 'module']) {
+const EXECUTION_TYPES = ['one-shot', 'script', 'module', 'file-one-shot', 'file-module']
+
+for (const type of EXECUTION_TYPES) {
   test(`${type} cannot read files through node:sqlite`, async (t) => {
     const path = join(tmpdir(), `secure-eval-worker-${randomUUID()}.db`)
     const database = new DatabaseSync(path)
@@ -97,7 +139,7 @@ for (const type of ['one-shot', 'script', 'module']) {
         }),
         async () => process.binding('fs'),
         async () => process._linkedBinding('fs'),
-        async () => process.dlopen({}, '/tmp/untrusted.node'),
+        async () => process.dlopen({}, process.execPath),
         async () => {
           const { register } = await import('node:module')
           register('data:text/javascript,' + encodeURIComponent(${JSON.stringify(loaderSource)}))
@@ -165,6 +207,18 @@ for (const type of ['one-shot', 'script', 'module']) {
         const { queryObjects: bareNamed } = await import('v8')
         const module = await import('node:module')
         const require = module.createRequire(process.execPath)
+        const aliases = [
+          namespace,
+          namespace.default,
+          bareNamespace,
+          bareNamespace.default,
+          require('node:v8'),
+          require('v8'),
+          module.Module._load('node:v8'),
+          module.Module._load('v8'),
+          process.getBuiltinModule('node:v8'),
+          process.getBuiltinModule('v8')
+        ]
         const calls = [
           named,
           namespace.queryObjects,
@@ -172,25 +226,87 @@ for (const type of ['one-shot', 'script', 'module']) {
           bareNamed,
           bareNamespace.queryObjects,
           bareNamespace.default.queryObjects,
-          require('node:v8').queryObjects,
-          require('v8').queryObjects,
-          module.Module._load('node:v8').queryObjects,
-          module.Module._load('v8').queryObjects,
-          process.getBuiltinModule('node:v8').queryObjects,
-          process.getBuiltinModule('v8').queryObjects
+          ...aliases.slice(4).map((alias) => alias.queryObjects)
         ]
-        return calls.map((call) => {
+        const results = calls.map((call) => {
           try {
             return call(Map, { format: 'summary' }).some((value) => value.includes(${JSON.stringify(secret)}))
           } catch (error) {
             return error.code
           }
         })
+        for (const alias of aliases) {
+          for (const call of [
+            () => alias.promiseHooks.onInit(() => {}),
+            () => alias.startupSnapshot.addDeserializeCallback(() => {})
+          ]) {
+            try {
+              call()
+              results.push('ALLOWED')
+            } catch (error) {
+              results.push(error.code)
+            }
+          }
+        }
+        return results
       `)
-      assert.deepEqual(codes, Array(12).fill('ERR_ACCESS_DENIED'))
+      assert.deepEqual(codes, Array(32).fill('ERR_ACCESS_DENIED'))
     } finally {
       setEnvironmentData(key, undefined)
     }
+  })
+
+  test(`${type} cannot connect to the inspector through module aliases`, async () => {
+    const codes = await evaluateInGuest(type, `
+      const namespace = await import('node:inspector')
+      const bareNamespace = await import('inspector')
+      const promisesNamespace = await import('node:inspector/promises')
+      const module = await import('node:module')
+      const require = module.createRequire(process.execPath)
+      const constructors = [
+        namespace.Session,
+        namespace.default.Session,
+        bareNamespace.Session,
+        promisesNamespace.Session,
+        require('node:inspector').Session,
+        require('inspector/promises').Session,
+        module.Module._load('node:inspector').Session,
+        module.Module._load('inspector/promises').Session,
+        process.getBuiltinModule('node:inspector').Session,
+        process.getBuiltinModule('inspector/promises').Session
+      ]
+      const results = []
+      for (const Session of constructors) {
+        for (const method of ['connect', 'connectToMainThread']) {
+          const session = new Session()
+          try {
+            session[method]()
+            results.push('ALLOWED')
+          } catch (error) {
+            results.push(error.code)
+          }
+          try { session.disconnect() } catch {}
+        }
+      }
+      const openers = [
+        namespace.open,
+        namespace.default.open,
+        bareNamespace.open,
+        require('node:inspector').open,
+        module.Module._load('inspector').open,
+        process.getBuiltinModule('node:inspector').open
+      ]
+      for (const open of openers) {
+        try {
+          open(0)
+          results.push('ALLOWED')
+        } catch (error) {
+          results.push(error.code)
+        }
+      }
+      return results
+    `)
+    assert.deepEqual(codes, Array(26).fill('ERR_ACCESS_DENIED'))
   })
 
   test(`${type} cannot read worker environment data`, async () => {
@@ -212,6 +328,103 @@ for (const type of ['one-shot', 'script', 'module']) {
     }
   })
 }
+
+for (const type of ['file-one-shot', 'file-module']) {
+  test(`${type} denies outside reads, writes, child processes, network, and inspector`, async (t) => {
+    const outside = join(tmpdir(), `secure-eval-outside-${randomUUID()}.txt`)
+    fs.writeFileSync(outside, 'outside-secret')
+    t.after(() => fs.rmSync(outside, { force: true }))
+    const codes = await evaluateInGuest(type, `
+      const attempts = [
+        async () => (await import('node:fs')).readFileSync(${JSON.stringify(outside)}, 'utf8'),
+        async () => (await import('node:fs')).writeFileSync(${JSON.stringify(outside)}, 'changed'),
+        async () => (await import('node:child_process')).execFileSync(process.execPath),
+        async () => (await import('node:net')).connect({ port: 9 }),
+        async () => (await import('node:inspector')).open(0)
+      ]
+      return Promise.all(attempts.map(async (attempt) => {
+        try {
+          await attempt()
+          return 'ALLOWED'
+        } catch (error) {
+          return error.code
+        }
+      }))
+    `)
+    assert.deepEqual(codes, Array(5).fill('ERR_ACCESS_DENIED'))
+    assert.equal(fs.readFileSync(outside, 'utf8'), 'outside-secret')
+  })
+}
+
+test('sanitizes host process metadata in every execution mode', async () => {
+  for (const type of EXECUTION_TYPES) {
+    const result = await evaluateInGuest(type, `
+      const namespace = await import('node:process')
+      const builtin = process.getBuiltinModule('node:process')
+      const moduleNamespace = await import('node:module')
+      const bareModuleNamespace = await import('module')
+      const require = moduleNamespace.createRequire(process.execPath)
+      const calls = {}
+      for (const name of [
+        'availableMemory', 'constrainedMemory', 'cpuUsage', 'getegid', 'geteuid',
+        'getgid', 'getgroups', 'getuid', 'memoryUsage', 'resourceUsage', 'umask', 'uptime'
+      ]) {
+        calls[name] = [
+          process[name],
+          namespace[name],
+          namespace.default[name],
+          builtin[name]
+        ].map((call) => {
+          if (typeof call !== 'function') return 'ABSENT'
+          try {
+            call()
+            return 'ALLOWED'
+          } catch (error) {
+            return error.code
+          }
+        })
+      }
+      return {
+        calls,
+        globalPaths: [
+          moduleNamespace.globalPaths,
+          moduleNamespace.default.globalPaths,
+          moduleNamespace.Module.globalPaths,
+          bareModuleNamespace.globalPaths,
+          bareModuleNamespace.default.globalPaths,
+          require('node:module').globalPaths,
+          require('module').globalPaths,
+          moduleNamespace.Module._load('node:module').globalPaths,
+          moduleNamespace.Module._load('module').globalPaths,
+          process.getBuiltinModule('node:module').globalPaths,
+          process.getBuiltinModule('module').globalPaths
+        ],
+        argv0: [process.argv0, namespace.argv0, namespace.default.argv0, builtin.argv0],
+        cwd: [process.cwd(), namespace.cwd(), namespace.default.cwd(), builtin.cwd()],
+        execArgv: [process.execArgv, namespace.execArgv, namespace.default.execArgv, builtin.execArgv],
+        execPath: [process.execPath, namespace.execPath, namespace.default.execPath, builtin.execPath]
+      }
+    `)
+    assert.deepEqual(result.argv0, Array(4).fill(process.argv0), type)
+    assert.deepEqual(result.globalPaths, Array.from({ length: 11 }, () => []), type)
+    assert.equal(result.cwd.some((value) => value.includes(process.cwd())), false, type)
+    assert.deepEqual(result.execArgv[0], [], type)
+    assert.deepEqual(result.execArgv[2], [], type)
+    assert.deepEqual(result.execArgv[3], [], type)
+    assert.equal(result.execArgv[1] === undefined || result.execArgv[1].length === 0, true, type)
+    assert.equal(result.execPath.some((value) => value.includes(process.execPath)), false, type)
+    for (const codes of Object.values(result.calls)) {
+      assert.equal(codes[0], 'ERR_ACCESS_DENIED', type)
+      assert.equal(codes[2], 'ERR_ACCESS_DENIED', type)
+      assert.equal(codes[3], 'ERR_ACCESS_DENIED', type)
+      assert.equal(
+        codes[1] === 'ERR_ACCESS_DENIED' || codes[1] === 'ABSENT',
+        true,
+        type
+      )
+    }
+  }
+})
 
 test('does not inherit host command-line arguments', () => {
   const moduleUrl = new URL('../src/index.js', import.meta.url).href
@@ -375,6 +588,37 @@ test('throwing error listeners cannot create unhandled host-function rejections'
   assert.equal(result.status, 0, result.stderr)
 })
 
+test('throwing diagnostic and error listeners do not create unhandled rejections', () => {
+  const moduleUrl = new URL('../src/index.js', import.meta.url).href
+  const childSource = `
+    import { createUntrustedWorker } from ${JSON.stringify(moduleUrl)}
+    let leaked = false
+    process.on('unhandledRejection', () => { leaked = true })
+    process.on('uncaughtException', () => { leaked = true })
+    const session = createUntrustedWorker(\`
+      console.log('trigger')
+      await new Promise(() => {})
+    \`, {
+      diagnostics: true,
+      onDiagnostic () { throw new Error('callback boom') },
+      startupTimeoutMs: 5_000,
+      messageTimeoutMs: 5_000,
+      lifetimeTimeoutMs: 5_000
+    })
+    session.on('error', () => { throw new Error('listener boom') })
+    session.ready.catch(() => {})
+    await session.closed
+    await new Promise(resolve => setImmediate(resolve))
+    if (leaked) process.exitCode = 1
+  `
+  const result = spawnSync(process.execPath, ['--input-type=module', '--eval', childSource], {
+    encoding: 'utf8',
+    timeout: 30_000
+  })
+  assert.equal(result.signal, null, result.stderr)
+  assert.equal(result.status, 0, result.stderr)
+})
+
 test('host intrinsic poisoning cannot bypass shared-memory checks', async () => {
   const originalIsView = ArrayBuffer.isView
   const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype)
@@ -383,7 +627,7 @@ test('host intrinsic poisoning cannot bypass shared-memory checks', async () => 
   const shared = new SharedArrayBuffer(8)
   const values = [new Uint8Array(shared), new DataView(shared)]
 
-  try {
+  const poisonIntrinsics = () => {
     ArrayBuffer.isView = () => false
     Object.defineProperty(typedArrayPrototype, 'buffer', {
       configurable: true,
@@ -393,7 +637,15 @@ test('host intrinsic poisoning cannot bypass shared-memory checks', async () => 
       configurable: true,
       get: () => new ArrayBuffer(0)
     })
+  }
+  const restoreIntrinsics = () => {
+    ArrayBuffer.isView = originalIsView
+    Object.defineProperty(typedArrayPrototype, 'buffer', originalTypedBuffer)
+    Object.defineProperty(DataView.prototype, 'buffer', originalDataViewBuffer)
+  }
 
+  poisonIntrinsics()
+  try {
     for (const value of values) {
       assert.throws(
         () => runUntrustedCode('return input', { input: value }),
@@ -404,19 +656,22 @@ test('host intrinsic poisoning cannot bypass shared-memory checks', async () => 
         /shared memory/
       )
     }
+  } finally {
+    restoreIntrinsics()
+  }
 
-    const session = createUntrustedWorker('onMessage(value => value)', SECURITY_TIMEOUTS)
-    await session.ready
+  const session = createUntrustedWorker('onMessage(value => value)', SECURITY_TIMEOUTS)
+  await session.ready
+  poisonIntrinsics()
+  try {
     for (const value of values) {
       assert.throws(() => session.postMessage(value), /shared memory/)
       assert.throws(() => session.request(value), /shared memory/)
     }
-    await session.terminate()
   } finally {
-    ArrayBuffer.isView = originalIsView
-    Object.defineProperty(typedArrayPrototype, 'buffer', originalTypedBuffer)
-    Object.defineProperty(DataView.prototype, 'buffer', originalDataViewBuffer)
+    restoreIntrinsics()
   }
+  await session.terminate()
 })
 
 test('suppresses ordinary output and hides private protocol credentials', async () => {

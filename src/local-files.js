@@ -18,6 +18,40 @@ import { abortError, UntrustedCodeError } from './internal.js'
 
 const READ_CHUNK_BYTES = 64 * 1024
 export const SNAPSHOT_CLEANUP_SETTLE_MS = 250
+const SafePromise = Promise
+const safeAbortSignalAborted = Object.getOwnPropertyDescriptor(AbortSignal.prototype, 'aborted').get
+const safeAbortSignalReason = Object.getOwnPropertyDescriptor(AbortSignal.prototype, 'reason').get
+const safeClearTimeout = globalThis.clearTimeout
+const safeMathMin = Math.min
+const safeObjectFreeze = Object.freeze
+const safeProcessEmitWarning = process.emitWarning
+const safePromiseAll = Promise.all
+const safePromiseRace = Promise.race
+const safePromiseResolve = Promise.resolve
+const safePromiseThen = Promise.prototype.then
+const safeReflectApply = Reflect.apply
+const safeSetTimeout = globalThis.setTimeout
+const safeWeakMapGet = WeakMap.prototype.get
+const safeWeakMapSet = WeakMap.prototype.set
+const timeoutPrototypeProbe = safeSetTimeout(() => {}, 0)
+const safeTimeoutUnref = timeoutPrototypeProbe.unref
+safeClearTimeout(timeoutPrototypeProbe)
+const cleanupUntilRemovedByError = new WeakMap()
+
+function thenSafePromise (promise, onFulfilled, onRejected) {
+  return safeReflectApply(safePromiseThen, promise, [onFulfilled, onRejected])
+}
+
+function throwIfAborted (signal) {
+  if (signal && safeReflectApply(safeAbortSignalAborted, signal, [])) {
+    throw abortError(safeReflectApply(safeAbortSignalReason, signal, []))
+  }
+}
+
+export function getLocalModuleCleanupUntilRemoved (error) {
+  if ((typeof error !== 'object' || error === null) && typeof error !== 'function') return undefined
+  return safeReflectApply(safeWeakMapGet, cleanupUntilRemovedByError, [error])
+}
 
 function modulePathError (message, code) {
   return new UntrustedCodeError(message, { code })
@@ -48,10 +82,10 @@ function isWithin (root, candidate) {
 }
 
 async function canonicalPath (path, label, signal) {
-  if (signal?.aborted) throw abortError(signal.reason)
+  throwIfAborted(signal)
   try {
     const canonical = await realpath(path)
-    if (signal?.aborted) throw abortError(signal.reason)
+    throwIfAborted(signal)
     return canonical
   } catch (error) {
     if (error?.name === 'AbortError') throw error
@@ -63,9 +97,9 @@ async function readBoundedFile (handle, maxFileBytes, signal) {
   const chunks = []
   let total = 0
   while (true) {
-    if (signal?.aborted) throw abortError(signal.reason)
+    throwIfAborted(signal)
     const remaining = maxFileBytes - total + 1
-    const buffer = Buffer.allocUnsafe(Math.min(READ_CHUNK_BYTES, remaining))
+    const buffer = Buffer.allocUnsafe(safeMathMin(READ_CHUNK_BYTES, remaining))
     const { bytesRead } = await handle.read(buffer, 0, buffer.length, null)
     if (bytesRead === 0) break
     total += bytesRead
@@ -149,7 +183,11 @@ async function copyRegularFile (
     if (error instanceof UntrustedCodeError || error?.name === 'AbortError') throw error
     throw modulePathError('rootDirectory changed while it was being staged', 'ERR_UNTRUSTED_MODULE_CHANGED')
   } finally {
-    await handle?.close().catch(() => {})
+    if (handle) {
+      try {
+        await handle.close()
+      } catch {}
+    }
   }
 }
 
@@ -158,7 +196,7 @@ async function stageRootTree (rootPath, stagePath, limits, signal) {
   const accounting = { entries: 0, totalFileBytes: 0, stagedFiles: new Set() }
 
   while (pending.length > 0) {
-    if (signal?.aborted) throw abortError(signal.reason)
+    throwIfAborted(signal)
     const directory = pending.pop()
     const canonicalDirectory = await canonicalPath(directory.source, 'A root directory', signal)
     if (!isWithin(rootPath, canonicalDirectory)) {
@@ -170,7 +208,7 @@ async function stageRootTree (rootPath, stagePath, limits, signal) {
 
     try {
       for await (const entry of await opendir(directory.source)) {
-        if (signal?.aborted) throw abortError(signal.reason)
+        throwIfAborted(signal)
         if (++accounting.entries > limits.maxRootEntries) {
           throw modulePathError(
             `rootDirectory exceeds maxRootEntries (${limits.maxRootEntries})`,
@@ -222,19 +260,20 @@ export async function attemptLocalModuleCleanup (
   timeoutMs = SNAPSHOT_CLEANUP_SETTLE_MS
 ) {
   let timer
-  const timeout = new Promise((resolve) => {
-    timer = setTimeout(() => resolve(Object.freeze({ status: 'pending' })), timeoutMs)
+  const timeout = new SafePromise((resolve) => {
+    timer = safeSetTimeout(() => resolve(safeObjectFreeze({ status: 'pending' })), timeoutMs)
   })
-  const attempt = Promise.resolve()
-    .then(() => localModule.cleanup())
-    .then(
-      () => Object.freeze({ status: 'removed' }),
-      (error) => Object.freeze({ status: 'failed', error })
-    )
+  const resolved = safeReflectApply(safePromiseResolve, SafePromise, [])
+  const attempt = thenSafePromise(resolved, () => localModule.cleanup())
+  const outcome = thenSafePromise(
+    attempt,
+    () => safeObjectFreeze({ status: 'removed' }),
+    (error) => safeObjectFreeze({ status: 'failed', error })
+  )
   try {
-    return await Promise.race([attempt, timeout])
+    return await safeReflectApply(safePromiseRace, SafePromise, [[outcome, timeout]])
   } finally {
-    clearTimeout(timer)
+    safeClearTimeout(timer)
   }
 }
 
@@ -261,7 +300,9 @@ export async function resolveLocalModule (modulePath, rootDirectory, limits, sig
   let rootStats
   let entryStats
   try {
-    ;[rootStats, entryStats] = await Promise.all([stat(rootPath), stat(entryPath)])
+    ;[rootStats, entryStats] = await safeReflectApply(safePromiseAll, SafePromise, [
+      [stat(rootPath), stat(entryPath)]
+    ])
   } catch {
     throw modulePathError('The local module paths could not be inspected', 'ERR_UNTRUSTED_MODULE_PATH')
   }
@@ -306,15 +347,18 @@ export async function resolveLocalModule (modulePath, rootDirectory, limits, sig
       } catch {
         if (!warned) {
           warned = true
-          process.emitWarning('A private module snapshot could not be removed', {
-            code: 'ERR_UNTRUSTED_MODULE_CLEANUP'
-          })
+          try {
+            safeReflectApply(safeProcessEmitWarning, process, [
+              'A private module snapshot could not be removed',
+              { code: 'ERR_UNTRUSTED_MODULE_CLEANUP' }
+            ])
+          } catch {}
         }
-        await new Promise((resolve) => {
-          const timer = setTimeout(resolve, retryDelayMs)
-          timer.unref()
+        await new SafePromise((resolve) => {
+          const timer = safeSetTimeout(resolve, retryDelayMs)
+          safeReflectApply(safeTimeoutUnref, timer, [])
         })
-        retryDelayMs = Math.min(retryDelayMs * 2, 60_000)
+        retryDelayMs = safeMathMin(retryDelayMs * 2, 60_000)
       }
     }
   }
@@ -328,7 +372,7 @@ export async function resolveLocalModule (modulePath, rootDirectory, limits, sig
       )
     }
     const stagedFiles = await stageRootTree(rootPath, stagePath, limits, signal)
-    if (signal?.aborted) throw abortError(signal.reason)
+    throwIfAborted(signal)
 
     const entryRelativePath = relative(rootPath, entryPath)
     if (!stagedFiles.has(entryRelativePath)) {
@@ -356,9 +400,10 @@ export async function resolveLocalModule (modulePath, rootDirectory, limits, sig
         'The private module snapshot could not be removed',
         'ERR_UNTRUSTED_MODULE_CLEANUP'
       )
-      Object.defineProperty(error, 'cleanupUntilRemoved', {
-        value: cleanupUntilRemoved
-      })
+      safeReflectApply(safeWeakMapSet, cleanupUntilRemovedByError, [
+        error,
+        cleanupUntilRemoved
+      ])
       throw error
     }
     throw error

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
-import { mkdtemp, mkdir, open, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises'
+import { cp, mkdtemp, mkdir, open, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { platform, tmpdir } from 'node:os'
 import { join, sep } from 'node:path'
 import { test } from 'node:test'
@@ -225,8 +225,14 @@ test('bounds guest-opened descriptors across every filesystem alias', async (t) 
   }), 'ERR_UNTRUSTED_FILE_DESCRIPTOR_LIMIT')
 })
 
-test('enforces a fixed process-wide descriptor quota and releases it on exit', async (t) => {
+test('physical package copies share the descriptor quota and release it on exit', async (t) => {
   configureWorkerAdmission({ maxConcurrentWorkers: 5 })
+  const temporary = await mkdtemp(join(tmpdir(), 'secure-eval-worker-descriptor-copy-'))
+  const copyRoot = join(temporary, 'copy')
+  await mkdir(copyRoot)
+  await cp(new URL('../src', import.meta.url), join(copyRoot, 'src'), { recursive: true })
+  await writeFile(join(copyRoot, 'package.json'), '{"type":"module"}')
+  const copy = await import(pathToFileURL(join(copyRoot, 'src/index.js')).href)
   const files = await fixture({
     'entry.mjs': `
       import fs from 'node:fs'
@@ -249,11 +255,17 @@ test('enforces a fixed process-wide descriptor quota and releases it on exit', a
   t.after(async () => {
     await Promise.all(sessions.map((session) => session.terminate().catch(() => {})))
     configureWorkerAdmission({ maxConcurrentWorkers: 4 })
-    await files.cleanup()
+    await Promise.all([
+      files.cleanup(),
+      rm(temporary, { force: true, recursive: true })
+    ])
   })
 
   for (let index = 0; index < 5; index++) {
-    const session = await createUntrustedWorkerFromFile(files.path('entry.mjs'), {
+    const createSession = index === 4
+      ? copy.createUntrustedWorkerFromFile
+      : createUntrustedWorkerFromFile
+    const session = await createSession(files.path('entry.mjs'), {
       ...TIMEOUTS,
       lifetimeTimeoutMs: 15_000,
       rootDirectory: files.directory
@@ -418,6 +430,14 @@ test('validates local-file options without invoking accessors', async (t) => {
     runUntrustedFile(files.path('entry.mjs'), { language: 'javascript' }),
     /not supported for local module files/
   )
+  await assert.rejects(
+    runUntrustedFile(files.path('entry.mjs'), { maxRootEntry: 1 }),
+    /Unknown option: maxRootEntry/
+  )
+  await assert.rejects(
+    createUntrustedWorkerFromFile(files.path('entry.mjs'), { messageTimeoutMS: 1 }),
+    /Unknown option: messageTimeoutMS/
+  )
   await assert.rejects(runUntrustedFile('https://example.com/entry.mjs'), /path string or file URL/)
   await assert.rejects(
     runUntrustedFile(new URL('https://example.com/entry.mjs')),
@@ -448,6 +468,121 @@ test('validates local-file options without invoking accessors', async (t) => {
     (error) => error.code === 'ABORT_ERR' &&
       error.cause?.message === 'expected abort'
   )
+})
+
+test('hostile path errors cannot forge snapshot cleanup ownership', async (t) => {
+  configureWorkerAdmission({ maxConcurrentWorkers: 1 })
+  const files = await fixture({ 'entry.mjs': 'export default () => 42' })
+  t.after(() => files.cleanup())
+
+  const forgedError = Object.defineProperty({}, 'cleanupUntilRemoved', {
+    get () { throw new Error('forged cleanup metadata') }
+  })
+  const modulePath = new Proxy({}, {
+    getPrototypeOf () { throw forgedError }
+  })
+  await assert.rejects(
+    runUntrustedFile(modulePath, { timeoutMs: 5_000 }),
+    (error) => error === forgedError
+  )
+  assert.equal(await runUntrustedFile(files.path('entry.mjs'), {
+    rootDirectory: files.directory,
+    timeoutMs: 5_000
+  }), 42)
+})
+
+test('snapshot cleanup uses captured promise operations', async (t) => {
+  configureWorkerAdmission({ maxConcurrentWorkers: 1 })
+  const files = await fixture({
+    'entry.mjs': 'export default ({ onMessage }) => onMessage(() => 42)',
+    'one-shot.mjs': 'export default () => 42'
+  })
+  t.after(() => files.cleanup())
+
+  const originalAll = Promise.all
+  const originalRace = Promise.race
+  let session
+  try {
+    const options = new Proxy({ ...TIMEOUTS, rootDirectory: files.directory }, {
+      ownKeys (target) {
+        Promise.all = () => new Promise(() => {})
+        Promise.race = () => new Promise(() => {})
+        return Reflect.ownKeys(target)
+      }
+    })
+    session = await createUntrustedWorkerFromFile(files.path('entry.mjs'), options)
+    await session.ready
+    assert.equal(await session.request(null), 42)
+    await session.terminate()
+  } finally {
+    Promise.all = originalAll
+    Promise.race = originalRace
+  }
+
+  await session.closed
+  assert.equal(await runUntrustedFile(files.path('one-shot.mjs'), {
+    rootDirectory: files.directory,
+    timeoutMs: 5_000
+  }), 42)
+})
+
+test('local-file deadlines use a captured clock', async (t) => {
+  configureWorkerAdmission({ maxConcurrentWorkers: 1 })
+  const files = await fixture({ 'entry.mjs': 'export default () => 42' })
+  t.after(() => files.cleanup())
+
+  const originalNow = Date.now
+  try {
+    const options = new Proxy({ rootDirectory: files.directory, timeoutMs: 5_000 }, {
+      ownKeys (target) {
+        Date.now = () => { throw new Error('poisoned Date.now') }
+        return Reflect.ownKeys(target)
+      }
+    })
+    assert.equal(await runUntrustedFile(files.path('entry.mjs'), options), 42)
+  } finally {
+    Date.now = originalNow
+  }
+
+  assert.equal(await runUntrustedFile(files.path('entry.mjs'), {
+    rootDirectory: files.directory,
+    timeoutMs: 5_000
+  }), 42)
+})
+
+test('descriptor cleanup uses captured atomic operations', async (t) => {
+  configureWorkerAdmission({ maxConcurrentWorkers: 1 })
+  const files = await fixture({
+    'entry.mjs': 'export default ({ onMessage }) => onMessage(() => 42)'
+  })
+  t.after(() => files.cleanup())
+
+  const originalCompareExchange = Atomics.compareExchange
+  let session
+  try {
+    const options = new Proxy({ ...TIMEOUTS, rootDirectory: files.directory }, {
+      ownKeys (target) {
+        Atomics.compareExchange = () => { throw new Error('poisoned Atomics.compareExchange') }
+        return Reflect.ownKeys(target)
+      }
+    })
+    session = await createUntrustedWorkerFromFile(files.path('entry.mjs'), options)
+    await session.ready
+    assert.equal(await session.request(null), 42)
+    await session.terminate()
+    await session.closed
+  } finally {
+    Atomics.compareExchange = originalCompareExchange
+    await session?.terminate().catch(() => {})
+  }
+
+  const replacement = await createUntrustedWorkerFromFile(files.path('entry.mjs'), {
+    ...TIMEOUTS,
+    rootDirectory: files.directory
+  })
+  await replacement.ready
+  await replacement.terminate()
+  await replacement.closed
 })
 
 test('snapshots input and nested policies before asynchronous scanning', async (t) => {
@@ -626,6 +761,37 @@ test('persistent cleanup settles while a stalled janitor retains preparation', a
   resolveJanitor()
   await new Promise((resolve) => setImmediate(resolve))
   assert.equal(releasePreparationCalls, 1)
+})
+
+test('janitor rejection retains unresolved preparation ownership', async (t) => {
+  const files = await fixture({
+    'entry.mjs': 'export default ({ onMessage }) => onMessage(() => 42)'
+  })
+  t.after(() => files.cleanup())
+  let releasePreparationCalls = 0
+  const rootPathPrefix = files.directory.endsWith(sep)
+    ? files.directory
+    : files.directory + sep
+  const localModule = {
+    entryUrl: pathToFileURL(files.path('entry.mjs')).href,
+    rootPath: files.directory,
+    rootPathPrefix,
+    rootUrlPrefix: pathToFileURL(rootPathPrefix).href,
+    cleanup: () => new Promise(() => {}),
+    cleanupUntilRemoved: () => Promise.reject(new Error('janitor failed'))
+  }
+  const session = createUntrustedFileSession(
+    localModule,
+    TIMEOUTS,
+    false,
+    () => {},
+    () => { releasePreparationCalls++ }
+  )
+  await session.ready
+  await session.terminate()
+  await session.closed
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(releasePreparationCalls, 0)
 })
 
 test('surfaces snapshot cleanup failures under host permissions', {

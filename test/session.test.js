@@ -545,50 +545,126 @@ test('request options ignore inherited deadlines and reject accessors', async ()
     }
   })
   assert.throws(() => next.request(null, accessor), /enumerable data property/)
+  assert.throws(() => next.request(null, { timeoutMS: 5_000 }), /Unknown option: timeoutMS/)
   assert.equal(reads, 0)
   await next.terminate()
 })
 
-test('request deadlines include synchronous cloning and serialization', async () => {
+test('request rechecks state after hostile option inspection before cloning input', async () => {
   const session = createUntrustedWorker('onMessage(value => value)', {
     startupTimeoutMs: 5_000,
     messageTimeoutMs: 5_000,
     lifetimeTimeoutMs: 5_000
   })
   await session.ready
-  const value = {
-    get slow () {
-      const end = Date.now() + 50
-      while (Date.now() < end) {}
+  let inputReads = 0
+  const input = Object.defineProperty({}, 'value', {
+    enumerable: true,
+    get () {
+      inputReads++
       return 42
     }
+  })
+  const options = new Proxy({}, {
+    ownKeys () {
+      void session.terminate()
+      return []
+    }
+  })
+  assert.throws(
+    () => session.request(input, options),
+    /terminated|closed/
+  )
+  assert.equal(inputReads, 0)
+  await session.closed
+})
+
+test('request deadlines include synchronous cloning and serialization', async () => {
+  const session = createUntrustedWorker('onMessage(value => value)', {
+    startupTimeoutMs: 5_000,
+    messageTimeoutMs: 5_000,
+    lifetimeTimeoutMs: 5_000,
+    maxMessageBytes: 8 * 1024 * 1024
+  })
+  await session.ready
+  const value = Array.from({ length: 100_000 }, (_, index) => index)
+  const nativePromiseReject = Promise.reject
+  const options = new Proxy({}, {
+    ownKeys () {
+      Promise.reject = () => new Promise(() => {})
+      return ['timeoutMs']
+    },
+    getOwnPropertyDescriptor () {
+      return { configurable: true, enumerable: true, value: 1, writable: true }
+    }
+  })
+  let request
+  try {
+    request = session.request(value, options)
+  } finally {
+    Promise.reject = nativePromiseReject
   }
 
   await assert.rejects(
-    session.request(value, { timeoutMs: 10 }),
+    request,
     (error) => error.code === 'ERR_UNTRUSTED_WORKER_MESSAGE_TIMEOUT'
   )
   await session.closed
 })
 
-test('postMessage rechecks session state after cloning', async () => {
+test('postMessage rejects accessors without invoking them', async () => {
   const session = createUntrustedWorker('onMessage(() => null)', {
     startupTimeoutMs: 5_000,
     messageTimeoutMs: 5_000,
     lifetimeTimeoutMs: 5_000
   })
   await session.ready
+  let reads = 0
+  const value = Object.defineProperty({}, 'value', {
+    enumerable: true,
+    get () {
+      reads++
+      return 42
+    }
+  })
 
   assert.throws(
-    () => session.postMessage({
-      get value () {
-        void session.terminate()
-        return 42
-      }
-    }),
-    (error) => error.code === 'ERR_UNTRUSTED_WORKER_CLOSED'
+    () => session.postMessage(value),
+    /enumerable data properties/
   )
-  await session.closed
+  assert.equal(reads, 0)
+  await session.terminate()
+})
+
+test('caller-defined lifecycle fields cannot suppress trusted termination', async () => {
+  const session = createUntrustedWorker(`
+    onMessage(() => { while (true) {} })
+  `, {
+    startupTimeoutMs: 5_000,
+    messageTimeoutMs: 5_000,
+    lifetimeTimeoutMs: 5_000
+  })
+  await session.ready
+  const closed = session.closed
+  Object.defineProperties(session, {
+    closedSettled: { value: true },
+    fail: { value: () => {} },
+    handleExit: { value: () => {} },
+    hostAbortController: {
+      value: { abort () { throw new Error('caller abort') } }
+    },
+    pending: { value: new Map() },
+    readySettled: { value: true },
+    settleWithoutWorkerExit: { value: () => {} },
+    state: { value: 'closed' },
+    termination: { value: Promise.resolve() }
+  })
+
+  await assert.rejects(
+    session.request(null, { timeoutMs: 50 }),
+    (error) => error.code === 'ERR_UNTRUSTED_WORKER_MESSAGE_TIMEOUT'
+  )
+  assert.equal((await closed).error.code, 'ERR_UNTRUSTED_WORKER_MESSAGE_TIMEOUT')
 })
 
 test('message timeout terminates a hanging handler and rejects pending requests', async () => {
@@ -765,6 +841,31 @@ test('ignores inherited persistent capabilities and limits', async () => {
 
 test('validates session options', () => {
   assert.throws(() => createUntrustedWorker(null), /source must be a string/)
+  assert.throws(
+    () => createUntrustedWorker('', { lifetimeTimeoutMS: 1 }),
+    /Unknown option: lifetimeTimeoutMS/
+  )
+  const nativeArrayIterator = Array.prototype[Symbol.iterator]
+  const nativeSetHas = Set.prototype.has
+  const hostileOptions = new Proxy({}, {
+    ownKeys () {
+      Array.prototype[Symbol.iterator] = function * () {}
+      Set.prototype.has = () => true
+      return ['lifetimeTimeoutMS']
+    },
+    getOwnPropertyDescriptor () {
+      return { configurable: true, enumerable: true, value: 1, writable: true }
+    }
+  })
+  try {
+    assert.throws(
+      () => createUntrustedWorker('', hostileOptions),
+      /Unknown option: lifetimeTimeoutMS/
+    )
+  } finally {
+    Array.prototype[Symbol.iterator] = nativeArrayIterator
+    Set.prototype.has = nativeSetHas
+  }
   assert.throws(() => createUntrustedWorker('', { type: 'file' }), /type must be/)
   assert.throws(
     () => createUntrustedWorker('', { startupTimeoutMs: 2_147_483_648 }),

@@ -2,7 +2,9 @@
 
 `Error` and `AggregateError` remain unsupported as ordinary protocol values.
 Thrown guest errors and host-function failures continue to use their dedicated,
-bounded error channels.
+bounded error channels. Guest-controlled error names, messages, codes, and
+stacks have control characters escaped before reaching host logs or error
+objects.
 
 Node's native structured clone and V8 serializer copy implementation-dependent
 error state, including stacks and causes. On the supported Node 26 endpoints,
@@ -11,6 +13,12 @@ through V8 serialization. Passing native errors would therefore risk host stack
 leakage and inconsistent semantics. A custom tagged codec would also need
 unforgeable provenance, graph-wide cycle and alias preservation, hostile
 property handling, and independent depth/member work limits.
+
+Protocol objects are validated before cloning. Custom class instances are
+rejected. Plain objects and arrays may contain only enumerable data properties,
+so their accessors, symbols, and non-enumerable properties are also rejected
+rather than silently normalized. Null-prototype objects are accepted as explicit data,
+but Node's structured-clone boundary normalizes them to ordinary objects.
 
 The safer contract is explicit application data:
 

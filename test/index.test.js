@@ -79,6 +79,95 @@ test('returns a structured-cloneable result', async () => {
   assert.deepEqual(result, { total: 42 })
 })
 
+test('validates protocol object semantics before structured cloning', async () => {
+  class AuthorityBearingValue {
+    constructor () {
+      this.value = 42
+    }
+  }
+  assert.throws(
+    () => runUntrustedCode('return input', { input: new AuthorityBearingValue() }),
+    /unsupported value/
+  )
+  class AuthorityMap extends Map {}
+  assert.throws(
+    () => runUntrustedCode('return input', { input: new AuthorityMap([['value', 42]]) }),
+    /unsupported value/
+  )
+  await assert.rejects(
+    runUntrustedCode(`
+      class AuthorityBearingValue {
+        constructor () { this.value = 42 }
+      }
+      return new AuthorityBearingValue()
+    `, { timeoutMs: 5_000 }),
+    /unsupported/i
+  )
+  await assert.rejects(
+    runUntrustedCode(`
+      class AuthorityBearingValue {
+        constructor () { this.value = 42 }
+      }
+      const value = new AuthorityBearingValue()
+      const NativeWeakSet = WeakSet
+      globalThis.WeakSet = class extends NativeWeakSet {
+        constructor () { super([value]) }
+      }
+      return value
+    `, { timeoutMs: 5_000 }),
+    /unsupported/i
+  )
+  await assert.rejects(
+    runUntrustedCode(`
+      class AuthorityBearingValue {
+        constructor () { this.value = 42 }
+      }
+      const value = { nested: new AuthorityBearingValue() }
+      Array.prototype[Symbol.iterator] = function * () {}
+      return value
+    `, { timeoutMs: 5_000 }),
+    /unsupported/i
+  )
+
+  const nativeWeakSet = globalThis.WeakSet
+  const value = new AuthorityBearingValue()
+  globalThis.WeakSet = class extends nativeWeakSet {
+    constructor () { super([value]) }
+  }
+  try {
+    assert.throws(
+      () => runUntrustedCode('return input', { input: value }),
+      /unsupported value/
+    )
+  } finally {
+    globalThis.WeakSet = nativeWeakSet
+  }
+
+  let reads = 0
+  const accessor = Object.defineProperty({}, 'value', {
+    enumerable: true,
+    get () {
+      reads++
+      return 42
+    }
+  })
+  assert.throws(
+    () => runUntrustedCode('return input', { input: accessor }),
+    /enumerable data properties/
+  )
+  assert.equal(reads, 0)
+
+  const nullPrototype = Object.create(null)
+  nullPrototype.value = 42
+  assert.deepEqual(
+    await runUntrustedCode('return { value: input.value, ordinary: Object.getPrototypeOf(input) === Object.prototype }', {
+      input: nullPrototype,
+      timeoutMs: 5_000
+    }),
+    { value: 42, ordinary: true }
+  )
+})
+
 test('preserves the one-shot source binding contract', async () => {
   assert.deepEqual(await runUntrustedCode(`
     if (typeof postToHost === 'function') {
@@ -233,7 +322,7 @@ test('denies filesystem access', async () => {
   await assert.rejects(
     runUntrustedCode(`
       const fs = await import('node:fs/promises')
-      return fs.readFile('/etc/passwd', 'utf8')
+      return fs.readFile(${JSON.stringify(process.execPath)}, 'utf8')
     `, { timeoutMs: 5_000 }),
     (error) => error instanceof UntrustedCodeError && error.remoteCode === 'ERR_ACCESS_DENIED'
   )
@@ -305,28 +394,54 @@ test('terminates source that exceeds its deadline', async () => {
 
 test('termination settlement is bounded during uninterruptible native work', async () => {
   const childSource = `
-    import { configureWorkerAdmission, runUntrustedCode } from ${JSON.stringify(packageUrl)}
+    import {
+      configureWorkerAdmission,
+      createUntrustedWorker,
+      runUntrustedCode
+    } from ${JSON.stringify(packageUrl)}
     configureWorkerAdmission({ maxConcurrentWorkers: 1 })
-    const startedAt = Date.now()
-    try {
-      await runUntrustedCode(\`
-        const { pbkdf2Sync } = await import('node:crypto')
+    const session = createUntrustedWorker(\`
+      const { pbkdf2Sync } = await import('node:crypto')
+      onMessage(() => {
+        send('native-started')
         pbkdf2Sync('password', 'salt', 1_000_000_000, 32, 'sha256')
-        return 1
-      \`, { timeoutMs: 500 })
-    } catch (error) {
-      let retainedCode
-      try {
-        await runUntrustedCode('return 42', { timeoutMs: 500 })
-      } catch (retainedError) {
-        retainedCode = retainedError.code
-      }
-      console.log(JSON.stringify({
-        code: error.code,
-        elapsedMs: Date.now() - startedAt,
-        retainedCode
-      }))
+      })
+    \`, {
+      startupTimeoutMs: 5_000,
+      messageTimeoutMs: 5_000,
+      lifetimeTimeoutMs: 30_000
+    })
+    await session.ready
+    const enteredNativeWork = new Promise((resolve) => session.once('message', resolve))
+    session.postMessage(null)
+    await enteredNativeWork
+    // The marker is posted immediately before the native call. Observe enough
+    // additional process CPU to prove the worker entered CPU-bound native work;
+    // the main thread sleeps between samples and has no other active work.
+    const baselineCpu = process.cpuUsage()
+    while (true) {
+      await new Promise((resolve) => setTimeout(resolve, 10))
+      const usage = process.cpuUsage(baselineCpu)
+      if (usage.user + usage.system >= 100_000) break
     }
+    const startedAt = Date.now()
+    let code
+    try {
+      await session.terminate()
+    } catch (error) {
+      code = error.code
+    }
+    let retainedCode
+    try {
+      await runUntrustedCode('return 42', { timeoutMs: 500 })
+    } catch (error) {
+      retainedCode = error.code
+    }
+    console.log(JSON.stringify({
+      code,
+      elapsedMs: Date.now() - startedAt,
+      retainedCode
+    }))
   `
   const child = spawn(process.execPath, [
     '--input-type=module',
@@ -342,10 +457,16 @@ test('termination settlement is bounded during uninterruptible native work', asy
     }, 5_000)
     child.stdout.on('data', (chunk) => {
       stdout += chunk
-      const line = stdout.trim()
+      const newlineIndex = stdout.indexOf('\n')
+      if (newlineIndex < 0) return
+      const line = stdout.slice(0, newlineIndex).trim()
       if (!line) return
       clearTimeout(timer)
-      resolve(JSON.parse(line))
+      try {
+        resolve(JSON.parse(line))
+      } catch (error) {
+        reject(error)
+      }
       child.kill('SIGKILL')
     })
     child.stderr.on('data', (chunk) => { stderr += chunk })
@@ -354,9 +475,9 @@ test('termination settlement is bounded during uninterruptible native work', asy
       reject(error)
     })
   })
-  assert.equal(result.code, 'ERR_UNTRUSTED_CODE_TERMINATION_TIMEOUT')
+  assert.equal(result.code, 'ERR_UNTRUSTED_WORKER_TERMINATION_TIMEOUT')
   assert.equal(result.retainedCode, 'ERR_UNTRUSTED_CODE_CAPACITY')
-  assert.ok(result.elapsedMs >= 1_500 && result.elapsedMs < 4_500)
+  assert.ok(result.elapsedMs >= 1_000 && result.elapsedMs < 4_000)
 })
 
 test('supports cancellation', async () => {
@@ -369,36 +490,15 @@ test('supports cancellation', async () => {
   await assert.rejects(result, (error) => error.name === 'AbortError')
 })
 
-test('does not lose an abort triggered while cloning input', async () => {
-  const controller = new AbortController()
-  const input = {
-    get value () {
-      controller.abort('during clone')
-      return 42
-    }
-  }
+test('includes synchronous input validation and cloning in the deadline', async () => {
+  const input = Array.from({ length: 200_000 }, (_, index) => index)
 
   await assert.rejects(
-    runUntrustedCode('return input.value', {
+    runUntrustedCode('return input.length', {
       input,
-      signal: controller.signal,
-      timeoutMs: 5_000
+      maxInputBytes: 16 * 1024 * 1024,
+      timeoutMs: 1
     }),
-    (error) => error.name === 'AbortError'
-  )
-})
-
-test('includes synchronous input cloning in the deadline', async () => {
-  const input = {
-    get slow () {
-      const end = Date.now() + 50
-      while (Date.now() < end) {}
-      return true
-    }
-  }
-
-  await assert.rejects(
-    runUntrustedCode('return input.slow', { input, timeoutMs: 10 }),
     (error) => error.code === 'ERR_UNTRUSTED_CODE_TIMEOUT'
   )
 })
@@ -456,6 +556,27 @@ throw new Error('located')`, { timeoutMs: 5_000 }),
   )
 })
 
+test('remote error metadata escapes control characters', async () => {
+  await assert.rejects(
+    runUntrustedCode(`
+      const error = new Error('line one\\n\\u001b[31mline two')
+      error.name = 'Bad\\rName'
+      error.code = 'BAD\\u0000CODE'
+      throw error
+    `, { timeoutMs: 5_000 }),
+    (error) => {
+      assert.equal(/[\u0000-\u001f\u007f-\u009f]/u.test(error.message), false)
+      assert.equal(
+        error.message,
+        'Bad\\u000dName: line one\\u000a\\u001b[31mline two'
+      )
+      assert.equal(error.remoteCode, 'BAD\\u0000CODE')
+      assert.equal(error.remoteStack.includes('\u001b'), false)
+      return true
+    }
+  )
+})
+
 test('remote stacks remain bounded sanitized untrusted diagnostics', async () => {
   await assert.rejects(
     runUntrustedCode(`
@@ -504,16 +625,64 @@ test('reports syntax, runtime, and clone errors', async (t) => {
     )
   })
 
-  await t.test('non-cloneable result', async () => {
+  await t.test('unsupported result', async () => {
     await assert.rejects(
       runUntrustedCode('return () => {}', { timeoutMs: 5_000 }),
-      /DataCloneError/
+      /unsupported/i
     )
   })
 })
 
 test('validates source and options', async () => {
   assert.throws(() => runUntrustedCode(null), /source must be a string/)
+  assert.throws(
+    () => runUntrustedCode('return 1', { timeoutMS: 1 }),
+    /Unknown option: timeoutMS/
+  )
+  const nativeArrayIterator = Array.prototype[Symbol.iterator]
+  const nativeSetHas = Set.prototype.has
+  const hostileOptions = new Proxy({}, {
+    ownKeys () {
+      Array.prototype[Symbol.iterator] = function * () {}
+      Set.prototype.has = () => true
+      return ['timeoutMS']
+    },
+    getOwnPropertyDescriptor () {
+      return { configurable: true, enumerable: true, value: 1, writable: true }
+    }
+  })
+  try {
+    assert.throws(
+      () => runUntrustedCode('return 1', hostileOptions),
+      /Unknown option: timeoutMS/
+    )
+  } finally {
+    Array.prototype[Symbol.iterator] = nativeArrayIterator
+    Set.prototype.has = nativeSetHas
+  }
+  const nativeIsSafeInteger = Number.isSafeInteger
+  const hostileLimit = new Proxy({}, {
+    ownKeys () {
+      Number.isSafeInteger = () => true
+      return ['maxMessageBytes']
+    },
+    getOwnPropertyDescriptor () {
+      return { configurable: true, enumerable: true, value: Number.NaN, writable: true }
+    }
+  })
+  try {
+    assert.throws(
+      () => runUntrustedCode('return 1', hostileLimit),
+      /positive integer/
+    )
+  } finally {
+    Number.isSafeInteger = nativeIsSafeInteger
+  }
+  const runner = createRunner()
+  assert.throws(
+    () => runner('return 1', { maxInputByte: 1 }),
+    /Unknown option: maxInputByte/
+  )
   assert.throws(() => runUntrustedCode('return 1', { timeoutMs: 0 }), /positive integer/)
   assert.throws(
     () => runUntrustedCode('return 1', { timeoutMs: 2_147_483_648 }),

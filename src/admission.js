@@ -9,6 +9,16 @@ const MAX_PROCESS_FILE_DESCRIPTORS = 256
 const STATE_KEY = Symbol.for('secure-eval-worker.admission.main.v1')
 const PREPARATION_STATE_KEY = Symbol.for('secure-eval-worker.admission.preparation.main.v1')
 const DESCRIPTOR_STATE_KEY = Symbol.for('secure-eval-worker.admission.descriptors.main.v1')
+const safeAtomics = Atomics
+const atomicsCompareExchange = Atomics.compareExchange
+const arrayIsArray = Array.isArray
+const numberIsSafeInteger = Number.isSafeInteger
+const objectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor
+const reflectApply = Reflect.apply
+const reflectOwnKeys = Reflect.ownKeys
+const setAdd = Set.prototype.add
+const setDelete = Set.prototype.delete
+const setHas = Set.prototype.has
 
 function capacityError (message) {
   return new UntrustedCodeError(message, { code: 'ERR_UNTRUSTED_WORKER_CAPACITY' })
@@ -53,11 +63,11 @@ function createDescriptorState () {
 
   return Object.freeze({
     createWorkerQuota () {
-      while (activeOwners.has(nextOwner)) {
+      while (reflectApply(setHas, activeOwners, [nextOwner])) {
         nextOwner = nextOwner === 0x7fffffff ? 1 : nextOwner + 1
       }
       const owner = nextOwner
-      activeOwners.add(owner)
+      reflectApply(setAdd, activeOwners, [owner])
       nextOwner = nextOwner === 0x7fffffff ? 1 : nextOwner + 1
       let released = false
       return Object.freeze({
@@ -67,9 +77,9 @@ function createDescriptorState () {
           if (released) return
           released = true
           for (let index = 0; index < slots.length; index++) {
-            Atomics.compareExchange(slots, index, owner, 0)
+            reflectApply(atomicsCompareExchange, safeAtomics, [slots, index, owner, 0])
           }
-          activeOwners.delete(owner)
+          reflectApply(setDelete, activeOwners, [owner])
         }
       })
     }
@@ -165,22 +175,29 @@ export function createFileDescriptorQuota () {
 }
 
 export function configureWorkerAdmission (options) {
-  if (options === null || typeof options !== 'object' || Array.isArray(options)) {
+  if (options === null || typeof options !== 'object' ||
+      reflectApply(arrayIsArray, Array, [options])) {
     throw new TypeError('admission options must be an object')
   }
-  const keys = Reflect.ownKeys(options)
-  if (keys.some((key) => typeof key === 'symbol')) {
-    throw new TypeError('admission options must not contain symbol properties')
+  const keys = reflectOwnKeys(options)
+  for (let index = 0; index < keys.length; index++) {
+    const key = keys[index]
+    if (typeof key === 'symbol') {
+      throw new TypeError('admission options must not contain symbol properties')
+    }
+    if (key !== 'maxConcurrentWorkers') {
+      throw new TypeError(`Unknown admission option: ${key}`)
+    }
   }
-  const unknown = keys.filter((key) => key !== 'maxConcurrentWorkers')
-  if (unknown.length > 0) {
-    throw new TypeError(`Unknown admission option: ${unknown[0]}`)
-  }
-  const descriptor = Object.getOwnPropertyDescriptor(options, 'maxConcurrentWorkers')
+  const descriptor = reflectApply(
+    objectGetOwnPropertyDescriptor,
+    Object,
+    [options, 'maxConcurrentWorkers']
+  )
   if (!descriptor || !('value' in descriptor)) {
     throw new TypeError('maxConcurrentWorkers must be a data property')
   }
-  if (!Number.isSafeInteger(descriptor.value) || descriptor.value <= 0) {
+  if (!reflectApply(numberIsSafeInteger, Number, [descriptor.value]) || descriptor.value <= 0) {
     throw new RangeError('maxConcurrentWorkers must be a positive integer')
   }
   const admissionState = requireState()

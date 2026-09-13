@@ -152,6 +152,7 @@ export interface UntrustedWorkerClosedResult {
 
 export type UntrustedWorkerState = 'starting' | 'ready' | 'closing' | 'closed'
 
+/** Security-sensitive final class. Runtime construction of subclasses throws. */
 export class UntrustedWorkerSession<
   InboundMessage = unknown,
   Response = unknown,
