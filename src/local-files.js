@@ -10,7 +10,7 @@ import {
   stat,
   writeFile
 } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { platform, tmpdir } from 'node:os'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
@@ -19,8 +19,13 @@ import { abortError, UntrustedCodeError } from './internal.js'
 const READ_CHUNK_BYTES = 64 * 1024
 export const SNAPSHOT_CLEANUP_SETTLE_MS = 250
 const SafePromise = Promise
+const safeArrayPop = Array.prototype.pop
+const safeArrayPush = Array.prototype.push
 const safeAbortSignalAborted = Object.getOwnPropertyDescriptor(AbortSignal.prototype, 'aborted').get
 const safeAbortSignalReason = Object.getOwnPropertyDescriptor(AbortSignal.prototype, 'reason').get
+const safeBufferAllocUnsafe = Buffer.allocUnsafe
+const safeBufferConcat = Buffer.concat
+const safeBufferSubarray = Buffer.prototype.subarray
 const safeClearTimeout = globalThis.clearTimeout
 const safeMathMin = Math.min
 const safeObjectFreeze = Object.freeze
@@ -30,13 +35,19 @@ const safePromiseRace = Promise.race
 const safePromiseResolve = Promise.resolve
 const safePromiseThen = Promise.prototype.then
 const safeReflectApply = Reflect.apply
+const safeSetAdd = Set.prototype.add
+const safeSetHas = Set.prototype.has
 const safeSetTimeout = globalThis.setTimeout
+const safeStringEndsWith = String.prototype.endsWith
+const safeStringIncludes = String.prototype.includes
+const safeStringStartsWith = String.prototype.startsWith
 const safeWeakMapGet = WeakMap.prototype.get
 const safeWeakMapSet = WeakMap.prototype.set
 const timeoutPrototypeProbe = safeSetTimeout(() => {}, 0)
 const safeTimeoutUnref = timeoutPrototypeProbe.unref
 safeClearTimeout(timeoutPrototypeProbe)
 const cleanupUntilRemovedByError = new WeakMap()
+const hostPlatform = platform()
 
 function thenSafePromise (promise, onFulfilled, onRejected) {
   return safeReflectApply(safePromiseThen, promise, [onFulfilled, onRejected])
@@ -60,7 +71,7 @@ function modulePathError (message, code) {
 function toPath (value, name) {
   if (typeof value === 'string') {
     if (value.length === 0) throw new TypeError(`${name} must not be empty`)
-    if (value.includes('://')) {
+    if (safeReflectApply(safeStringIncludes, value, ['://'])) {
       throw new TypeError(`${name} must be a path string or file URL`)
     }
     return resolve(value)
@@ -78,7 +89,9 @@ function toPath (value, name) {
 function isWithin (root, candidate) {
   const pathFromRoot = relative(root, candidate)
   return pathFromRoot === '' ||
-    (pathFromRoot !== '..' && !pathFromRoot.startsWith(`..${sep}`) && !isAbsolute(pathFromRoot))
+    (pathFromRoot !== '..' &&
+     !safeReflectApply(safeStringStartsWith, pathFromRoot, [`..${sep}`]) &&
+     !isAbsolute(pathFromRoot))
 }
 
 async function canonicalPath (path, label, signal) {
@@ -99,7 +112,7 @@ async function readBoundedFile (handle, maxFileBytes, signal) {
   while (true) {
     throwIfAborted(signal)
     const remaining = maxFileBytes - total + 1
-    const buffer = Buffer.allocUnsafe(safeMathMin(READ_CHUNK_BYTES, remaining))
+    const buffer = safeBufferAllocUnsafe(safeMathMin(READ_CHUNK_BYTES, remaining))
     const { bytesRead } = await handle.read(buffer, 0, buffer.length, null)
     if (bytesRead === 0) break
     total += bytesRead
@@ -109,9 +122,11 @@ async function readBoundedFile (handle, maxFileBytes, signal) {
         'ERR_UNTRUSTED_MODULE_FILE_LIMIT'
       )
     }
-    chunks.push(buffer.subarray(0, bytesRead))
+    safeReflectApply(safeArrayPush, chunks, [
+      safeReflectApply(safeBufferSubarray, buffer, [0, bytesRead])
+    ])
   }
-  return Buffer.concat(chunks, total)
+  return safeReflectApply(safeBufferConcat, Buffer, [chunks, total])
 }
 
 async function copyRegularFile (
@@ -197,7 +212,7 @@ async function stageRootTree (rootPath, stagePath, limits, signal) {
 
   while (pending.length > 0) {
     throwIfAborted(signal)
-    const directory = pending.pop()
+    const directory = safeReflectApply(safeArrayPop, pending, [])
     const canonicalDirectory = await canonicalPath(directory.source, 'A root directory', signal)
     if (!isWithin(rootPath, canonicalDirectory)) {
       throw modulePathError(
@@ -226,7 +241,10 @@ async function stageRootTree (rootPath, stagePath, limits, signal) {
         }
         if (entryStats.isDirectory()) {
           await mkdir(destinationPath, { mode: 0o700 })
-          pending.push({ source: sourcePath, destination: destinationPath })
+          safeReflectApply(safeArrayPush, pending, [{
+            source: sourcePath,
+            destination: destinationPath
+          }])
         } else if (entryStats.isFile()) {
           await copyRegularFile(
             sourcePath,
@@ -236,7 +254,11 @@ async function stageRootTree (rootPath, stagePath, limits, signal) {
             accounting,
             signal
           )
-          accounting.stagedFiles.add(relative(rootPath, sourcePath))
+          safeReflectApply(
+            safeSetAdd,
+            accounting.stagedFiles,
+            [relative(rootPath, sourcePath)]
+          )
         } else {
           throw modulePathError(
             'rootDirectory may contain only regular files and directories',
@@ -365,7 +387,17 @@ export async function resolveLocalModule (modulePath, rootDirectory, limits, sig
 
   try {
     stagePath = await mkdtemp(join(tmpdir(), 'secure-eval-worker-modules-'))
-    if (stagePath.includes('*')) {
+    // macOS exposes /var and /tmp through /private. Node's module loader uses
+    // the canonical spelling while its Permission Model compares the granted
+    // path literally, so normalize these standard local aliases without an
+    // extra filesystem read permission.
+    if (hostPlatform === 'darwin' &&
+        (stagePath === '/var' || stagePath === '/tmp' ||
+         safeReflectApply(safeStringStartsWith, stagePath, ['/var/']) ||
+         safeReflectApply(safeStringStartsWith, stagePath, ['/tmp/']))) {
+      stagePath = '/private' + stagePath
+    }
+    if (safeReflectApply(safeStringIncludes, stagePath, ['*'])) {
       throw modulePathError(
         'The staging path contains wildcard characters',
         'ERR_UNTRUSTED_MODULE_ROOT'
@@ -375,7 +407,7 @@ export async function resolveLocalModule (modulePath, rootDirectory, limits, sig
     throwIfAborted(signal)
 
     const entryRelativePath = relative(rootPath, entryPath)
-    if (!stagedFiles.has(entryRelativePath)) {
+    if (!safeReflectApply(safeSetHas, stagedFiles, [entryRelativePath])) {
       throw modulePathError(
         'modulePath changed while it was being staged',
         'ERR_UNTRUSTED_MODULE_CHANGED'
@@ -383,7 +415,9 @@ export async function resolveLocalModule (modulePath, rootDirectory, limits, sig
     }
     const stagedEntryPath = join(stagePath, entryRelativePath)
 
-    const rootPathPrefix = stagePath.endsWith(sep) ? stagePath : stagePath + sep
+    const rootPathPrefix = safeReflectApply(safeStringEndsWith, stagePath, [sep])
+      ? stagePath
+      : stagePath + sep
     return Object.freeze({
       entryUrl: pathToFileURL(stagedEntryPath).href,
       rootPath: stagePath,
