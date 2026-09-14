@@ -20,7 +20,12 @@ import {
   validatePositiveInteger,
   validateTimeout
 } from './internal.js'
-import { acquireWorkerSlot, createFileDescriptorQuota } from './admission.js'
+import {
+  acquireWorkerSlot,
+  createFileDescriptorQuota,
+  getFileDescriptorQuotaWorkerData,
+  releaseFileDescriptorQuota
+} from './admission.js'
 import { attemptLocalModuleCleanup } from './local-files.js'
 import {
   HostFunctionError,
@@ -29,6 +34,10 @@ import {
   validateHostFunctions
 } from './host-functions.js'
 
+const Error = globalThis.Error
+const TypeError = globalThis.TypeError
+const RangeError = globalThis.RangeError
+const AggregateError = globalThis.AggregateError
 const DEFAULT_STARTUP_TIMEOUT_MS = 1_000
 const DEFAULT_MESSAGE_TIMEOUT_MS = 1_000
 const DEFAULT_LIFETIME_TIMEOUT_MS = 30_000
@@ -62,7 +71,6 @@ const hostObjectFreeze = Object.freeze
 const hostObjectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor
 const hostObjectGetOwnPropertyDescriptors = Object.getOwnPropertyDescriptors
 const hostObjectHasOwn = Object.hasOwn
-const hostPromiseCatch = Promise.prototype.catch
 const hostPromiseReject = Promise.reject
 const hostPromiseResolve = Promise.resolve
 const hostPromiseThen = Promise.prototype.then
@@ -137,7 +145,22 @@ function thenHostPromise (promise, onFulfilled, onRejected) {
 }
 
 function catchHostPromise (promise, onRejected) {
-  return hostReflectApply(hostPromiseCatch, promise, [onRejected])
+  return thenHostPromise(promise, undefined, onRejected)
+}
+
+function chainHostPromise (promise, onFulfilled) {
+  return new SafePromise((resolve, reject) => {
+    thenHostPromise(promise, (value) => {
+      let next
+      try {
+        next = onFulfilled(value)
+      } catch (error) {
+        reject(error)
+        return
+      }
+      thenHostPromise(next, resolve, reject)
+    }, reject)
+  })
 }
 
 function closeHostMessagePort (port) {
@@ -245,6 +268,8 @@ const networkAliasBuiltins = [
   require('_tls_wrap')
 ]
 const { deserialize: v8Deserialize, serialize: v8Serialize } = v8Builtin
+const moduleNodeModulePaths = moduleBuiltin._nodeModulePaths
+const moduleResolveLookupPaths = moduleBuiltin._resolveLookupPaths
 const { stripTypeScriptTypes } = moduleBuiltin
 const { MessageChannel, parentPort, workerData } = workerThreadsBuiltin
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor
@@ -255,14 +280,18 @@ const reflectApply = Reflect.apply
 const safeAtomics = Atomics
 const hostAtomicsCompareExchange = Atomics.compareExchange
 const SafePromise = Promise
-const SafeError = Error
-const SafeSyntaxError = SyntaxError
+const SafeError = globalThis.Error
+const SafeTypeError = globalThis.TypeError
+const SafeRangeError = globalThis.RangeError
+const SafeSyntaxError = globalThis.SyntaxError
+const Error = SafeError
+const TypeError = SafeTypeError
+const RangeError = SafeRangeError
 const SafeString = String
 const SafeNumber = Number
 const SafeWeakSet = WeakSet
 const numberIsSafeInteger = Number.isSafeInteger
 const promiseThen = Promise.prototype.then
-const promiseCatch = Promise.prototype.catch
 const safeSetInterval = globalThis.setInterval
 const safeClearInterval = globalThis.clearInterval
 const reflectOwnKeys = Reflect.ownKeys
@@ -273,6 +302,7 @@ const weakSetAdd = WeakSet.prototype.add
 const arrayPush = Array.prototype.push
 const arrayPop = Array.prototype.pop
 const arrayJoin = Array.prototype.join
+const arraySplice = Array.prototype.splice
 const mapGet = Map.prototype.get
 const mapSet = Map.prototype.set
 const mapDelete = Map.prototype.delete
@@ -335,6 +365,7 @@ const stringCharCodeAt = String.prototype.charCodeAt
 const stringPadStart = String.prototype.padStart
 const numberToString = Number.prototype.toString
 const bufferByteLength = Buffer.byteLength
+const bufferFrom = Buffer.from
 const moduleFileReaders = objectFreeze(Object.fromEntries(
   [
     'accessSync', 'closeSync', 'existsSync', 'fstatSync', 'lstatSync', 'openSync',
@@ -602,10 +633,40 @@ function hardenDangerousBuiltins() {
 
   // Asynchronous customization hooks execute in an InternalWorker, which does
   // not inherit this realm's permission drop or builtin hardening.
+  const originalGlobalPaths = moduleBuiltin.globalPaths
+  if (reflectApply(arrayIsArray, Array, [originalGlobalPaths])) {
+    reflectApply(arraySplice, originalGlobalPaths, [0, originalGlobalPaths.length])
+  }
   const hiddenGlobalPaths = objectFreeze([])
   replaceProperty(moduleBuiltin, 'globalPaths', hiddenGlobalPaths)
   replaceProperty(moduleBuiltin.Module, 'globalPaths', hiddenGlobalPaths)
+  replaceProperty(moduleBuiltin, '_cache', objectCreate(null))
+  replaceProperty(moduleBuiltin, '_pathCache', objectCreate(null))
+  const restrictModulePaths = (paths) => {
+    if (!reflectApply(arrayIsArray, Array, [paths])) return paths
+    const filtered = []
+    if (!workerData.localModule) return filtered
+    for (let index = 0; index < paths.length; index++) {
+      const path = paths[index]
+      if (path === workerData.localModule.rootPath ||
+          reflectApply(stringIndexOf, path, [workerData.localModule.rootPathPrefix]) === 0) {
+        reflectApply(arrayPush, filtered, [path])
+      }
+    }
+    return filtered
+  }
+  replaceProperty(moduleBuiltin, '_nodeModulePaths', function restrictedNodeModulePaths(from) {
+    return restrictModulePaths(
+      reflectApply(moduleNodeModulePaths, moduleBuiltin, [from])
+    )
+  })
+  replaceProperty(moduleBuiltin, '_resolveLookupPaths', function restrictedLookupPaths(request, parent) {
+    return restrictModulePaths(
+      reflectApply(moduleResolveLookupPaths, moduleBuiltin, [request, parent])
+    )
+  })
   for (const name of [
+    '_initPaths',
     'register',
     'registerHooks',
     'enableCompileCache',
@@ -712,6 +773,16 @@ function hardenDangerousBuiltins() {
   if (globalThis.navigator) replaceProperty(globalThis.navigator, 'locks', deniedLocks)
   replaceProperty(workerThreadsBuiltin, 'parentPort', null)
   replaceProperty(workerThreadsBuiltin, 'workerData', undefined)
+
+  // Eval workers expose their bootstrap CommonJS wrapper through globals.
+  // Guest source uses AsyncFunction/data URLs and does not need these objects;
+  // local CommonJS modules receive their own lexical require/module bindings.
+  replaceProperty(globalThis, 'require', undefined)
+  replaceProperty(globalThis, 'module', undefined)
+  replaceProperty(globalThis, 'exports', undefined)
+  replaceProperty(globalThis, '__filename', undefined)
+  replaceProperty(globalThis, '__dirname', undefined)
+  replaceProperty(processBuiltin, 'mainModule', undefined)
 
   const discardOutput = (...args) => {
     const callback = args[args.length - 1]
@@ -993,7 +1064,8 @@ function authenticateHostMessage(envelope) {
   let authenticated = false
   let serialized
   if (envelope !== null && typeof envelope === 'object' &&
-      Number.isSafeInteger(envelope.sequence) && envelope.sequence === inboundSequence + 1 &&
+      reflectApply(numberIsSafeInteger, SafeNumber, [envelope.sequence]) &&
+      envelope.sequence === inboundSequence + 1 &&
       envelope.payload !== null && typeof envelope.payload === 'object' &&
       reflectApply(arrayBufferIsView, ArrayBuffer, [envelope.payload]) &&
       typeof envelope.mac === 'string') {
@@ -1365,7 +1437,7 @@ async function initialize() {
     }
 
     const dispatched = reflectApply(promiseThen, processing, [() => dispatch(envelope)])
-    processing = reflectApply(promiseCatch, dispatched, [(error) => {
+    processing = reflectApply(promiseThen, dispatched, [undefined, (error) => {
       reportFatal(error)
     }])
   })
@@ -1408,9 +1480,10 @@ async function initialize() {
       if (workerData.localModule) {
         component = await import(workerData.localModule.entryUrl)
       } else {
-        const encoded = Buffer.from(
-          guestSource + '\n//# sourceURL=secure-eval-worker-component.mjs\n',
-          'utf8'
+        const encoded = reflectApply(
+          bufferFrom,
+          Buffer,
+          [guestSource + '\n//# sourceURL=secure-eval-worker-component.mjs\n', 'utf8']
         ).toString('base64')
         component = await import('data:text/javascript;base64,' + encoded)
       }
@@ -1428,7 +1501,7 @@ async function initialize() {
     }
     setupResult = workerData.oneShot
       ? await component.default(workerData.input)
-      : await component.default(Object.freeze({
+      : await component.default(objectFreeze({
           input: workerData.input,
           send,
           onMessage,
@@ -1442,7 +1515,7 @@ async function initialize() {
   postToHost({ type: 'ready', value: readyValue })
 }
 
-reflectApply(promiseCatch, initialize(), [(error) => {
+reflectApply(promiseThen, initialize(), [undefined, (error) => {
   if (port) {
     reportFatal(error)
   } else {
@@ -1717,9 +1790,14 @@ export class UntrustedWorkerSession extends EventEmitter {
     }
 
     let descriptorQuota
+    let descriptorQuotaWorkerData
     try {
       descriptorQuota = localModule ? createFileDescriptorQuota() : undefined
+      descriptorQuotaWorkerData = descriptorQuota
+        ? getFileDescriptorQuotaWorkerData(descriptorQuota)
+        : undefined
     } catch (error) {
+      if (descriptorQuota) releaseFileDescriptorQuota(descriptorQuota)
       releaseWorkerSlot()
       throw error
     }
@@ -1730,8 +1808,8 @@ export class UntrustedWorkerSession extends EventEmitter {
           rootPathPrefix: localModule.rootPathPrefix,
           rootUrlPrefix: localModule.rootUrlPrefix,
           maxOpenFileDescriptors: MAX_LOCAL_OPEN_FILE_DESCRIPTORS,
-          descriptorOwner: descriptorQuota.owner,
-          globalDescriptorSlots: descriptorQuota.slotsBuffer
+          descriptorOwner: descriptorQuotaWorkerData.owner,
+          globalDescriptorSlots: descriptorQuotaWorkerData.slotsBuffer
         }
       : undefined
     const workerExecArgv = ['--permission', '--allow-worker']
@@ -1766,7 +1844,7 @@ export class UntrustedWorkerSession extends EventEmitter {
         stderr: true
       })
     } catch (error) {
-      descriptorQuota?.release()
+      if (descriptorQuota) releaseFileDescriptorQuota(descriptorQuota)
       releaseWorkerSlot()
       getSessionData(this).closedSettled = true
       getSessionData(this).resolveClosed({ code: undefined, error })
@@ -1776,7 +1854,7 @@ export class UntrustedWorkerSession extends EventEmitter {
 
     const worker = getSessionSecrets(this).worker
     hostReflectApply(hostEventEmitterOn, worker, ['exit', (code) => {
-      descriptorQuota?.release()
+      if (descriptorQuota) releaseFileDescriptorQuota(descriptorQuota)
       releaseWorkerSlot()
       if (!localModule) {
         this.#handleExit(code)
@@ -2055,7 +2133,7 @@ export class UntrustedWorkerSession extends EventEmitter {
           this.#fail(error)
           return
         }
-        const processing = thenHostPromise(
+        const processing = chainHostPromise(
           getSessionData(this).diagnosticProcessing,
           () => this.#handleDiagnostic(record, sequence)
         )
@@ -2465,7 +2543,7 @@ export class UntrustedWorkerSession extends EventEmitter {
     this.#rejectReadyOnce(error)
     this.#rejectOutstanding(error)
     const termination = this.terminate()
-    hostReflectApply(hostPromiseCatch, termination, [() => {}])
+    catchHostPromise(termination, () => {})
     this.#emitError(error)
   }
 

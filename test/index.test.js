@@ -3,13 +3,69 @@ import { spawn } from 'node:child_process'
 import { test } from 'node:test'
 
 import {
+  configureWorkerAdmission,
   createRunner,
   runUntrustedCode,
   sanitizeEnvironment,
   UntrustedCodeError
 } from '../src/index.js'
+import { assertSupportedRuntime } from '../src/internal.js'
 
 const packageUrl = new URL('../src/index.js', import.meta.url).href
+
+test('rejects unsupported Node.js runtime versions', () => {
+  assert.doesNotThrow(() => assertSupportedRuntime('26.5.1'))
+  assert.doesNotThrow(() => assertSupportedRuntime('26.99.0'))
+  for (const version of [
+    '26.3.0',
+    '26.5.0',
+    '26.5.1-rc.0',
+    '26.5.1garbage',
+    '25.99.0',
+    '27.0.0',
+    'invalid'
+  ]) {
+    assert.throws(
+      () => assertSupportedRuntime(version),
+      (error) => error.code === 'ERR_SECURE_EVAL_UNSUPPORTED_RUNTIME' &&
+        /requires Node\.js >=26\.5\.1 <27/.test(error.message)
+    )
+  }
+})
+
+test('one-shot settlement uses captured Promise chaining', async (t) => {
+  configureWorkerAdmission({ maxConcurrentWorkers: 1 })
+  t.after(() => configureWorkerAdmission({ maxConcurrentWorkers: 4 }))
+  const originalThen = Promise.prototype.then
+  const never = new Promise(() => {})
+  const unhandled = []
+  const onUnhandled = (error) => unhandled.push(error)
+  process.on('unhandledRejection', onUnhandled)
+  t.after(() => process.off('unhandledRejection', onUnhandled))
+
+  let result
+  try {
+    Promise.prototype.then = () => never
+    result = runUntrustedCode('return 42', { timeoutMs: 5_000 })
+  } finally {
+    Promise.prototype.then = originalThen
+  }
+  assert.equal(await result, 42)
+
+  let rejection
+  try {
+    Promise.prototype.then = () => never
+    rejection = runUntrustedCode('throw new Error("expected startup failure")', {
+      timeoutMs: 5_000
+    })
+  } finally {
+    Promise.prototype.then = originalThen
+  }
+  await assert.rejects(rejection, /expected startup failure/)
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.deepEqual(unhandled, [])
+  assert.equal(await runUntrustedCode('return 43', { timeoutMs: 5_000 }), 43)
+})
 
 test('createRunner snapshots reusable defaults and applies per-run overrides', async () => {
   const defaults = {

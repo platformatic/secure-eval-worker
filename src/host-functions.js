@@ -1,10 +1,14 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { Buffer } from 'node:buffer'
 
+const Error = globalThis.Error
+const TypeError = globalThis.TypeError
 const contextStorage = new AsyncLocalStorage()
 const SafeMap = Map
 const arrayIsArray = Array.isArray
 const arrayPush = Array.prototype.push
+const asyncLocalStorageGetStore = AsyncLocalStorage.prototype.getStore
+const asyncLocalStorageRun = AsyncLocalStorage.prototype.run
 const bufferByteLength = Buffer.byteLength
 const eventTargetAddEventListener = EventTarget.prototype.addEventListener
 const eventTargetRemoveEventListener = EventTarget.prototype.removeEventListener
@@ -39,12 +43,12 @@ export class HostFunctionError extends Error {
 }
 
 export function isHostFunctionContextActiveForSession (sessionId) {
-  const store = contextStorage.getStore()
+  const store = reflectApply(asyncLocalStorageGetStore, contextStorage, [])
   return store?.active === true && store.context.sessionId === sessionId
 }
 
 export function getHostFunctionContext () {
-  const store = contextStorage.getStore()
+  const store = reflectApply(asyncLocalStorageGetStore, contextStorage, [])
   if (!store?.active) {
     throw new Error('getHostFunctionContext() must be called from an active host function')
   }
@@ -109,7 +113,10 @@ export async function invokeHostFunction (hostFunction, argumentsList, context) 
   const deactivate = () => { store.active = false }
   reflectApply(eventTargetAddEventListener, context.abortSignal, ['abort', deactivate, { once: true }])
   try {
-    return await contextStorage.run(store, () => reflectApply(hostFunction, undefined, argumentsList))
+    return await reflectApply(asyncLocalStorageRun, contextStorage, [
+      store,
+      () => reflectApply(hostFunction, undefined, argumentsList)
+    ])
   } finally {
     deactivate()
     reflectApply(eventTargetRemoveEventListener, context.abortSignal, ['abort', deactivate])

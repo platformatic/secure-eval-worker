@@ -384,8 +384,45 @@ test('sanitizes host process metadata in every execution mode', async () => {
           }
         })
       }
+      const initPaths = [
+        moduleNamespace._initPaths,
+        moduleNamespace.default._initPaths,
+        moduleNamespace.Module._initPaths,
+        require('node:module')._initPaths,
+        require('module')._initPaths,
+        moduleNamespace.Module._load('node:module')._initPaths,
+        process.getBuiltinModule('node:module')._initPaths
+      ].map((call) => {
+        if (typeof call !== 'function') return 'ABSENT'
+        try {
+          call()
+          return 'ALLOWED'
+        } catch (error) {
+          return error.code
+        }
+      })
       return {
         calls,
+        globals: [
+          typeof globalThis.require,
+          typeof globalThis.module,
+          typeof globalThis.exports,
+          typeof globalThis.__filename,
+          typeof globalThis.__dirname
+        ],
+        initPaths,
+        resolverPaths: require.resolve.paths('secure-eval-worker-probe'),
+        nodeModulePaths: [
+          moduleNamespace._nodeModulePaths,
+          moduleNamespace.default._nodeModulePaths,
+          moduleNamespace.Module._nodeModulePaths,
+          bareModuleNamespace._nodeModulePaths,
+          bareModuleNamespace.default._nodeModulePaths,
+          require('node:module')._nodeModulePaths,
+          require('module')._nodeModulePaths,
+          moduleNamespace.Module._load('node:module')._nodeModulePaths,
+          process.getBuiltinModule('node:module')._nodeModulePaths
+        ].map((call) => typeof call === 'function' ? call(process.execPath) : []),
         globalPaths: [
           moduleNamespace.globalPaths,
           moduleNamespace.default.globalPaths,
@@ -406,7 +443,15 @@ test('sanitizes host process metadata in every execution mode', async () => {
       }
     `)
     assert.deepEqual(result.argv0, Array(4).fill(process.argv0), type)
+    assert.deepEqual(result.globals, Array(5).fill('undefined'), type)
+    assert.equal(
+      result.initPaths.every((code) => code === 'ERR_ACCESS_DENIED' || code === 'ABSENT'),
+      true,
+      type
+    )
     assert.deepEqual(result.globalPaths, Array.from({ length: 11 }, () => []), type)
+    assert.deepEqual(result.nodeModulePaths, Array.from({ length: 9 }, () => []), type)
+    assert.deepEqual(result.resolverPaths, [], type)
     assert.equal(result.cwd.some((value) => value.includes(process.cwd())), false, type)
     assert.deepEqual(result.execArgv[0], [], type)
     assert.deepEqual(result.execArgv[2], [], type)

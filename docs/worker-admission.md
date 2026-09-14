@@ -60,12 +60,10 @@ npm run measure:workers -- 4
 ```
 
 The benchmark starts initialized workers one at a time, performs one request,
-and samples whole-process memory after an explicit host GC. Results on the
-supported runtime endpoints were:
+and samples whole-process memory after an explicit host GC. Results on a supported current runtime were:
 
 | Node.js | Baseline RSS | 1 worker | 2 workers | 3 workers | 4 workers |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| 26.3.0 | 51.63 MiB | 70.13 MiB | 82.13 MiB | 94.13 MiB | 107.13 MiB |
 | 26.8.1 | 51.91 MiB | 71.79 MiB | 84.91 MiB | 98.16 MiB | 111.16 MiB |
 
 The observed incremental RSS was approximately 12–20 MiB per initialized

@@ -19,8 +19,9 @@ will not be added solely for feature parity.
 
 ## Runtime compatibility
 
-Node.js 26.3.0 remains the minimum. Supporting older Node.js or Bun would
-require weakening the verified `process.permission.drop('worker')` ordering,
-which is not acceptable. Compatibility will be reconsidered only when another
-runtime provides equivalent enforceable per-worker primitives and passes the
-full boundary and exploit test suites.
+Node.js 26.5.1 remains the minimum patched runtime. Earlier Node.js 26 releases
+provide `process.permission.drop()`, but lack required runtime and Permission
+Model security fixes. Supporting older major releases or Bun would also require
+an equivalent verified permission-drop boundary. Compatibility will be
+reconsidered only when another runtime provides enforceable per-worker
+primitives and passes the full boundary and exploit test suites.

@@ -346,6 +346,25 @@ for (const type of ['script', 'module']) {
     await session.terminate()
   })
 
+  test(`${type} authenticated traffic uses captured numeric validation`, async () => {
+    const poison = `
+      Number.isSafeInteger = () => { throw new Error('poisoned Number.isSafeInteger') }
+    `
+    const source = type === 'script'
+      ? `${poison}\nonMessage(value => value)`
+      : `${poison}\nexport default ({ onMessage }) => { onMessage(value => value) }`
+    const session = createUntrustedWorker(source, {
+      type,
+      startupTimeoutMs: 5_000,
+      messageTimeoutMs: 5_000,
+      lifetimeTimeoutMs: 5_000
+    })
+
+    await session.ready
+    assert.equal(await session.request('real'), 'real')
+    await session.terminate()
+  })
+
   test(`${type} startup errors survive Promise.prototype poisoning`, async () => {
     const poisonAndThrow = `
       Promise.prototype.catch = function () { return this }
@@ -716,6 +735,34 @@ test('an AbortSignal terminates a session', async () => {
   controller.abort('test')
   await assert.rejects(session.ready, (error) => error.name === 'AbortError')
   await session.closed
+})
+
+test('cancellation uses a captured Error constructor', async () => {
+  const controller = new AbortController()
+  const session = createUntrustedWorker(`
+    onMessage(() => new Promise(() => {}))
+  `, {
+    signal: controller.signal,
+    startupTimeoutMs: 5_000,
+    messageTimeoutMs: 5_000,
+    lifetimeTimeoutMs: 5_000
+  })
+  session.on('error', () => {})
+  await session.ready
+
+  const OriginalError = globalThis.Error
+  try {
+    globalThis.Error = class PoisonedError {
+      constructor () { throw new OriginalError('poisoned Error constructor') }
+    }
+    controller.abort('test')
+    const closed = await session.closed
+    assert.equal(closed.error.name, 'AbortError')
+    assert.equal(session.state, 'closed')
+  } finally {
+    globalThis.Error = OriginalError
+    await session.terminate().catch(() => {})
+  }
 })
 
 test('termination rejects ready and queued requests', async () => {

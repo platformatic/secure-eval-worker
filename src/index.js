@@ -23,6 +23,10 @@ export { getHostFunctionContext, HostFunctionError } from './host-functions.js'
 export { sanitizeEnvironment, UntrustedCodeError } from './internal.js'
 export { createUntrustedWorker, UntrustedWorkerSession } from './session.js'
 
+const Error = globalThis.Error
+const TypeError = globalThis.TypeError
+const RangeError = globalThis.RangeError
+const AggregateError = globalThis.AggregateError
 const DEFAULT_TIMEOUT_MS = 1_000
 const DEFAULT_MAX_ROOT_ENTRIES = 10_000
 const DEFAULT_MAX_FILE_BYTES = 1024 * 1024
@@ -49,9 +53,6 @@ const safeObjectEntries = Object.entries
 const safeObjectFreeze = Object.freeze
 const safeObjectGetOwnPropertyDescriptors = Object.getOwnPropertyDescriptors
 const safeObjectKeys = Object.keys
-const safePromiseCatch = Promise.prototype.catch
-const safePromiseFinally = Promise.prototype.finally
-const safePromiseRace = Promise.race
 const safePromiseReject = Promise.reject
 const safePromiseThen = Promise.prototype.then
 const safeClearTimeout = globalThis.clearTimeout
@@ -123,11 +124,38 @@ function thenSafePromise (promise, onFulfilled, onRejected) {
 }
 
 function catchSafePromise (promise, onRejected) {
-  return safeReflectApply(safePromiseCatch, promise, [onRejected])
+  return thenSafePromise(promise, undefined, onRejected)
 }
 
 function finallySafePromise (promise, onFinally) {
-  return safeReflectApply(safePromiseFinally, promise, [onFinally])
+  return new SafePromise((resolve, reject) => {
+    const settle = (fulfilled, value) => {
+      let finalization
+      try {
+        finalization = onFinally()
+      } catch (error) {
+        reject(error)
+        return
+      }
+      thenSafePromise(
+        finalization,
+        () => fulfilled ? resolve(value) : reject(value),
+        reject
+      )
+    }
+    thenSafePromise(
+      promise,
+      (value) => settle(true, value),
+      (error) => settle(false, error)
+    )
+  })
+}
+
+function raceSafePromises (first, second) {
+  return new SafePromise((resolve, reject) => {
+    thenSafePromise(first, resolve, reject)
+    thenSafePromise(second, resolve, reject)
+  })
 }
 
 function rejectSafePromise (error) {
@@ -440,31 +468,36 @@ async function prepareLocalModule (
     },
     controllerSignal
   )
-  const preparation = thenSafePromise(preparationRequest, async (localModule) => {
-    if (safeReflectApply(abortSignalAborted, controllerSignal, [])) {
-      try {
-        await localModule.cleanup()
-      } catch (cleanupError) {
-        const error = new UntrustedCodeError(
-          'The private module snapshot could not be removed',
-          { code: 'ERR_UNTRUSTED_MODULE_CLEANUP', cause: cleanupError }
+  const preparation = new SafePromise((resolve, reject) => {
+    thenSafePromise(
+      preparationRequest,
+      (localModule) => {
+        if (!safeReflectApply(abortSignalAborted, controllerSignal, [])) {
+          resolve(localModule)
+          return
+        }
+        let cleanup
+        try {
+          cleanup = localModule.cleanup()
+        } catch (cleanupError) {
+          rejectPreparationCleanup(cleanupError, localModule, reject)
+          return
+        }
+        thenSafePromise(
+          cleanup,
+          () => reject(safeReflectApply(abortSignalReason, controllerSignal, [])),
+          (cleanupError) => rejectPreparationCleanup(cleanupError, localModule, reject)
         )
-        safeReflectApply(safeWeakMapSet, preparationCleanupUntilRemovedByError, [
-          error,
-          localModule.cleanupUntilRemoved
-        ])
-        throw error
-      }
-      throw safeReflectApply(abortSignalReason, controllerSignal, [])
-    }
-    return localModule
+      },
+      reject
+    )
   })
   // A filesystem request may settle after the public deadline. Preparation
   // can never continue into worker creation.
   void catchSafePromise(preparation, () => {})
 
   try {
-    return await safeReflectApply(safePromiseRace, SafePromise, [[preparation, interruption]])
+    return await raceSafePromises(preparation, interruption)
   } catch (error) {
     releaseWorkerSlot()
     if (safeReflectApply(abortSignalAborted, controllerSignal, [])) {
@@ -490,6 +523,18 @@ async function prepareLocalModule (
       } catch {}
     }
   }
+}
+
+function rejectPreparationCleanup (cleanupError, localModule, reject) {
+  const error = new UntrustedCodeError(
+    'The private module snapshot could not be removed',
+    { code: 'ERR_UNTRUSTED_MODULE_CLEANUP', cause: cleanupError }
+  )
+  safeReflectApply(safeWeakMapSet, preparationCleanupUntilRemovedByError, [
+    error,
+    localModule.cleanupUntilRemoved
+  ])
+  reject(error)
 }
 
 function releaseAfterPreparationError (error, releasePreparationSlot) {

@@ -1,9 +1,15 @@
-import { constants } from 'node:fs'
+import {
+  close as closeDescriptor,
+  constants,
+  Dir,
+  fstat as statDescriptor,
+  open as openDescriptor,
+  read as readDescriptor
+} from 'node:fs'
 import {
   lstat,
   mkdir,
   mkdtemp,
-  open,
   opendir,
   realpath,
   rm,
@@ -16,7 +22,15 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 
 import { abortError, UntrustedCodeError } from './internal.js'
 
+const TypeError = globalThis.TypeError
 const READ_CHUNK_BYTES = 64 * 1024
+const FILE_TYPE_MASK = constants.S_IFMT
+const DIRECTORY_FILE_TYPE = constants.S_IFDIR
+const REGULAR_FILE_TYPE = constants.S_IFREG
+const SYMBOLIC_LINK_FILE_TYPE = constants.S_IFLNK
+const READ_ONLY_SAFE_OPEN_FLAGS = constants.O_RDONLY |
+  (constants.O_NOFOLLOW ?? 0) |
+  (constants.O_NONBLOCK ?? 0)
 export const SNAPSHOT_CLEANUP_SETTLE_MS = 250
 const SafePromise = Promise
 const safeArrayPop = Array.prototype.pop
@@ -30,17 +44,24 @@ const safeClearTimeout = globalThis.clearTimeout
 const safeMathMin = Math.min
 const safeObjectFreeze = Object.freeze
 const safeProcessEmitWarning = process.emitWarning
-const safePromiseAll = Promise.all
-const safePromiseRace = Promise.race
-const safePromiseResolve = Promise.resolve
 const safePromiseThen = Promise.prototype.then
 const safeReflectApply = Reflect.apply
+const safeCloseDescriptor = closeDescriptor
+const safeDirClose = Dir.prototype.close
+const safeDirRead = Dir.prototype.read
+const safeOpenDescriptor = openDescriptor
+const safeReadDescriptor = readDescriptor
+const safeStatDescriptor = statDescriptor
 const safeSetAdd = Set.prototype.add
 const safeSetHas = Set.prototype.has
 const safeSetTimeout = globalThis.setTimeout
 const safeStringEndsWith = String.prototype.endsWith
 const safeStringIncludes = String.prototype.includes
 const safeStringStartsWith = String.prototype.startsWith
+const safeTypedArrayByteLength = Object.getOwnPropertyDescriptor(
+  Object.getPrototypeOf(Uint8Array.prototype),
+  'byteLength'
+).get
 const safeWeakMapGet = WeakMap.prototype.get
 const safeWeakMapSet = WeakMap.prototype.set
 const timeoutPrototypeProbe = safeSetTimeout(() => {}, 0)
@@ -51,6 +72,80 @@ const hostPlatform = platform()
 
 function thenSafePromise (promise, onFulfilled, onRejected) {
   return safeReflectApply(safePromiseThen, promise, [onFulfilled, onRejected])
+}
+
+function raceSafePromises (first, second) {
+  return new SafePromise((resolve, reject) => {
+    thenSafePromise(first, resolve, reject)
+    thenSafePromise(second, resolve, reject)
+  })
+}
+
+function openFileDescriptor (path, flags) {
+  return new SafePromise((resolve, reject) => {
+    safeOpenDescriptor(path, flags, (error, descriptor) => {
+      if (error) reject(error)
+      else resolve(descriptor)
+    })
+  })
+}
+
+function statFileDescriptor (descriptor) {
+  return new SafePromise((resolve, reject) => {
+    safeStatDescriptor(descriptor, (error, stats) => {
+      if (error) reject(error)
+      else resolve(stats)
+    })
+  })
+}
+
+function readFileDescriptor (descriptor, buffer) {
+  return new SafePromise((resolve, reject) => {
+    const byteLength = safeReflectApply(safeTypedArrayByteLength, buffer, [])
+    safeReadDescriptor(descriptor, buffer, 0, byteLength, null, (error, bytesRead) => {
+      if (error) reject(error)
+      else resolve(bytesRead)
+    })
+  })
+}
+
+function closeFileDescriptor (descriptor) {
+  return new SafePromise((resolve, reject) => {
+    safeCloseDescriptor(descriptor, (error) => {
+      if (error) reject(error)
+      else resolve()
+    })
+  })
+}
+
+function readDirectory (directory) {
+  return new SafePromise((resolve, reject) => {
+    safeReflectApply(safeDirRead, directory, [(error, entry) => {
+      if (error) reject(error)
+      else resolve(entry)
+    }])
+  })
+}
+
+function closeDirectory (directory) {
+  return new SafePromise((resolve, reject) => {
+    safeReflectApply(safeDirClose, directory, [(error) => {
+      if (error) reject(error)
+      else resolve()
+    }])
+  })
+}
+
+function isFileMode (mode) {
+  return (mode & FILE_TYPE_MASK) === REGULAR_FILE_TYPE
+}
+
+function isDirectoryMode (mode) {
+  return (mode & FILE_TYPE_MASK) === DIRECTORY_FILE_TYPE
+}
+
+function isSymbolicLinkMode (mode) {
+  return (mode & FILE_TYPE_MASK) === SYMBOLIC_LINK_FILE_TYPE
 }
 
 function throwIfAborted (signal) {
@@ -106,14 +201,14 @@ async function canonicalPath (path, label, signal) {
   }
 }
 
-async function readBoundedFile (handle, maxFileBytes, signal) {
+async function readBoundedFile (descriptor, maxFileBytes, signal) {
   const chunks = []
   let total = 0
   while (true) {
     throwIfAborted(signal)
     const remaining = maxFileBytes - total + 1
     const buffer = safeBufferAllocUnsafe(safeMathMin(READ_CHUNK_BYTES, remaining))
-    const { bytesRead } = await handle.read(buffer, 0, buffer.length, null)
+    const bytesRead = await readFileDescriptor(descriptor, buffer)
     if (bytesRead === 0) break
     total += bytesRead
     if (total > maxFileBytes) {
@@ -137,16 +232,11 @@ async function copyRegularFile (
   accounting,
   signal
 ) {
-  let handle
+  let descriptor
   try {
-    handle = await open(
-      sourcePath,
-      constants.O_RDONLY |
-        (constants.O_NOFOLLOW ?? 0) |
-        (constants.O_NONBLOCK ?? 0)
-    )
-    const before = await handle.stat()
-    if (!before.isFile()) {
+    descriptor = await openFileDescriptor(sourcePath, READ_ONLY_SAFE_OPEN_FLAGS)
+    const before = await statFileDescriptor(descriptor)
+    if (!isFileMode(before.mode)) {
       throw modulePathError(
         'rootDirectory may contain only regular files and directories',
         'ERR_UNTRUSTED_MODULE_ROOT'
@@ -177,16 +267,17 @@ async function copyRegularFile (
       )
     }
 
-    const data = await readBoundedFile(handle, limits.maxFileBytes, signal)
-    const after = await handle.stat()
+    const data = await readBoundedFile(descriptor, limits.maxFileBytes, signal)
+    const after = await statFileDescriptor(descriptor)
     if (before.size !== after.size || before.mtimeMs !== after.mtimeMs ||
-        before.ctimeMs !== after.ctimeMs || data.byteLength !== after.size) {
+        before.ctimeMs !== after.ctimeMs ||
+        safeReflectApply(safeTypedArrayByteLength, data, []) !== after.size) {
       throw modulePathError(
         'A root file changed while it was being staged',
         'ERR_UNTRUSTED_MODULE_CHANGED'
       )
     }
-    accounting.totalFileBytes += data.byteLength
+    accounting.totalFileBytes += safeReflectApply(safeTypedArrayByteLength, data, [])
     if (accounting.totalFileBytes > limits.maxTotalFileBytes) {
       throw modulePathError(
         `rootDirectory exceeds maxTotalFileBytes (${limits.maxTotalFileBytes})`,
@@ -198,9 +289,9 @@ async function copyRegularFile (
     if (error instanceof UntrustedCodeError || error?.name === 'AbortError') throw error
     throw modulePathError('rootDirectory changed while it was being staged', 'ERR_UNTRUSTED_MODULE_CHANGED')
   } finally {
-    if (handle) {
+    if (descriptor !== undefined) {
       try {
-        await handle.close()
+        await closeFileDescriptor(descriptor)
       } catch {}
     }
   }
@@ -222,49 +313,56 @@ async function stageRootTree (rootPath, stagePath, limits, signal) {
     }
 
     try {
-      for await (const entry of await opendir(directory.source)) {
-        throwIfAborted(signal)
-        if (++accounting.entries > limits.maxRootEntries) {
-          throw modulePathError(
-            `rootDirectory exceeds maxRootEntries (${limits.maxRootEntries})`,
-            'ERR_UNTRUSTED_MODULE_ROOT_LIMIT'
-          )
+      const directoryHandle = await opendir(directory.source)
+      try {
+        while (true) {
+          const entry = await readDirectory(directoryHandle)
+          if (entry === null) break
+          throwIfAborted(signal)
+          if (++accounting.entries > limits.maxRootEntries) {
+            throw modulePathError(
+              `rootDirectory exceeds maxRootEntries (${limits.maxRootEntries})`,
+              'ERR_UNTRUSTED_MODULE_ROOT_LIMIT'
+            )
+          }
+          const sourcePath = join(directory.source, entry.name)
+          const destinationPath = join(directory.destination, entry.name)
+          const entryStats = await lstat(sourcePath)
+          if (isSymbolicLinkMode(entryStats.mode)) {
+            throw modulePathError(
+              'rootDirectory must not contain symbolic links',
+              'ERR_UNTRUSTED_MODULE_ROOT'
+            )
+          }
+          if (isDirectoryMode(entryStats.mode)) {
+            await mkdir(destinationPath, { mode: 0o700 })
+            safeReflectApply(safeArrayPush, pending, [{
+              source: sourcePath,
+              destination: destinationPath
+            }])
+          } else if (isFileMode(entryStats.mode)) {
+            await copyRegularFile(
+              sourcePath,
+              destinationPath,
+              rootPath,
+              limits,
+              accounting,
+              signal
+            )
+            safeReflectApply(
+              safeSetAdd,
+              accounting.stagedFiles,
+              [relative(rootPath, sourcePath)]
+            )
+          } else {
+            throw modulePathError(
+              'rootDirectory may contain only regular files and directories',
+              'ERR_UNTRUSTED_MODULE_ROOT'
+            )
+          }
         }
-        const sourcePath = join(directory.source, entry.name)
-        const destinationPath = join(directory.destination, entry.name)
-        const entryStats = await lstat(sourcePath)
-        if (entryStats.isSymbolicLink()) {
-          throw modulePathError(
-            'rootDirectory must not contain symbolic links',
-            'ERR_UNTRUSTED_MODULE_ROOT'
-          )
-        }
-        if (entryStats.isDirectory()) {
-          await mkdir(destinationPath, { mode: 0o700 })
-          safeReflectApply(safeArrayPush, pending, [{
-            source: sourcePath,
-            destination: destinationPath
-          }])
-        } else if (entryStats.isFile()) {
-          await copyRegularFile(
-            sourcePath,
-            destinationPath,
-            rootPath,
-            limits,
-            accounting,
-            signal
-          )
-          safeReflectApply(
-            safeSetAdd,
-            accounting.stagedFiles,
-            [relative(rootPath, sourcePath)]
-          )
-        } else {
-          throw modulePathError(
-            'rootDirectory may contain only regular files and directories',
-            'ERR_UNTRUSTED_MODULE_ROOT'
-          )
-        }
+      } finally {
+        await closeDirectory(directoryHandle)
       }
     } catch (error) {
       if (error instanceof UntrustedCodeError || error?.name === 'AbortError') throw error
@@ -285,15 +383,23 @@ export async function attemptLocalModuleCleanup (
   const timeout = new SafePromise((resolve) => {
     timer = safeSetTimeout(() => resolve(safeObjectFreeze({ status: 'pending' })), timeoutMs)
   })
-  const resolved = safeReflectApply(safePromiseResolve, SafePromise, [])
-  const attempt = thenSafePromise(resolved, () => localModule.cleanup())
+  const attempt = new SafePromise((resolve, reject) => {
+    let cleanup
+    try {
+      cleanup = localModule.cleanup()
+    } catch (error) {
+      reject(error)
+      return
+    }
+    thenSafePromise(cleanup, resolve, reject)
+  })
   const outcome = thenSafePromise(
     attempt,
     () => safeObjectFreeze({ status: 'removed' }),
     (error) => safeObjectFreeze({ status: 'failed', error })
   )
   try {
-    return await safeReflectApply(safePromiseRace, SafePromise, [[outcome, timeout]])
+    return await raceSafePromises(outcome, timeout)
   } finally {
     safeClearTimeout(timer)
   }
@@ -322,16 +428,15 @@ export async function resolveLocalModule (modulePath, rootDirectory, limits, sig
   let rootStats
   let entryStats
   try {
-    ;[rootStats, entryStats] = await safeReflectApply(safePromiseAll, SafePromise, [
-      [stat(rootPath), stat(entryPath)]
-    ])
+    rootStats = await stat(rootPath)
+    entryStats = await stat(entryPath)
   } catch {
     throw modulePathError('The local module paths could not be inspected', 'ERR_UNTRUSTED_MODULE_PATH')
   }
-  if (!rootStats.isDirectory()) {
+  if (!isDirectoryMode(rootStats.mode)) {
     throw modulePathError('rootDirectory must be a directory', 'ERR_UNTRUSTED_MODULE_ROOT')
   }
-  if (!entryStats.isFile()) {
+  if (!isFileMode(entryStats.mode)) {
     throw modulePathError('modulePath must be a regular file', 'ERR_UNTRUSTED_MODULE_PATH')
   }
 
@@ -418,7 +523,7 @@ export async function resolveLocalModule (modulePath, rootDirectory, limits, sig
     const rootPathPrefix = safeReflectApply(safeStringEndsWith, stagePath, [sep])
       ? stagePath
       : stagePath + sep
-    return Object.freeze({
+    return safeObjectFreeze({
       entryUrl: pathToFileURL(stagedEntryPath).href,
       rootPath: stagePath,
       rootPathPrefix,

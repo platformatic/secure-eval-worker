@@ -4,21 +4,34 @@ import { UntrustedCodeError } from './internal.js'
 
 const DEFAULT_MAX_CONCURRENT_WORKERS = 4
 const MAX_PROCESS_FILE_DESCRIPTORS = 256
+const DESCRIPTOR_SLOTS_BYTE_LENGTH = Int32Array.BYTES_PER_ELEMENT *
+  MAX_PROCESS_FILE_DESCRIPTORS
 // Keep the original worker key so older and newer package copies continue to
 // share the same process-wide worker counter.
 const STATE_KEY = Symbol.for('secure-eval-worker.admission.main.v1')
 const PREPARATION_STATE_KEY = Symbol.for('secure-eval-worker.admission.preparation.main.v1')
 const DESCRIPTOR_STATE_KEY = Symbol.for('secure-eval-worker.admission.descriptors.main.v1')
+const TypeError = globalThis.TypeError
+const RangeError = globalThis.RangeError
 const safeAtomics = Atomics
 const atomicsCompareExchange = Atomics.compareExchange
 const arrayIsArray = Array.isArray
 const numberIsSafeInteger = Number.isSafeInteger
+const objectDefineProperty = Object.defineProperty
+const objectFreeze = Object.freeze
 const objectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor
+const objectIsFrozen = Object.isFrozen
 const reflectApply = Reflect.apply
+const sharedArrayBufferByteLength = Object.getOwnPropertyDescriptor(
+  SharedArrayBuffer.prototype,
+  'byteLength'
+).get
 const reflectOwnKeys = Reflect.ownKeys
 const setAdd = Set.prototype.add
 const setDelete = Set.prototype.delete
 const setHas = Set.prototype.has
+const weakMapGet = WeakMap.prototype.get
+const weakMapSet = WeakMap.prototype.set
 
 function capacityError (message) {
   return new UntrustedCodeError(message, { code: 'ERR_UNTRUSTED_WORKER_CAPACITY' })
@@ -28,7 +41,7 @@ function createState () {
   let activeWorkers = 0
   let maxConcurrentWorkers = DEFAULT_MAX_CONCURRENT_WORKERS
 
-  return Object.freeze({
+  return objectFreeze({
     acquire () {
       if (activeWorkers >= maxConcurrentWorkers) {
         throw capacityError(`Worker capacity exhausted (${maxConcurrentWorkers} active workers)`)
@@ -48,20 +61,19 @@ function createState () {
     },
 
     status () {
-      return Object.freeze({ maxConcurrentWorkers, activeWorkers })
+      return objectFreeze({ maxConcurrentWorkers, activeWorkers })
     }
   })
 }
 
 function createDescriptorState () {
-  const slotsBuffer = new SharedArrayBuffer(
-    Int32Array.BYTES_PER_ELEMENT * MAX_PROCESS_FILE_DESCRIPTORS
-  )
+  const slotsBuffer = new SharedArrayBuffer(DESCRIPTOR_SLOTS_BYTE_LENGTH)
   const slots = new Int32Array(slotsBuffer)
   const activeOwners = new Set()
+  const descriptorQuotaData = new WeakMap()
   let nextOwner = 1
 
-  return Object.freeze({
+  return objectFreeze({
     createWorkerQuota () {
       while (reflectApply(setHas, activeOwners, [nextOwner])) {
         nextOwner = nextOwner === 0x7fffffff ? 1 : nextOwner + 1
@@ -70,18 +82,36 @@ function createDescriptorState () {
       reflectApply(setAdd, activeOwners, [owner])
       nextOwner = nextOwner === 0x7fffffff ? 1 : nextOwner + 1
       let released = false
-      return Object.freeze({
-        slotsBuffer,
-        owner,
-        release () {
-          if (released) return
-          released = true
-          for (let index = 0; index < slots.length; index++) {
-            reflectApply(atomicsCompareExchange, safeAtomics, [slots, index, owner, 0])
-          }
-          reflectApply(setDelete, activeOwners, [owner])
+      const workerData = objectFreeze({ slotsBuffer, owner })
+      const release = () => {
+        if (released) return
+        released = true
+        for (let index = 0; index < MAX_PROCESS_FILE_DESCRIPTORS; index++) {
+          reflectApply(atomicsCompareExchange, safeAtomics, [slots, index, owner, 0])
         }
-      })
+        reflectApply(setDelete, activeOwners, [owner])
+      }
+      // The public shape remains compatible with descriptor-state v1 so an
+      // older physical package copy loaded after this one can still release
+      // its quota. New copies use the private WeakMap association below.
+      const quota = objectFreeze({ slotsBuffer, owner, release })
+      reflectApply(weakMapSet, descriptorQuotaData, [
+        quota,
+        objectFreeze({ release, workerData })
+      ])
+      return quota
+    },
+
+    getWorkerData (quota) {
+      const data = reflectApply(weakMapGet, descriptorQuotaData, [quota])
+      if (!data) throw new TypeError('Invalid file descriptor quota')
+      return data.workerData
+    },
+
+    release (quota) {
+      const data = reflectApply(weakMapGet, descriptorQuotaData, [quota])
+      if (!data) throw new TypeError('Invalid file descriptor quota')
+      data.release()
     }
   })
 }
@@ -90,7 +120,7 @@ function createPreparationState () {
   let activePreparations = 0
   let maxConcurrentPreparations = DEFAULT_MAX_CONCURRENT_WORKERS
 
-  return Object.freeze({
+  return objectFreeze({
     acquire () {
       if (activePreparations >= maxConcurrentPreparations) {
         throw capacityError(
@@ -112,14 +142,19 @@ function createPreparationState () {
   })
 }
 
+const descriptorQuotaData = new WeakMap()
 let state
 let preparationState
 let descriptorState
+let descriptorStateCreateWorkerQuota
+let descriptorStateGetWorkerData
+let descriptorStateRelease
+let legacyDescriptorState = false
 if (isMainThread) {
   state = globalThis[STATE_KEY]
   if (state === undefined) {
     state = createState()
-    Object.defineProperty(globalThis, STATE_KEY, {
+    objectDefineProperty(globalThis, STATE_KEY, {
       value: state,
       configurable: false,
       enumerable: false,
@@ -130,7 +165,7 @@ if (isMainThread) {
   preparationState = globalThis[PREPARATION_STATE_KEY]
   if (preparationState === undefined) {
     preparationState = createPreparationState()
-    Object.defineProperty(globalThis, PREPARATION_STATE_KEY, {
+    objectDefineProperty(globalThis, PREPARATION_STATE_KEY, {
       value: preparationState,
       configurable: false,
       enumerable: false,
@@ -141,12 +176,51 @@ if (isMainThread) {
   descriptorState = globalThis[DESCRIPTOR_STATE_KEY]
   if (descriptorState === undefined) {
     descriptorState = createDescriptorState()
-    Object.defineProperty(globalThis, DESCRIPTOR_STATE_KEY, {
+    objectDefineProperty(globalThis, DESCRIPTOR_STATE_KEY, {
       value: descriptorState,
       configurable: false,
       enumerable: false,
       writable: false
     })
+  }
+
+  if (descriptorState !== null && typeof descriptorState === 'object' &&
+      reflectApply(objectIsFrozen, Object, [descriptorState])) {
+    const createDescriptor = reflectApply(
+      objectGetOwnPropertyDescriptor,
+      Object,
+      [descriptorState, 'createWorkerQuota']
+    )
+    if (createDescriptor && 'value' in createDescriptor &&
+        typeof createDescriptor.value === 'function' &&
+        createDescriptor.writable === false && createDescriptor.configurable === false) {
+      const getDescriptor = reflectApply(
+        objectGetOwnPropertyDescriptor,
+        Object,
+        [descriptorState, 'getWorkerData']
+      )
+      const releaseDescriptor = reflectApply(
+        objectGetOwnPropertyDescriptor,
+        Object,
+        [descriptorState, 'release']
+      )
+      const hasModernMethods = getDescriptor && 'value' in getDescriptor &&
+        typeof getDescriptor.value === 'function' &&
+        getDescriptor.writable === false && getDescriptor.configurable === false &&
+        releaseDescriptor && 'value' in releaseDescriptor &&
+        typeof releaseDescriptor.value === 'function' &&
+        releaseDescriptor.writable === false && releaseDescriptor.configurable === false
+      const hasNoModernMethods = getDescriptor === undefined && releaseDescriptor === undefined
+      if (hasModernMethods || hasNoModernMethods) {
+        descriptorStateCreateWorkerQuota = createDescriptor.value
+        if (hasModernMethods) {
+          descriptorStateGetWorkerData = getDescriptor.value
+          descriptorStateRelease = releaseDescriptor.value
+        } else {
+          legacyDescriptorState = true
+        }
+      }
+    }
   }
 }
 
@@ -169,9 +243,96 @@ export function acquireFilePreparationSlot () {
   return preparationState.acquire()
 }
 
-export function createFileDescriptorQuota () {
+function descriptorAdmissionError () {
+  return new UntrustedCodeError(
+    'File descriptor admission state is unavailable or incompatible',
+    { code: 'ERR_UNTRUSTED_WORKER_ADMISSION_UNAVAILABLE' }
+  )
+}
+
+function requireDescriptorState () {
   requireState()
-  return descriptorState.createWorkerQuota()
+  if (!descriptorStateCreateWorkerQuota) throw descriptorAdmissionError()
+}
+
+function immutableQuotaDataDescriptor (quota, name) {
+  const descriptor = reflectApply(
+    objectGetOwnPropertyDescriptor,
+    Object,
+    [quota, name]
+  )
+  if (!descriptor || !('value' in descriptor) ||
+      descriptor.writable !== false || descriptor.configurable !== false) {
+    throw descriptorAdmissionError()
+  }
+  return descriptor.value
+}
+
+function adaptLegacyDescriptorQuota (quota) {
+  if (quota === null || typeof quota !== 'object' ||
+      !reflectApply(objectIsFrozen, Object, [quota])) {
+    throw descriptorAdmissionError()
+  }
+  const owner = immutableQuotaDataDescriptor(quota, 'owner')
+  const slotsBuffer = immutableQuotaDataDescriptor(quota, 'slotsBuffer')
+  const capturedRelease = immutableQuotaDataDescriptor(quota, 'release')
+  let slotsByteLength
+  try {
+    slotsByteLength = reflectApply(sharedArrayBufferByteLength, slotsBuffer, [])
+  } catch {
+    throw descriptorAdmissionError()
+  }
+  if (!reflectApply(numberIsSafeInteger, Number, [owner]) ||
+      owner <= 0 || owner > 0x7fffffff ||
+      slotsByteLength !== DESCRIPTOR_SLOTS_BYTE_LENGTH ||
+      typeof capturedRelease !== 'function') {
+    throw descriptorAdmissionError()
+  }
+  let released = false
+  const release = () => {
+    if (released) return
+    released = true
+    reflectApply(capturedRelease, quota, [])
+  }
+  reflectApply(weakMapSet, descriptorQuotaData, [
+    quota,
+    objectFreeze({
+      release,
+      workerData: objectFreeze({ owner, slotsBuffer })
+    })
+  ])
+  return quota
+}
+
+export function createFileDescriptorQuota () {
+  requireDescriptorState()
+  let quota
+  try {
+    quota = reflectApply(descriptorStateCreateWorkerQuota, descriptorState, [])
+  } catch (error) {
+    if (legacyDescriptorState) throw descriptorAdmissionError()
+    throw error
+  }
+  return legacyDescriptorState ? adaptLegacyDescriptorQuota(quota) : quota
+}
+
+export function getFileDescriptorQuotaWorkerData (quota) {
+  requireDescriptorState()
+  const data = reflectApply(weakMapGet, descriptorQuotaData, [quota])
+  if (data) return data.workerData
+  if (!descriptorStateGetWorkerData) throw descriptorAdmissionError()
+  return reflectApply(descriptorStateGetWorkerData, descriptorState, [quota])
+}
+
+export function releaseFileDescriptorQuota (quota) {
+  requireDescriptorState()
+  const data = reflectApply(weakMapGet, descriptorQuotaData, [quota])
+  if (data) {
+    data.release()
+    return
+  }
+  if (!descriptorStateRelease) throw descriptorAdmissionError()
+  reflectApply(descriptorStateRelease, descriptorState, [quota])
 }
 
 export function configureWorkerAdmission (options) {

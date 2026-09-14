@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { test } from 'node:test'
 
 import {
@@ -260,6 +261,41 @@ test('rejects same-session reentrant requests from host functions', async () => 
   await session.ready
   assert.equal(await session.request('outer'), 'rejected safely')
   await session.terminate()
+})
+
+test('host function context uses captured AsyncLocalStorage operations', async () => {
+  let session
+  session = createUntrustedWorker(`onMessage(() => tools.reenter())`, {
+    hostFunctions: {
+      tools: {
+        reenter () {
+          const context = getHostFunctionContext()
+          assert.equal(context.hostFunctionName, 'tools.reenter')
+          assert.throws(
+            () => session.request('nested'),
+            (error) => error.code === 'ERR_UNTRUSTED_WORKER_REENTRANT_REQUEST'
+          )
+          return 'rejected safely'
+        }
+      }
+    },
+    startupTimeoutMs: 5_000,
+    messageTimeoutMs: 5_000,
+    lifetimeTimeoutMs: 5_000
+  })
+  await session.ready
+
+  const originalGetStore = AsyncLocalStorage.prototype.getStore
+  const originalRun = AsyncLocalStorage.prototype.run
+  try {
+    AsyncLocalStorage.prototype.getStore = () => undefined
+    AsyncLocalStorage.prototype.run = () => { throw new Error('poisoned run') }
+    assert.equal(await session.request('outer'), 'rejected safely')
+  } finally {
+    AsyncLocalStorage.prototype.getStore = originalGetStore
+    AsyncLocalStorage.prototype.run = originalRun
+    await session.terminate().catch(() => {})
+  }
 })
 
 test('host function context provides request metadata and cancellation', async () => {

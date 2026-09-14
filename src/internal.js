@@ -1,5 +1,39 @@
 export const DEFAULT_MAX_SOURCE_BYTES = 64 * 1024
 export const MAX_TIMEOUT_MS = 2_147_483_647
+const MINIMUM_NODE_VERSION = [26, 5, 1]
+const MAXIMUM_NODE_MAJOR = 27
+const SafeError = globalThis.Error
+const TypeError = globalThis.TypeError
+const RangeError = globalThis.RangeError
+const safeRegExpExec = RegExp.prototype.exec
+const safeReflectApply = Reflect.apply
+
+function unsupportedRuntimeError () {
+  const error = new SafeError('secure-eval-worker requires Node.js >=26.5.1 <27')
+  error.code = 'ERR_SECURE_EVAL_UNSUPPORTED_RUNTIME'
+  return error
+}
+
+export function assertSupportedRuntime (version) {
+  if (typeof version !== 'string') {
+    throw unsupportedRuntimeError()
+  }
+  const match = safeReflectApply(safeRegExpExec, /^(\d+)\.(\d+)\.(\d+)$/, [version])
+  if (!match) {
+    throw unsupportedRuntimeError()
+  }
+  const major = +match[1]
+  const minor = +match[2]
+  const patch = +match[3]
+  if (major !== MINIMUM_NODE_VERSION[0] || major >= MAXIMUM_NODE_MAJOR ||
+      minor < MINIMUM_NODE_VERSION[1] ||
+      (minor === MINIMUM_NODE_VERSION[1] && patch < MINIMUM_NODE_VERSION[2])) {
+    throw unsupportedRuntimeError()
+  }
+}
+
+assertSupportedRuntime(process.versions.node)
+
 export const DEFAULT_RESOURCE_LIMITS = Object.freeze({
   maxOldGenerationSizeMb: 32,
   maxYoungGenerationSizeMb: 8,
@@ -98,7 +132,7 @@ function getWasmMemoryBuffer (value) {
   }
 }
 
-export class UntrustedCodeError extends Error {
+export class UntrustedCodeError extends SafeError {
   constructor (message, options = {}) {
     super(message, options)
     this.name = 'UntrustedCodeError'
@@ -455,7 +489,7 @@ export function validateResourceLimits (limits) {
 }
 
 export function abortError (reason) {
-  const error = new Error('Execution was aborted', { cause: reason })
+  const error = new SafeError('Execution was aborted', { cause: reason })
   error.name = 'AbortError'
   error.code = 'ABORT_ERR'
   return error

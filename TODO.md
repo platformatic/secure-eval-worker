@@ -143,7 +143,7 @@ features.
 These remain intentionally open because they are release-by-release
 requirements rather than one-time deliverables.
 
-- [ ] Run the complete test suite on Node.js 26.3.0 and current 26.x for every
+- [ ] Run the complete test suite on Node.js 26.5.1 and current 26.x for every
   security-sensitive change.
 - [ ] Add exploit-focused regression coverage for callable accessors, aliases,
   prototype-reachable constructors, inherited descriptors, native bindings,

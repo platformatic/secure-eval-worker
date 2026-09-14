@@ -65,7 +65,10 @@ released. Writes,
 addons remain unavailable.
 
 Use a dedicated source directory containing no secrets, special files, native
-binaries, or unrelated files. The source filesystem and every process able to
+binaries, or unrelated files. A hard-linked regular file is treated as root
+content and copied even when the same inode also has names outside the root;
+rejecting multi-link files would break legitimate package-manager layouts.
+The source filesystem and every process able to
 mutate it must remain trusted during staging. Held handles and identity checks
 reduce ordinary races, but
 portable Node APIs cannot prove containment against an actively adversarial
