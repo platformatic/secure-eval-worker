@@ -1,10 +1,14 @@
 import {
   abortError,
+  assertSafePromiseEnvironment,
   assertSupportedProtocolValue,
   cloneWithoutSharedMemory,
+  isAbortError,
+  isUntrustedCodeError,
   DEFAULT_MAX_SOURCE_BYTES,
   MAX_TIMEOUT_MS,
   sanitizeEnvironment,
+  settleProtocolValue,
   UntrustedCodeError,
   validatePositiveInteger,
   validateResourceLimits
@@ -23,6 +27,8 @@ export { getHostFunctionContext, HostFunctionError } from './host-functions.js'
 export { sanitizeEnvironment, UntrustedCodeError } from './internal.js'
 export { createUntrustedWorker, UntrustedWorkerSession } from './session.js'
 
+const safeIsAbortError = isAbortError
+const safeIsUntrustedCodeError = isUntrustedCodeError
 const Error = globalThis.Error
 const TypeError = globalThis.TypeError
 const RangeError = globalThis.RangeError
@@ -51,7 +57,9 @@ const safeObjectCreate = Object.create
 const safeObjectDefineProperty = Object.defineProperty
 const safeObjectEntries = Object.entries
 const safeObjectFreeze = Object.freeze
+const safeObjectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor
 const safeObjectGetOwnPropertyDescriptors = Object.getOwnPropertyDescriptors
+const safeObjectHasOwn = Object.hasOwn
 const safeObjectKeys = Object.keys
 const safePromiseReject = Promise.reject
 const safePromiseThen = Promise.prototype.then
@@ -124,13 +132,28 @@ const SAFE_PROMISE_CONSTRUCTOR_DESCRIPTOR = safeObjectFreeze({
   value: undefined,
   writable: false
 })
+const NATIVE_AWAIT_PROMISE_CONSTRUCTOR_DESCRIPTOR = safeObjectFreeze({
+  configurable: false,
+  enumerable: false,
+  value: SafePromise,
+  writable: false
+})
 
 function hardenSafePromise (promise) {
-  safeReflectApply(safeObjectDefineProperty, Object, [
-    promise,
-    'constructor',
-    SAFE_PROMISE_CONSTRUCTOR_DESCRIPTOR
-  ])
+  const descriptor = safeReflectApply(
+    safeObjectGetOwnPropertyDescriptor,
+    undefined,
+    [promise, 'constructor']
+  )
+  if (!descriptor || !safeReflectApply(safeObjectHasOwn, undefined, [descriptor, 'value']) ||
+      descriptor.value !== undefined || descriptor.writable !== false ||
+      descriptor.enumerable !== false || descriptor.configurable !== false) {
+    safeReflectApply(safeObjectDefineProperty, undefined, [
+      promise,
+      'constructor',
+      SAFE_PROMISE_CONSTRUCTOR_DESCRIPTOR
+    ])
+  }
   return promise
 }
 
@@ -143,6 +166,50 @@ function thenSafePromise (promise, onFulfilled, onRejected) {
 
 function createSafePromise (executor) {
   return hardenSafePromise(new SafePromise(executor))
+}
+
+function createValueOutcome (value) {
+  const outcome = safeObjectCreate(null)
+  safeReflectApply(safeObjectDefineProperty, undefined, [outcome, 'value', {
+    configurable: false,
+    enumerable: true,
+    value,
+    writable: false
+  }])
+  return safeObjectFreeze(outcome)
+}
+
+function publicPromiseFromOutcome (promise) {
+  return createSafePromise((resolve, reject) => {
+    thenSafePromise(
+      promise,
+      (outcome) => settleProtocolValue(resolve, reject, outcome.value),
+      reject
+    )
+  })
+}
+
+function awaitPublicValuePromise (promise) {
+  const control = createSafePromise((resolve, reject) => {
+    safeReflectApply(safePromiseThen, promise, [
+      (value) => resolve(createValueOutcome(value)),
+      reject
+    ])
+  })
+  return awaitSafePromise(control)
+}
+
+function awaitSafePromise (promise) {
+  hardenSafePromise(promise)
+  const bridge = new SafePromise((resolve, reject) => {
+    safeReflectApply(safePromiseThen, promise, [resolve, reject])
+  })
+  safeReflectApply(safeObjectDefineProperty, undefined, [
+    bridge,
+    'constructor',
+    NATIVE_AWAIT_PROMISE_CONSTRUCTOR_DESCRIPTOR
+  ])
+  return bridge
 }
 
 function catchSafePromise (promise, onRejected) {
@@ -236,6 +303,7 @@ export function runUntrustedCode (source, options = {}) {
 }
 
 function runUntrustedCodeAdmitted (source, options, releaseWorkerSlot) {
+  assertSafePromiseEnvironment()
   if (typeof source !== 'string') throw new TypeError('source must be a string')
   if (options === null || typeof options !== 'object' || safeArrayIsArray(options)) {
     throw new TypeError('options must be an object')
@@ -263,11 +331,11 @@ function runUntrustedCodeAdmitted (source, options, releaseWorkerSlot) {
  * module must default-export a function receiving the one-shot input.
  */
 export function runUntrustedFile (modulePath, options = {}) {
-  return hardenSafePromise(runUntrustedFileAdmitted(modulePath, options))
+  return publicPromiseFromOutcome(runUntrustedFileAdmitted(modulePath, options))
 }
 
 async function runUntrustedFileAdmitted (modulePath, options) {
-  const startedAt = safeReflectApply(safeDateNow, Date, [])
+  const startedAt = safeReflectApply(safeDateNow, undefined, [])
   let releaseWorkerSlot
   try {
     releaseWorkerSlot = acquireWorkerSlot()
@@ -277,6 +345,7 @@ async function runUntrustedFileAdmitted (modulePath, options) {
 
   let timeoutMs
   try {
+    assertSafePromiseEnvironment()
     options = snapshotFileOptions(options, 'options', ONE_SHOT_FILE_OPTION_NAMES)
     timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
     validatePositiveInteger(timeoutMs, 'timeoutMs')
@@ -308,24 +377,24 @@ async function runUntrustedFileAdmitted (modulePath, options) {
     throw error
   }
 
-  const localModule = await hardenSafePromise(prepareLocalModule(
+  const localModule = (await awaitSafePromise(prepareLocalModule(
     modulePath,
     options,
-    timeoutMs - (safeReflectApply(safeDateNow, Date, []) - startedAt),
+    timeoutMs - (safeReflectApply(safeDateNow, undefined, []) - startedAt),
     new UntrustedCodeError(`Execution exceeded ${timeoutMs} ms`, {
       code: 'ERR_UNTRUSTED_CODE_TIMEOUT'
     }),
     releaseWorkerSlot,
     releasePreparationSlot
-  ))
+  ))).value
 
-  const remainingTimeoutMs = timeoutMs - (safeReflectApply(safeDateNow, Date, []) - startedAt)
+  const remainingTimeoutMs = timeoutMs - (safeReflectApply(safeDateNow, undefined, []) - startedAt)
   if (remainingTimeoutMs <= 0) {
     releaseWorkerSlot()
     const timeoutError = new UntrustedCodeError(`Execution exceeded ${timeoutMs} ms`, {
       code: 'ERR_UNTRUSTED_CODE_TIMEOUT'
     })
-    await hardenSafePromise(cleanupLocalModule(localModule, releasePreparationSlot, timeoutError))
+    await awaitSafePromise(cleanupLocalModule(localModule, releasePreparationSlot, timeoutError))
     throw timeoutError
   }
   delete options.rootDirectory
@@ -337,7 +406,7 @@ async function runUntrustedFileAdmitted (modulePath, options) {
   let transferred = false
   let primaryError
   try {
-    return await hardenSafePromise(runOneShot(options, remainingTimeoutMs, timeoutMs, (sessionOptions) => {
+    return await awaitPublicValuePromise(runOneShot(options, remainingTimeoutMs, timeoutMs, (sessionOptions) => {
       const session = createUntrustedFileSession(
         localModule,
         sessionOptions,
@@ -354,7 +423,7 @@ async function runUntrustedFileAdmitted (modulePath, options) {
   } finally {
     if (!transferred) {
       releaseWorkerSlot()
-      await hardenSafePromise(cleanupLocalModule(localModule, releasePreparationSlot, primaryError))
+      await awaitSafePromise(cleanupLocalModule(localModule, releasePreparationSlot, primaryError))
     }
   }
 }
@@ -366,14 +435,15 @@ async function runUntrustedFileAdmitted (modulePath, options) {
  * for the session.
  */
 export function createUntrustedWorkerFromFile (modulePath, options = {}) {
-  return hardenSafePromise(createUntrustedWorkerFromFileAdmitted(modulePath, options))
+  return publicPromiseFromOutcome(createUntrustedWorkerFromFileAdmitted(modulePath, options))
 }
 
 async function createUntrustedWorkerFromFileAdmitted (modulePath, options) {
-  const startedAt = safeReflectApply(safeDateNow, Date, [])
+  const startedAt = safeReflectApply(safeDateNow, undefined, [])
   const releaseWorkerSlot = acquireWorkerSlot()
   let startupTimeoutMs
   try {
+    assertSafePromiseEnvironment()
     options = snapshotFileOptions(options, 'options', PERSISTENT_FILE_OPTION_NAMES)
     startupTimeoutMs = options.startupTimeoutMs ?? DEFAULT_TIMEOUT_MS
     validatePositiveInteger(startupTimeoutMs, 'startupTimeoutMs')
@@ -403,24 +473,24 @@ async function createUntrustedWorkerFromFileAdmitted (modulePath, options) {
     releasePreparationSlot()
     throw error
   }
-  const localModule = await hardenSafePromise(prepareLocalModule(
+  const localModule = (await awaitSafePromise(prepareLocalModule(
     modulePath,
     options,
-    startupTimeoutMs - (safeReflectApply(safeDateNow, Date, []) - startedAt),
+    startupTimeoutMs - (safeReflectApply(safeDateNow, undefined, []) - startedAt),
     new UntrustedCodeError(`Startup exceeded ${startupTimeoutMs} ms`, {
       code: 'ERR_UNTRUSTED_WORKER_STARTUP_TIMEOUT'
     }),
     releaseWorkerSlot,
     releasePreparationSlot
-  ))
+  ))).value
 
-  const remainingStartupMs = startupTimeoutMs - (safeReflectApply(safeDateNow, Date, []) - startedAt)
+  const remainingStartupMs = startupTimeoutMs - (safeReflectApply(safeDateNow, undefined, []) - startedAt)
   if (remainingStartupMs <= 0) {
     releaseWorkerSlot()
     const timeoutError = new UntrustedCodeError(`Startup exceeded ${startupTimeoutMs} ms`, {
       code: 'ERR_UNTRUSTED_WORKER_STARTUP_TIMEOUT'
     })
-    await hardenSafePromise(cleanupLocalModule(localModule, releasePreparationSlot, timeoutError))
+    await awaitSafePromise(cleanupLocalModule(localModule, releasePreparationSlot, timeoutError))
     throw timeoutError
   }
   delete options.rootDirectory
@@ -429,16 +499,16 @@ async function createUntrustedWorkerFromFileAdmitted (modulePath, options) {
   delete options.maxTotalFileBytes
   options.startupTimeoutMs = remainingStartupMs
   try {
-    return createUntrustedFileSession(
+    return createValueOutcome(createUntrustedFileSession(
       localModule,
       options,
       false,
       releaseWorkerSlot,
       releasePreparationSlot
-    )
+    ))
   } catch (error) {
     releaseWorkerSlot()
-    await hardenSafePromise(cleanupLocalModule(localModule, releasePreparationSlot, error))
+    await awaitSafePromise(cleanupLocalModule(localModule, releasePreparationSlot, error))
     throw error
   }
 }
@@ -501,9 +571,10 @@ async function prepareLocalModule (
   const preparation = createSafePromise((resolve, reject) => {
     thenSafePromise(
       preparationRequest,
-      (localModule) => {
+      (localModuleOutcome) => {
+        const localModule = localModuleOutcome.value
         if (!safeReflectApply(abortSignalAborted, controllerSignal, [])) {
-          resolve(localModule)
+          resolve(createValueOutcome(localModule))
           return
         }
         let cleanup
@@ -527,7 +598,7 @@ async function prepareLocalModule (
   void catchSafePromise(preparation, () => {})
 
   try {
-    return await hardenSafePromise(raceSafePromises(preparation, interruption))
+    return await awaitSafePromise(raceSafePromises(preparation, interruption))
   } catch (error) {
     releaseWorkerSlot()
     if (safeReflectApply(abortSignalAborted, controllerSignal, [])) {
@@ -590,7 +661,7 @@ function releaseAfterPreparationError (error, releasePreparationSlot) {
 }
 
 async function cleanupLocalModule (localModule, releasePreparationSlot, primaryError) {
-  const outcome = await hardenSafePromise(attemptLocalModuleCleanup(localModule))
+  const outcome = (await awaitSafePromise(attemptLocalModuleCleanup(localModule))).value
   if (outcome.status === 'removed') {
     releasePreparationSlot()
     return
@@ -664,7 +735,7 @@ function runOneShot (
     transferred = true
   } catch (error) {
     if (!transferred) releaseWorkerSlot()
-    if (error?.name === 'AbortError' ||
+    if (safeIsAbortError(error) ||
         error?.code === 'ERR_UNTRUSTED_WORKER_STARTUP_TIMEOUT' ||
         error?.code === 'ERR_UNTRUSTED_WORKER_CAPACITY' ||
         error?.code === 'ERR_UNTRUSTED_WORKER_ADMISSION_UNAVAILABLE') {
@@ -673,20 +744,24 @@ function runOneShot (
     throw error
   }
 
-  const translatedReady = catchSafePromise(session.ready, (error) => {
-    throw translateSessionError(error, reportedTimeoutMs)
+  const translatedReady = createSafePromise((resolve, reject) => {
+    safeReflectApply(safePromiseThen, session.ready, [
+      (value) => resolve(createValueOutcome(value)),
+      (error) => reject(translateSessionError(error, reportedTimeoutMs))
+    ])
   })
-  return finallySafePromise(translatedReady, async () => {
+  const finalized = finallySafePromise(translatedReady, async () => {
     try {
-      await hardenSafePromise(session.terminate())
+      await awaitSafePromise(session.terminate())
     } catch {}
-    const closed = await hardenSafePromise(session.closed)
+    const closed = (await awaitPublicValuePromise(session.closed)).value
     if (closed.error?.code === 'ERR_UNTRUSTED_WORKER_CLEANUP' ||
         closed.error?.code === 'ERR_UNTRUSTED_WORKER_TERMINATION_TIMEOUT' ||
         closed.error?.code === 'ERR_UNTRUSTED_WORKER_TERMINATION') {
       throw translateSessionError(closed.error, reportedTimeoutMs)
     }
   })
+  return publicPromiseFromOutcome(finalized)
 }
 
 function snapshotFilePolicies (options) {
@@ -783,7 +858,8 @@ function snapshotPublicOptions (options, label, allowedNames) {
       throw new TypeError(`Unknown option: ${key}`)
     }
     const descriptor = descriptors[key]
-    if (!descriptor.enumerable || !('value' in descriptor)) {
+    if (!descriptor.enumerable ||
+        !safeReflectApply(safeObjectHasOwn, undefined, [descriptor, 'value'])) {
       throw new TypeError(`${label}.${key} must be an enumerable data property`)
     }
     snapshot[key] = descriptor.value
@@ -813,7 +889,8 @@ function snapshotRunnerDefaults (options) {
       throw new TypeError(`Unknown runner default: ${key}`)
     }
     const descriptor = descriptors[key]
-    if (!descriptor.enumerable || !('value' in descriptor)) {
+    if (!descriptor.enumerable ||
+        !safeReflectApply(safeObjectHasOwn, undefined, [descriptor, 'value'])) {
       throw new TypeError(`Runner default ${key} must be an enumerable data property`)
     }
     snapshot[key] = descriptor.value
@@ -869,7 +946,8 @@ function snapshotRunnerDefaults (options) {
       if (!safeReflectApply(safeSetHas, DIAGNOSTIC_OPTION_NAMES, [name])) {
         throw new TypeError(`Unknown diagnostics option: ${name}`)
       }
-      if (!descriptor.enumerable || !('value' in descriptor)) {
+      if (!descriptor.enumerable ||
+          !safeReflectApply(safeObjectHasOwn, undefined, [descriptor, 'value'])) {
         throw new TypeError(`diagnostics.${name} must be an enumerable data property`)
       }
       validatePositiveInteger(descriptor.value, `diagnostics.${name}`)
@@ -925,7 +1003,7 @@ function snapshotHostFunctions (hostFunctions) {
 }
 
 function translateSessionError (error, timeoutMs) {
-  if (error?.name === 'AbortError') return error
+  if (safeIsAbortError(error)) return error
 
   const codes = {
     ERR_UNTRUSTED_WORKER_STARTUP_TIMEOUT: [
@@ -983,7 +1061,7 @@ function translateSessionError (error, timeoutMs) {
       remoteStack: error.remoteStack
     })
   }
-  if (error instanceof UntrustedCodeError) {
+  if (safeIsUntrustedCodeError(error)) {
     return new UntrustedCodeError(error.message, {
       cause: error,
       code: 'ERR_UNTRUSTED_CODE',

@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict'
-import { spawn } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
 import { createRequire, syncBuiltinESMExports } from 'node:module'
 import { test } from 'node:test'
+import { promisify } from 'node:util'
+import { serialize } from 'node:v8'
 
 import {
   configureWorkerAdmission,
@@ -10,10 +12,14 @@ import {
   sanitizeEnvironment,
   UntrustedCodeError
 } from '../src/index.js'
-import { assertSupportedRuntime } from '../src/internal.js'
+import {
+  assertSupportedProtocolSource,
+  assertSupportedRuntime
+} from '../src/internal.js'
 
 const packageUrl = new URL('../src/index.js', import.meta.url).href
 const require = createRequire(import.meta.url)
+const execFileAsync = promisify(execFile)
 
 test('rejects unsupported Node.js runtime versions', () => {
   assert.doesNotThrow(() => assertSupportedRuntime('26.5.1'))
@@ -101,7 +107,7 @@ test('one-shot settlement uses captured Promise chaining', async (t) => {
   assert.equal(await runUntrustedCode('return 43', { timeoutMs: 5_000 }), 43)
 })
 
-test('guest result adoption preserves frozen promises and Promise subclasses', async () => {
+test('guest execution preserves native Promise identity and subclass semantics', async () => {
   const result = await runUntrustedCode(`
     class ResultPromise extends Promise {}
     const ordinary = (async () => {})()
@@ -398,6 +404,342 @@ test('rejects oversized views before enumerating indexed descriptors', async () 
     }),
     /maxMessageBytes/
   )
+})
+
+test('protocol traversal budgets bound every structural category before cloning', () => {
+  const expectBudget = (value, maxBytes = 128) => {
+    assert.throws(
+      () => assertSupportedProtocolSource(value, 'input', maxBytes, 'maxInputBytes'),
+      /input exceeds maxInputBytes/
+    )
+  }
+
+  expectBudget('x'.repeat(129))
+
+  let getterReads = 0
+  const manyProperties = {}
+  for (let index = 0; index < 129; index++) manyProperties[`property${index}`] = index
+  Object.defineProperty(manyProperties, 'authority', {
+    enumerable: true,
+    get () { getterReads++; return new SharedArrayBuffer(8) }
+  })
+  expectBudget(manyProperties)
+  assert.equal(getterReads, 0)
+
+  const forbidden = new SharedArrayBuffer(8)
+  expectBudget(new Map(Array.from({ length: 65 }, (_, index) => [index, forbidden])))
+  expectBudget(new Set(Array.from({ length: 129 }, (_, index) => index)))
+
+  const shared = {}
+  expectBudget(Array.from({ length: 129 }, () => shared))
+
+  let deep = {}
+  for (let index = 0; index < 128; index++) deep = { next: deep }
+  expectBudget(deep)
+
+  expectBudget(new Uint8Array(129))
+})
+
+test('protocol budgets cumulatively charge unique backing ArrayBuffers', async () => {
+  const first = new ArrayBuffer(160)
+  const second = new ArrayBuffer(160)
+  assert.throws(
+    () => assertSupportedProtocolSource([first, second], 'input', 256, 'maxInputBytes'),
+    /input exceeds maxInputBytes/
+  )
+  await assert.rejects(
+    async () => runUntrustedCode('return input', {
+      input: [first, second],
+      maxInputBytes: 256,
+      timeoutMs: 5_000
+    }),
+    /maxInputBytes/
+  )
+
+  const shared = new ArrayBuffer(160)
+  const sharedViews = [
+    new Uint8Array(shared, 0, 80),
+    new Uint8Array(shared, 80, 80)
+  ]
+  assert.doesNotThrow(() => {
+    assertSupportedProtocolSource(sharedViews, 'input', 256, 'maxInputBytes')
+  })
+  assert.deepEqual(
+    await runUntrustedCode('return input.map(view => view.byteLength)', {
+      input: sharedViews,
+      maxInputBytes: 256,
+      timeoutMs: 5_000
+    }),
+    [80, 80]
+  )
+
+  await assert.rejects(
+    runUntrustedCode('return [new ArrayBuffer(160), new ArrayBuffer(160)]', {
+      maxMessageBytes: 256,
+      timeoutMs: 5_000
+    }),
+    /(?:maxMessageBytes|Worker protocol failure)/
+  )
+  assert.deepEqual(
+    await runUntrustedCode(`
+      const backing = new ArrayBuffer(160)
+      return [new Uint8Array(backing, 0, 80), new Uint8Array(backing, 80, 80)]
+    `, {
+      maxMessageBytes: 256,
+      timeoutMs: 5_000
+    }).then(views => views.map(view => view.byteLength)),
+    [80, 80]
+  )
+})
+
+test('protocol traversal budgets preserve fitting sparse, cyclic, and branded values', () => {
+  const sparse = []
+  sparse[100_000] = 'value'
+  const cycle = { empty: '', unicode: 'π🙂', sparse }
+  cycle.self = cycle
+  cycle.sharedA = sparse
+  cycle.sharedB = sparse
+  cycle.map = new Map([['answer', 42]])
+  cycle.set = new Set(['value'])
+  cycle.regexp = /value/gy
+  cycle.regexp.lastIndex = 3
+  for (const value of [
+    '',
+    'π🙂',
+    sparse,
+    cycle,
+    new Map([['answer', 42]]),
+    new Set(['value']),
+    cycle.regexp
+  ]) {
+    const maxBytes = serialize(value).byteLength
+    assert.doesNotThrow(() => {
+      assertSupportedProtocolSource(value, 'input', maxBytes, 'maxInputBytes')
+    })
+  }
+})
+
+test('protocol traversal uses captured size and reflection intrinsics', (t) => {
+  const mapSize = Object.getOwnPropertyDescriptor(Map.prototype, 'size')
+  const setSize = Object.getOwnPropertyDescriptor(Set.prototype, 'size')
+  const ownKeys = Reflect.ownKeys
+  const descriptors = Object.getOwnPropertyDescriptors
+  t.after(() => {
+    Object.defineProperty(Map.prototype, 'size', mapSize)
+    Object.defineProperty(Set.prototype, 'size', setSize)
+    Reflect.ownKeys = ownKeys
+    Object.getOwnPropertyDescriptors = descriptors
+  })
+  const value = { map: new Map([['answer', 42]]), set: new Set([43]) }
+  const maxBytes = serialize(value).byteLength
+  try {
+    Object.defineProperty(Map.prototype, 'size', {
+      configurable: true,
+      get () { throw new Error('poisoned Map size') }
+    })
+    Object.defineProperty(Set.prototype, 'size', {
+      configurable: true,
+      get () { throw new Error('poisoned Set size') }
+    })
+    Reflect.ownKeys = () => { throw new Error('poisoned Reflect.ownKeys') }
+    Object.getOwnPropertyDescriptors = () => {
+      throw new Error('poisoned Object.getOwnPropertyDescriptors')
+    }
+    assert.doesNotThrow(() => {
+      assertSupportedProtocolSource(value, 'input', maxBytes, 'maxInputBytes')
+    })
+  } finally {
+    Object.defineProperty(Map.prototype, 'size', mapSize)
+    Object.defineProperty(Set.prototype, 'size', setSize)
+    Reflect.ownKeys = ownKeys
+    Object.getOwnPropertyDescriptors = descriptors
+  }
+})
+
+test('caller option poisoning cannot redirect captured global receivers', async () => {
+  const source = `
+    import { runUntrustedCode } from ${JSON.stringify(packageUrl)}
+    const defineProperty = Object.defineProperty
+    const getOwnPropertyDescriptor = Object.getOwnPropertyDescriptor
+    const ownKeys = Reflect.ownKeys
+    const promiseThen = Promise.prototype.then
+    const stringify = JSON.stringify
+    const names = ['Date', 'Buffer', 'Object', 'Array', 'ArrayBuffer', 'Number', 'JSON']
+    const originals = names.map(name => [name, getOwnPropertyDescriptor(globalThis, name)])
+    let reads = 0
+    const restore = () => {
+      for (const [name, descriptor] of originals) defineProperty(globalThis, name, descriptor)
+    }
+    const optionsTarget = { timeoutMs: 5000 }
+    const options = new Proxy(optionsTarget, {
+      ownKeys () {
+        for (const [name, descriptor] of originals) {
+          defineProperty(globalThis, name, {
+            configurable: true,
+            enumerable: descriptor.enumerable,
+            get () { reads++; throw new Error('read poisoned global ' + name) }
+          })
+        }
+        return ownKeys(optionsTarget)
+      }
+    })
+    let execution
+    try {
+      execution = runUntrustedCode('return 42', options)
+    } catch (error) {
+      restore()
+      process.stdout.write(stringify({ error: error.message, reads }))
+      process.exit(0)
+    }
+    Reflect.apply(promiseThen, execution, [
+      (value) => {
+        restore()
+        process.stdout.write(stringify({ value, reads }))
+      },
+      (error) => {
+        restore()
+        process.stdout.write(stringify({ error: error.message, reads }))
+      }
+    ])
+  `
+  const { stdout } = await execFileAsync(process.execPath, ['--input-type=module', '--eval', source], {
+    timeout: 10_000
+  })
+  assert.deepEqual(JSON.parse(stdout), { value: 42, reads: 0 })
+})
+
+test('prototype-specific then pollution cannot assimilate branded results', async () => {
+  const source = `
+    import { runUntrustedCode } from ${JSON.stringify(packageUrl)}
+    const promiseThen = Promise.prototype.then
+    const defineProperty = Object.defineProperty
+    const deleteProperty = Reflect.deleteProperty
+    const stringify = JSON.stringify
+    let calls = 0
+    defineProperty(Map.prototype, 'then', {
+      configurable: true,
+      value (resolve) { calls++; if (typeof resolve === 'function') resolve('assimilated') }
+    })
+    const execution = runUntrustedCode("return new Map([['answer', 42]])", { timeoutMs: 5000 })
+    Reflect.apply(promiseThen, execution, [
+      (value) => {
+        deleteProperty(Map.prototype, 'then')
+        process.stdout.write(stringify({ answer: value.get('answer'), calls }))
+      },
+      (error) => {
+        deleteProperty(Map.prototype, 'then')
+        process.stdout.write(stringify({ error: error.message, calls }))
+      }
+    ])
+  `
+  const { stdout } = await execFileAsync(process.execPath, ['--input-type=module', '--eval', source], {
+    timeout: 10_000
+  })
+  assert.deepEqual(JSON.parse(stdout), { answer: 42, calls: 0 })
+})
+
+test('protocol validation never resolves mutable global constructor bindings', async () => {
+  const names = ['ArrayBuffer', 'Array', 'Object', 'Number']
+  const defineProperty = Object.defineProperty
+  const getOwnPropertyDescriptor = Object.getOwnPropertyDescriptor
+  const originals = names.map(name => [name, getOwnPropertyDescriptor(globalThis, name)])
+  let hostReads = 0
+  try {
+    for (const [name] of originals) {
+      defineProperty(globalThis, name, {
+        configurable: true,
+        get () { hostReads++; throw new Error(`read global ${name}`) }
+      })
+    }
+    assert.doesNotThrow(() => {
+      assertSupportedProtocolSource([{ value: 42 }], 'input', 128, 'maxInputBytes')
+    })
+  } finally {
+    for (const [name, descriptor] of originals) defineProperty(globalThis, name, descriptor)
+  }
+  assert.equal(hostReads, 0)
+
+  const result = await runUntrustedCode(`
+    const defineProperty = Object.defineProperty
+    const create = Object.create
+    let reads = 0
+    for (const name of ['ArrayBuffer', 'Array', 'Object', 'Number']) {
+      defineProperty(globalThis, name, {
+        configurable: true,
+        get () { reads++; throw new Error('read global ' + name) }
+      })
+    }
+    const output = create(null)
+    output.reads = reads
+    output.value = 42
+    return output
+  `, { timeoutMs: 5_000, maxMessageBytes: 128 })
+  assert.deepEqual({ ...result }, { reads: 0, value: 42 })
+})
+
+test('descriptor validation ignores polluted Object.prototype.value for host options', async (t) => {
+  configureWorkerAdmission({ maxConcurrentWorkers: 1 })
+  t.after(() => configureWorkerAdmission({ maxConcurrentWorkers: 4 }))
+  const original = Object.getOwnPropertyDescriptor(Object.prototype, 'value')
+  const restore = () => {
+    if (original) Object.defineProperty(Object.prototype, 'value', original)
+    else delete Object.prototype.value
+  }
+  t.after(restore)
+
+  for (const pollution of ['data', 'accessor']) {
+    let optionReads = 0
+    let prototypeReads = 0
+    if (pollution === 'data') {
+      Object.defineProperty(Object.prototype, 'value', {
+        configurable: true,
+        value: 5_000,
+        writable: true
+      })
+    } else {
+      Object.defineProperty(Object.prototype, 'value', {
+        configurable: true,
+        get () {
+          prototypeReads++
+          throw new Error('poisoned descriptor value')
+        }
+      })
+    }
+    const optionDescriptor = Object.create(null)
+    optionDescriptor.enumerable = true
+    optionDescriptor.get = () => {
+      optionReads++
+      return 5_000
+    }
+    const options = Object.defineProperty({}, 'timeoutMs', optionDescriptor)
+    assert.throws(
+      () => runUntrustedCode('return 42', options),
+      /timeoutMs must be an enumerable data property/
+    )
+    assert.equal(optionReads, 0)
+    assert.equal(prototypeReads, 0)
+
+    let inputReads = 0
+    const inputDescriptor = Object.create(null)
+    inputDescriptor.enumerable = true
+    inputDescriptor.get = () => {
+      inputReads++
+      return new SharedArrayBuffer(8)
+    }
+    const input = Object.defineProperty({}, 'authority', inputDescriptor)
+    assert.throws(
+      () => runUntrustedCode('return input', {
+        input,
+        timeoutMs: 5_000
+      }),
+      /input must contain only enumerable data properties/
+    )
+    assert.equal(inputReads, 0)
+    assert.equal(prototypeReads, 0)
+
+    restore()
+    assert.equal(await runUntrustedCode('return 42', { timeoutMs: 5_000 }), 42)
+  }
 })
 
 test('returns a structured-cloneable result', async () => {

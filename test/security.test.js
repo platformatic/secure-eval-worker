@@ -371,7 +371,181 @@ for (const type of EXECUTION_TYPES) {
       setEnvironmentData(key, undefined)
     }
   })
+
+  test(`${type} denies DNS, fetch, WebSocket, trace events, crypto engines, and QUIC`, async () => {
+    const result = await evaluateInGuest(type, `
+      const Module = await import('node:module')
+      const require = Module.createRequire(process.execPath)
+      const dnsNode = await import('node:dns')
+      const dnsBare = await import('dns')
+      const dnsPromises = await import('node:dns/promises')
+      const cryptoNode = await import('node:crypto')
+      const cryptoBare = await import('crypto')
+      const attempts = [
+        () => dnsNode.lookup('localhost', () => {}),
+        () => dnsNode.default.lookup('localhost', () => {}),
+        () => dnsBare.lookup('localhost', () => {}),
+        () => dnsPromises.lookup('localhost'),
+        () => require('node:dns').lookup('localhost', () => {}),
+        () => require('dns').lookup('localhost', () => {}),
+        () => require('node:dns/promises').lookup('localhost'),
+        () => Module.default._load('node:dns').resolve('localhost', () => {}),
+        () => process.getBuiltinModule('node:dns').lookup('localhost', () => {}),
+        () => cryptoNode.setEngine('missing'),
+        () => cryptoNode.default.setEngine('missing'),
+        () => cryptoBare.setEngine('missing'),
+        () => require('node:crypto').setEngine('missing'),
+        () => process.getBuiltinModule('crypto').setEngine('missing'),
+        () => fetch('http://127.0.0.1:9/'),
+        () => new WebSocket('ws://127.0.0.1:9/')
+      ]
+      const codes = []
+      for (const attempt of attempts) {
+        try {
+          await attempt()
+          codes.push('ALLOWED')
+        } catch (error) {
+          codes.push(error.code)
+        }
+      }
+      const trace = []
+      for (const load of [
+        () => import('node:trace_events'),
+        () => import('trace_events'),
+        () => require('node:trace_events'),
+        () => require('trace_events'),
+        () => Module.default._load('node:trace_events'),
+        () => Module.default._load('trace_events'),
+        () => process.getBuiltinModule('node:trace_events'),
+        () => process.getBuiltinModule('trace_events')
+      ]) {
+        try {
+          const value = await load()
+          const create = value.createTracing ?? value.default?.createTracing
+          try { create({ categories: ['node'] }); trace.push('ALLOWED') } catch (error) { trace.push(error.code) }
+        } catch (error) {
+          trace.push(error.code)
+        }
+      }
+      const quic = []
+      for (const load of [
+        () => import('node:quic'),
+        () => import('quic'),
+        () => require('node:quic'),
+        () => require('quic'),
+        () => Module.default._load('node:quic'),
+        () => Module.default._load('quic'),
+        () => process.getBuiltinModule('node:quic'),
+        () => process.getBuiltinModule('quic')
+      ]) {
+        let value
+        try { value = await load() } catch { quic.push('UNAVAILABLE'); continue }
+        if (value === undefined) { quic.push('UNAVAILABLE'); continue }
+        const invocationCodes = []
+        for (const candidate of [value, value.default]) {
+          if (!candidate || (typeof candidate !== 'object' && typeof candidate !== 'function')) continue
+          for (const descriptor of Object.values(Object.getOwnPropertyDescriptors(candidate))) {
+            if (!('value' in descriptor) || typeof descriptor.value !== 'function') continue
+            try { Reflect.apply(descriptor.value, candidate, []); invocationCodes.push('ALLOWED') } catch (error) {
+              invocationCodes.push(error.code)
+            }
+          }
+        }
+        quic.push(invocationCodes)
+      }
+      return { codes, trace, quic }
+    `)
+    assert.deepEqual(result.codes, Array(16).fill('ERR_ACCESS_DENIED'))
+    assert.equal(result.trace.every(code => code === 'ERR_ACCESS_DENIED' || code === 'ERR_TRACE_EVENTS_UNAVAILABLE'), true)
+    assert.equal(result.quic.every(outcome => outcome === 'UNAVAILABLE' ||
+      (outcome.length > 0 && outcome.every(code => code === 'ERR_ACCESS_DENIED'))), true)
+  })
 }
+
+test('pre-existing HTTP agents cannot open loopback connections in any execution mode', async (t) => {
+  let accepted = 0
+  const sockets = []
+  const server = createServer(socket => {
+    accepted++
+    sockets.push(socket)
+    socket.destroy()
+  })
+  await new Promise((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(0, '127.0.0.1', resolve)
+  })
+  t.after(() => {
+    for (const socket of sockets) socket.destroy()
+    server.close()
+  })
+  const port = server.address().port
+
+  for (const type of EXECUTION_TYPES) {
+    const codes = await evaluateInGuest(type, `
+      const Module = await import('node:module')
+      const require = Module.createRequire(process.execPath)
+      const httpNode = await import('node:http')
+      const httpBare = await import('http')
+      const httpsNode = await import('node:https')
+      const httpsBare = await import('https')
+      const modules = [
+        httpNode, httpNode.default, httpBare, httpBare.default,
+        httpsNode, httpsNode.default, httpsBare, httpsBare.default,
+        require('node:http'), require('http'), require('node:https'), require('https'),
+        Module.default._load('node:http'), Module.default._load('node:https'),
+        process.getBuiltinModule('node:http'), process.getBuiltinModule('node:https')
+      ]
+      const results = []
+      const attempt = (label, call, receiver, argumentsList) => {
+        try {
+          Reflect.apply(call, receiver, argumentsList)
+          results.push([label, 'ALLOWED'])
+        } catch (error) {
+          results.push([label, error.code])
+        }
+      }
+      for (let moduleIndex = 0; moduleIndex < modules.length; moduleIndex++) {
+        const builtin = modules[moduleIndex]
+        for (const name of ['request', 'get']) {
+          if (typeof builtin[name] === 'function') {
+            attempt(moduleIndex + ':' + name, builtin[name], builtin, [{ host: '127.0.0.1', port: ${port} }])
+          }
+        }
+        const agent = builtin.globalAgent
+        if (!agent) continue
+        if (typeof agent === 'function') {
+          attempt(moduleIndex + ':globalAgent', agent, builtin, [])
+          continue
+        }
+        for (const name of ['createConnection', 'addRequest', 'createSocket']) {
+          if (typeof agent[name] === 'function') {
+            attempt(moduleIndex + ':agent.' + name, agent[name], agent, [{ host: '127.0.0.1', port: ${port} }, {}])
+          }
+        }
+        let current = agent
+        for (let depth = 0; current && depth < 4; depth++) {
+          const descriptors = Object.getOwnPropertyDescriptors(current)
+          const networkNames = ['createConnection', 'addRequest', 'createSocket']
+          const hasNetworkMethod = networkNames.some(name => typeof descriptors[name]?.value === 'function')
+          if (depth > 0 && !hasNetworkMethod) break
+          for (const name of ['constructor', ...networkNames]) {
+            const descriptor = descriptors[name]
+            if (descriptor && typeof descriptor.value === 'function') {
+              attempt(moduleIndex + ':prototype[' + depth + '].' + name,
+                descriptor.value, agent, [{ host: '127.0.0.1', port: ${port} }, {}])
+            }
+          }
+          current = Object.getPrototypeOf(current)
+        }
+      }
+      return results
+    `)
+    assert.equal(codes.length > 0, true, type)
+    assert.deepEqual(codes.filter(([, code]) => code !== 'ERR_ACCESS_DENIED'), [], type)
+  }
+  await new Promise(resolve => setTimeout(resolve, 50))
+  assert.equal(accepted, 0)
+})
 
 for (const type of ['file-one-shot', 'file-module']) {
   test(`${type} denies outside reads, writes, child processes, network, and inspector`, async (t) => {
@@ -481,12 +655,22 @@ test('sanitizes host process metadata in every execution mode', async () => {
           process.getBuiltinModule('module').globalPaths
         ],
         argv0: [process.argv0, namespace.argv0, namespace.default.argv0, builtin.argv0],
+        identity: [process, namespace, namespace.default, builtin].map(value => ({
+          pid: value.pid,
+          ppid: value.ppid,
+          title: value.title
+        })),
         cwd: [process.cwd(), namespace.cwd(), namespace.default.cwd(), builtin.cwd()],
         execArgv: [process.execArgv, namespace.execArgv, namespace.default.execArgv, builtin.execArgv],
         execPath: [process.execPath, namespace.execPath, namespace.default.execPath, builtin.execPath]
       }
     `)
     assert.deepEqual(result.argv0, Array(4).fill(process.argv0), type)
+    assert.deepEqual(result.identity, Array.from({ length: 4 }, () => ({
+      pid: 0,
+      ppid: 0,
+      title: 'secure-eval-worker'
+    })), type)
     assert.deepEqual(result.globals, Array(5).fill('undefined'), type)
     assert.equal(
       result.initPaths.every((code) => code === 'ERR_ACCESS_DENIED' || code === 'ABSENT'),
@@ -954,6 +1138,94 @@ test('limits setup input size before worker construction', () => {
     }),
     /maxInputBytes/
   )
+})
+
+test('enforces structural traversal budgets across persistent and host-function boundaries', async (t) => {
+  let hostCalls = 0
+  const session = createUntrustedWorker(`
+    onMessage(async value => {
+      if (value === 'large-result') {
+        const result = {}
+        for (let index = 0; index < 257; index++) result['property' + index] = index
+        return result
+      }
+      if (value === 'large-host-argument') {
+        const argument = new Map()
+        for (let index = 0; index < 129; index++) argument.set(index, new SharedArrayBuffer(8))
+        try { await tools.consume(argument) } catch (error) { return error.message }
+      }
+      if (value === 'large-host-result') {
+        try { return await tools.largeResult() } catch (error) { return error.code }
+      }
+      return value
+    })
+  `, {
+    ...SECURITY_TIMEOUTS,
+    maxMessageBytes: 256,
+    hostFunctions: {
+      tools: {
+        consume () { hostCalls++ },
+        largeResult () {
+          const result = new Set()
+          for (let index = 0; index < 257; index++) result.add(index)
+          return result
+        }
+      }
+    }
+  })
+  session.on('error', () => {})
+  t.after(() => session.terminate().catch(() => {}))
+  await session.ready
+
+  const broad = {}
+  for (let index = 0; index < 257; index++) broad[`property${index}`] = index
+  assert.throws(() => session.request(broad), /maxMessageBytes/)
+  assert.match(await session.request('large-host-argument'), /maxMessageBytes/)
+  assert.equal(hostCalls, 0)
+  assert.equal(
+    await session.request('large-host-result'),
+    'ERR_UNTRUSTED_WORKER_HOST_FUNCTION'
+  )
+  await assert.rejects(
+    session.request('large-result'),
+    /(?:maxMessageBytes|Worker protocol failure)/
+  )
+  await session.closed
+})
+
+test('worker traversal uses captured size and reflection intrinsics', async () => {
+  const result = await runUntrustedCode(`
+    const map = new Map([['answer', 42]])
+    const set = new Set([43])
+    Object.defineProperty(Map.prototype, 'size', {
+      configurable: true,
+      get () { throw new Error('poisoned Map size') }
+    })
+    Object.defineProperty(Set.prototype, 'size', {
+      configurable: true,
+      get () { throw new Error('poisoned Set size') }
+    })
+    Reflect.ownKeys = () => { throw new Error('poisoned Reflect.ownKeys') }
+    Object.getOwnPropertyDescriptors = () => {
+      throw new Error('poisoned Object.getOwnPropertyDescriptors')
+    }
+    return { map, set }
+  `, { timeoutMs: 5_000, maxMessageBytes: 256 })
+  assert.deepEqual([...result.map], [['answer', 42]])
+  assert.deepEqual([...result.set], [43])
+})
+
+test('enforces one-shot output string and graph budgets', async () => {
+  for (const source of [
+    "return 'x'.repeat(129)",
+    `const shared = {}; return Array.from({ length: 129 }, () => shared)`,
+    `let value = {}; for (let index = 0; index < 128; index++) value = { next: value }; return value`
+  ]) {
+    await assert.rejects(
+      runUntrustedCode(source, { timeoutMs: 5_000, maxMessageBytes: 128 }),
+      /(?:maxMessageBytes|Worker protocol failure)/
+    )
+  }
 })
 
 test('limits serialized values in both protocol directions', async () => {

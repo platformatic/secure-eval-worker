@@ -10,10 +10,17 @@ import {
   sanitizeEnvironment,
   UntrustedCodeError,
   UntrustedWorkerSession,
+  type HostFunction,
   type HostFunctionNamespaces,
   type ProtocolValue,
   type UntrustedWorkerClosedResult
 } from 'secure-eval-worker'
+
+declare const promiseLikeNumber: PromiseLike<number>
+declare const promiseLikeVoid: PromiseLike<void>
+// @ts-expect-error asynchronous host functions must return native Promise instances
+const unsupportedPromiseLikeHost: HostFunction<[], number> = () => promiseLikeNumber
+void unsupportedPromiseLikeHost
 
 const hosts = {
   math: {
@@ -157,6 +164,8 @@ const fileResponse: { doubled: number } = await fileSession.request({ value: 21 
 void fileResponse
 await fileSession.terminate()
 
+// @ts-expect-error asynchronous diagnostic callbacks must return native Promise instances
+void runUntrustedCode('return 1', { onDiagnostic: () => promiseLikeVoid })
 // @ts-expect-error local module language is selected by the file extension
 void runUntrustedFile('/trusted/entry.mjs', { language: 'javascript' })
 // @ts-expect-error persistent local modules always use the module contract

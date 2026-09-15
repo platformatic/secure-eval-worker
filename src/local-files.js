@@ -1,8 +1,11 @@
+import { randomUUID } from 'node:crypto'
 import {
+  chmod as chmodPath,
   close as closeDescriptor,
   constants,
   Dir,
   fstat as statDescriptor,
+  link as linkPath,
   lstat as lstatPath,
   mkdir as mkdirPath,
   mkdtemp as makeTemporaryDirectory,
@@ -10,18 +13,48 @@ import {
   opendir as openDirectory,
   read as readDescriptor,
   realpath as realPath,
-  rm as removePath,
+  rmdir as removeDirectoryPath,
   stat as statPath,
-  writeFile as writeFilePath
+  unlink as unlinkPath,
+  write as writeDescriptor
 } from 'node:fs'
 import { platform, tmpdir } from 'node:os'
-import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
-import { fileURLToPath, pathToFileURL } from 'node:url'
+import { dirname, join, resolve, sep } from 'node:path'
+import { domainToASCII, fileURLToPath } from 'node:url'
 
-import { abortError, UntrustedCodeError } from './internal.js'
+import { abortError, isAbortError, isUntrustedCodeError, UntrustedCodeError } from './internal.js'
 
+const safeIsAbortError = isAbortError
+const safeIsUntrustedCodeError = isUntrustedCodeError
+const SafeError = globalThis.Error
 const TypeError = globalThis.TypeError
 const READ_CHUNK_BYTES = 64 * 1024
+// Snapshot every security-sensitive builtin binding before caller-controlled
+// option processing can synchronize poisoned CommonJS builtin exports.
+const safeRandomUUID = randomUUID
+const safeChmodPath = chmodPath
+const safeCloseDescriptor = closeDescriptor
+const safeStatDescriptor = statDescriptor
+const safeLinkPath = linkPath
+const safeLstatPath = lstatPath
+const safeMkdirPath = mkdirPath
+const safeMakeTemporaryDirectory = makeTemporaryDirectory
+const safeOpenDescriptor = openDescriptor
+const safeOpenDirectory = openDirectory
+const safeReadDescriptor = readDescriptor
+const safeRemoveDirectoryPath = removeDirectoryPath
+const safeStatPath = statPath
+const safeUnlinkPath = unlinkPath
+const safeWriteDescriptor = writeDescriptor
+const safePlatform = platform
+const safeTmpdir = tmpdir
+const safeDir = Dir
+const safeDirname = dirname
+const safeJoin = join
+const safeResolve = resolve
+const pathSeparator = sep
+const safeDomainToASCII = domainToASCII
+const safeFileURLToPath = fileURLToPath
 const FILE_TYPE_MASK = constants.S_IFMT
 const DIRECTORY_FILE_TYPE = constants.S_IFDIR
 const REGULAR_FILE_TYPE = constants.S_IFREG
@@ -29,35 +62,49 @@ const SYMBOLIC_LINK_FILE_TYPE = constants.S_IFLNK
 const READ_ONLY_SAFE_OPEN_FLAGS = constants.O_RDONLY |
   (constants.O_NOFOLLOW ?? 0) |
   (constants.O_NONBLOCK ?? 0)
+const WRITE_NEW_FILE_FLAGS = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL
 export const SNAPSHOT_CLEANUP_SETTLE_MS = 250
 const SafePromise = Promise
+const SafeMap = Map
+const safeMapGet = Map.prototype.get
+const safeMapHas = Map.prototype.has
+const safeMapSet = Map.prototype.set
 const safeArrayPop = Array.prototype.pop
 const safeArrayPush = Array.prototype.push
+const safeArrayJoin = Array.prototype.join
+const safeArraySlice = Array.prototype.slice
 const safeAbortSignalAborted = Object.getOwnPropertyDescriptor(AbortSignal.prototype, 'aborted').get
 const safeAbortSignalReason = Object.getOwnPropertyDescriptor(AbortSignal.prototype, 'reason').get
 const safeBufferAllocUnsafe = Buffer.allocUnsafe
 const safeBufferConcat = Buffer.concat
+const safeBufferFrom = Buffer.from
 const safeBufferSubarray = Buffer.prototype.subarray
 const safeClearTimeout = globalThis.clearTimeout
 const safeMathMin = Math.min
+const safeObjectCreate = Object.create
 const safeObjectDefineProperty = Object.defineProperty
 const safeObjectFreeze = Object.freeze
+const safeObjectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor
+const safeObjectHasOwn = Object.hasOwn
 const safeProcessEmitWarning = process.emitWarning
 const safePromiseThen = Promise.prototype.then
 const safeReflectApply = Reflect.apply
-const safeCloseDescriptor = closeDescriptor
-const safeDirClose = Dir.prototype.close
-const safeDirRead = Dir.prototype.read
-const safeOpenDescriptor = openDescriptor
-const safeReadDescriptor = readDescriptor
+const safeReflectOwnKeys = Reflect.ownKeys
+const safeDirClose = safeDir.prototype.close
+const safeDirRead = safeDir.prototype.read
 const safeRealPath = realPath.native
-const safeStatDescriptor = statDescriptor
 const safeSetAdd = Set.prototype.add
 const safeSetHas = Set.prototype.has
 const safeSetTimeout = globalThis.setTimeout
 const safeStringEndsWith = String.prototype.endsWith
 const safeStringIncludes = String.prototype.includes
 const safeStringStartsWith = String.prototype.startsWith
+const safeStringSlice = String.prototype.slice
+const safeStringSplit = String.prototype.split
+const safeStringPadStart = String.prototype.padStart
+const safeStringCharCodeAt = String.prototype.charCodeAt
+const safeNumberToString = Number.prototype.toString
+const safeEncodeURIComponent = globalThis.encodeURIComponent
 const safeTypedArrayByteLength = Object.getOwnPropertyDescriptor(
   Object.getPrototypeOf(Uint8Array.prototype),
   'byteLength'
@@ -65,12 +112,14 @@ const safeTypedArrayByteLength = Object.getOwnPropertyDescriptor(
 const safeWeakMapGet = WeakMap.prototype.get
 const safeWeakMapSet = WeakMap.prototype.set
 const SafeSet = Set
+const safeSetValues = Set.prototype.values
+const safeSetIteratorNext = Object.getPrototypeOf(new SafeSet().values()).next
 const safeUrlHref = Object.getOwnPropertyDescriptor(URL.prototype, 'href').get
 const timeoutPrototypeProbe = safeSetTimeout(() => {}, 0)
 const safeTimeoutUnref = timeoutPrototypeProbe.unref
 safeClearTimeout(timeoutPrototypeProbe)
 const cleanupUntilRemovedByError = new WeakMap()
-const hostPlatform = platform()
+const hostPlatform = safePlatform()
 
 const SAFE_PROMISE_CONSTRUCTOR_DESCRIPTOR = safeObjectFreeze({
   configurable: false,
@@ -78,18 +127,72 @@ const SAFE_PROMISE_CONSTRUCTOR_DESCRIPTOR = safeObjectFreeze({
   value: undefined,
   writable: false
 })
+const NATIVE_AWAIT_PROMISE_CONSTRUCTOR_DESCRIPTOR = safeObjectFreeze({
+  configurable: false,
+  enumerable: false,
+  value: SafePromise,
+  writable: false
+})
 
 function hardenSafePromise (promise) {
-  safeReflectApply(safeObjectDefineProperty, Object, [
-    promise,
-    'constructor',
-    SAFE_PROMISE_CONSTRUCTOR_DESCRIPTOR
-  ])
+  const descriptor = safeReflectApply(
+    safeObjectGetOwnPropertyDescriptor,
+    undefined,
+    [promise, 'constructor']
+  )
+  if (!descriptor || !safeReflectApply(safeObjectHasOwn, undefined, [descriptor, 'value']) ||
+      descriptor.value !== undefined || descriptor.writable !== false ||
+      descriptor.enumerable !== false || descriptor.configurable !== false) {
+    safeReflectApply(safeObjectDefineProperty, undefined, [
+      promise,
+      'constructor',
+      SAFE_PROMISE_CONSTRUCTOR_DESCRIPTOR
+    ])
+  }
   return promise
 }
 
 function createSafePromise (executor) {
   return hardenSafePromise(new SafePromise(executor))
+}
+
+function createValueOutcome (value) {
+  const outcome = safeObjectCreate(null)
+  safeReflectApply(safeObjectDefineProperty, undefined, [outcome, 'value', {
+    configurable: false,
+    enumerable: true,
+    value,
+    writable: false
+  }])
+  return safeObjectFreeze(outcome)
+}
+
+function createRecord (properties) {
+  const record = safeObjectCreate(null)
+  const keys = safeReflectApply(safeReflectOwnKeys, undefined, [properties])
+  for (let index = 0; index < keys.length; index++) {
+    const key = keys[index]
+    safeReflectApply(safeObjectDefineProperty, undefined, [record, key, {
+      configurable: false,
+      enumerable: true,
+      value: properties[key],
+      writable: false
+    }])
+  }
+  return safeObjectFreeze(record)
+}
+
+function awaitSafePromise (promise) {
+  hardenSafePromise(promise)
+  const bridge = new SafePromise((resolve, reject) => {
+    safeReflectApply(safePromiseThen, promise, [resolve, reject])
+  })
+  safeReflectApply(safeObjectDefineProperty, undefined, [
+    bridge,
+    'constructor',
+    NATIVE_AWAIT_PROMISE_CONSTRUCTOR_DESCRIPTOR
+  ])
+  return bridge
 }
 
 function thenSafePromise (promise, onFulfilled, onRejected) {
@@ -115,36 +218,98 @@ function callbackOperation (invoke) {
   })
 }
 
+function callbackValueOperation (invoke) {
+  return createSafePromise((resolve, reject) => {
+    invoke((error, value) => {
+      if (error) reject(error)
+      else resolve(createValueOutcome(value))
+    })
+  })
+}
+
 function realpath (path) {
   return callbackOperation(callback => safeRealPath(path, callback))
 }
 
 function lstat (path) {
-  return callbackOperation(callback => lstatPath(path, callback))
+  return callbackValueOperation(callback => safeLstatPath(path, callback))
 }
 
 function stat (path) {
-  return callbackOperation(callback => statPath(path, callback))
+  return callbackValueOperation(callback => safeStatPath(path, callback))
+}
+
+function link (existingPath, newPath) {
+  return callbackOperation(callback => safeLinkPath(existingPath, newPath, callback))
 }
 
 function mkdir (path, options) {
-  return callbackOperation(callback => mkdirPath(path, options, callback))
+  return callbackOperation(callback => safeMkdirPath(path, options, callback))
 }
 
 function mkdtemp (prefix) {
-  return callbackOperation(callback => makeTemporaryDirectory(prefix, callback))
+  return callbackOperation(callback => safeMakeTemporaryDirectory(prefix, callback))
 }
 
 function opendir (path) {
-  return callbackOperation(callback => openDirectory(path, callback))
+  return callbackValueOperation(callback => safeOpenDirectory(path, callback))
 }
 
-function rm (path, options) {
-  return callbackOperation(callback => removePath(path, options, callback))
+function chmod (path, mode) {
+  return callbackOperation(callback => safeChmodPath(path, mode, callback))
+}
+
+function unlink (path) {
+  return callbackOperation(callback => safeUnlinkPath(path, callback))
+}
+
+function rmdir (path) {
+  return callbackOperation(callback => safeRemoveDirectoryPath(path, callback))
 }
 
 function writeFile (path, data, options) {
-  return callbackOperation(callback => writeFilePath(path, data, options, callback))
+  return createSafePromise((resolve, reject) => {
+    safeOpenDescriptor(path, WRITE_NEW_FILE_FLAGS, options.mode, (openError, descriptor) => {
+      if (openError) {
+        reject(openError)
+        return
+      }
+      const byteLength = safeReflectApply(safeTypedArrayByteLength, data, [])
+      let offset = 0
+      const finish = (error) => {
+        safeCloseDescriptor(descriptor, (closeError) => {
+          if (error || closeError) reject(error ?? closeError)
+          else resolve()
+        })
+      }
+      const writeNext = () => {
+        if (offset === byteLength) {
+          finish()
+          return
+        }
+        safeWriteDescriptor(
+          descriptor,
+          data,
+          offset,
+          byteLength - offset,
+          null,
+          (error, bytesWritten) => {
+            if (error) {
+              finish(error)
+              return
+            }
+            if (bytesWritten <= 0) {
+              finish(new SafeError('A staged file could not be written completely'))
+              return
+            }
+            offset += bytesWritten
+            writeNext()
+          }
+        )
+      }
+      writeNext()
+    })
+  })
 }
 
 function openFileDescriptor (path, flags) {
@@ -157,12 +322,7 @@ function openFileDescriptor (path, flags) {
 }
 
 function statFileDescriptor (descriptor) {
-  return createSafePromise((resolve, reject) => {
-    safeStatDescriptor(descriptor, (error, stats) => {
-      if (error) reject(error)
-      else resolve(stats)
-    })
-  })
+  return callbackValueOperation(callback => safeStatDescriptor(descriptor, callback))
 }
 
 function readFileDescriptor (descriptor, buffer) {
@@ -185,11 +345,8 @@ function closeFileDescriptor (descriptor) {
 }
 
 function readDirectory (directory) {
-  return createSafePromise((resolve, reject) => {
-    safeReflectApply(safeDirRead, directory, [(error, entry) => {
-      if (error) reject(error)
-      else resolve(entry)
-    }])
+  return callbackValueOperation(callback => {
+    safeReflectApply(safeDirRead, directory, [callback])
   })
 }
 
@@ -200,6 +357,73 @@ function closeDirectory (directory) {
       else resolve()
     }])
   })
+}
+
+function ownErrorCode (error) {
+  if (error === null || (typeof error !== 'object' && typeof error !== 'function')) return undefined
+  const descriptor = safeReflectApply(safeObjectGetOwnPropertyDescriptor, undefined, [error, 'code'])
+  return descriptor && safeReflectApply(safeObjectHasOwn, undefined, [descriptor, 'value'])
+    ? descriptor.value
+    : undefined
+}
+
+async function removeEntry (path, directory) {
+  const operation = directory ? rmdir : unlink
+  try {
+    await awaitSafePromise(operation(path))
+  } catch (error) {
+    // Windows rejects removal of read-only files with EPERM. Staged files are
+    // deliberately written mode 0400, so make only the package-owned snapshot
+    // entry writable and retry through captured callback APIs.
+    if (hostPlatform !== 'win32' || ownErrorCode(error) !== 'EPERM') throw error
+    await awaitSafePromise(chmod(path, directory ? 0o700 : 0o600))
+    await awaitSafePromise(operation(path))
+  }
+}
+
+async function removeTreeOnce (path) {
+  let stats
+  try {
+    stats = (await awaitSafePromise(lstat(path))).value
+  } catch (error) {
+    if (ownErrorCode(error) === 'ENOENT') return
+    throw error
+  }
+  if (!isDirectoryMode(stats.mode) || isSymbolicLinkMode(stats.mode)) {
+    await removeEntry(path, false)
+    return
+  }
+  const directory = (await awaitSafePromise(opendir(path))).value
+  try {
+    while (true) {
+      const entry = (await awaitSafePromise(readDirectory(directory))).value
+      if (entry === null) break
+      await awaitSafePromise(removeTreeOnce(safeJoin(path, entry.name)))
+    }
+  } finally {
+    await awaitSafePromise(closeDirectory(directory))
+  }
+  await removeEntry(path, true)
+}
+
+async function rm (path, options) {
+  const maximumAttempts = (options?.maxRetries ?? 0) + 1
+  let lastError
+  for (let attempt = 0; attempt < maximumAttempts; attempt++) {
+    try {
+      await awaitSafePromise(removeTreeOnce(path))
+      return
+    } catch (error) {
+      lastError = error
+      if (attempt + 1 < maximumAttempts) {
+        await awaitSafePromise(createSafePromise(resolve => {
+          const timer = safeSetTimeout(resolve, options?.retryDelay ?? 0)
+          safeReflectApply(safeTimeoutUnref, timer, [])
+        }))
+      }
+    }
+  }
+  throw lastError
 }
 
 function isFileMode (mode) {
@@ -235,7 +459,7 @@ function toPath (value, name) {
     if (safeReflectApply(safeStringIncludes, value, ['://'])) {
       throw new TypeError(`${name} must be a path string or file URL`)
     }
-    return resolve(value)
+    return safeResolve(value)
   }
   let isUrl = false
   if (value !== null && typeof value === 'object') {
@@ -246,7 +470,7 @@ function toPath (value, name) {
   }
   if (isUrl) {
     try {
-      return fileURLToPath(value)
+      return safeFileURLToPath(value)
     } catch {
       throw new TypeError(`${name} URL must use the file: protocol`)
     }
@@ -254,22 +478,92 @@ function toPath (value, name) {
   throw new TypeError(`${name} must be a path string or file URL`)
 }
 
+function encodeFileUrlSegment (segment) {
+  return safeReflectApply(safeEncodeURIComponent, undefined, [segment])
+}
+
+function fileUrlHrefForPath (path) {
+  const windows = hostPlatform === 'win32'
+  let href
+  if (!windows) {
+    if (!safeReflectApply(safeStringStartsWith, path, ['/']) ||
+        safeReflectApply(safeStringIncludes, path, ['\\'])) {
+      throw modulePathError(
+        'The private module snapshot path cannot be represented as a file URL',
+        'ERR_UNTRUSTED_MODULE_CHANGED'
+      )
+    }
+    const segments = safeReflectApply(safeStringSplit, path, ['/'])
+    for (let index = 0; index < segments.length; index++) {
+      segments[index] = encodeFileUrlSegment(segments[index])
+    }
+    href = 'file://' + safeReflectApply(safeArrayJoin, segments, ['/'])
+  } else if (safeReflectApply(safeStringStartsWith, path, ['\\\\'])) {
+    const segments = safeReflectApply(safeStringSplit, path, ['\\'])
+    const hostname = safeReflectApply(safeDomainToASCII, undefined, [segments[2]])
+    if (hostname.length === 0 || segments.length < 4 || segments[3].length === 0) {
+      throw modulePathError(
+        'The private module snapshot UNC path cannot be represented as a file URL',
+        'ERR_UNTRUSTED_MODULE_CHANGED'
+      )
+    }
+    for (let index = 3; index < segments.length; index++) {
+      segments[index] = encodeFileUrlSegment(segments[index])
+    }
+    href = 'file://' + hostname + '/' +
+      safeReflectApply(safeArrayJoin, safeReflectApply(safeArraySlice, segments, [3]), ['/'])
+  } else {
+    const drive = safeReflectApply(safeStringSlice, path, [0, 2])
+    const driveCode = safeReflectApply(safeStringCharCodeAt, drive, [0]) | 0x20
+    if (drive.length !== 2 || drive[1] !== ':' || driveCode < 0x61 || driveCode > 0x7a ||
+        (path.length > 2 && path[2] !== '\\')) {
+      throw modulePathError(
+        'The private module snapshot drive path cannot be represented as a file URL',
+        'ERR_UNTRUSTED_MODULE_CHANGED'
+      )
+    }
+    const segments = safeReflectApply(
+      safeStringSplit,
+      safeReflectApply(safeStringSlice, path, [3]),
+      ['\\']
+    )
+    for (let index = 0; index < segments.length; index++) {
+      segments[index] = encodeFileUrlSegment(segments[index])
+    }
+    href = 'file:///' + drive + '/' + safeReflectApply(safeArrayJoin, segments, ['/'])
+  }
+
+  const options = { windows }
+  if (safeFileURLToPath(href, options) !== path) {
+    throw modulePathError(
+      'The private module snapshot URL could not be verified',
+      'ERR_UNTRUSTED_MODULE_CHANGED'
+    )
+  }
+  return href
+}
+
+function relativeWithin (root, candidate) {
+  if (candidate === root) return ''
+  const prefix = safeReflectApply(safeStringEndsWith, root, [pathSeparator])
+    ? root
+    : root + pathSeparator
+  if (!safeReflectApply(safeStringStartsWith, candidate, [prefix])) return undefined
+  return safeReflectApply(safeStringSlice, candidate, [prefix.length])
+}
+
 function isWithin (root, candidate) {
-  const pathFromRoot = relative(root, candidate)
-  return pathFromRoot === '' ||
-    (pathFromRoot !== '..' &&
-     !safeReflectApply(safeStringStartsWith, pathFromRoot, [`..${sep}`]) &&
-     !isAbsolute(pathFromRoot))
+  return relativeWithin(root, candidate) !== undefined
 }
 
 async function canonicalPath (path, label, signal) {
   throwIfAborted(signal)
   try {
-    const canonical = await hardenSafePromise(realpath(path))
+    const canonical = await awaitSafePromise(realpath(path))
     throwIfAborted(signal)
     return canonical
   } catch (error) {
-    if (error?.name === 'AbortError') throw error
+    if (safeIsAbortError(error)) throw error
     throw modulePathError(`${label} could not be resolved`, 'ERR_UNTRUSTED_MODULE_PATH')
   }
 }
@@ -281,7 +575,7 @@ async function readBoundedFile (descriptor, maxFileBytes, signal) {
     throwIfAborted(signal)
     const remaining = maxFileBytes - total + 1
     const buffer = safeBufferAllocUnsafe(safeMathMin(READ_CHUNK_BYTES, remaining))
-    const bytesRead = await hardenSafePromise(readFileDescriptor(descriptor, buffer))
+    const bytesRead = await awaitSafePromise(readFileDescriptor(descriptor, buffer))
     if (bytesRead === 0) break
     total += bytesRead
     if (total > maxFileBytes) {
@@ -294,7 +588,7 @@ async function readBoundedFile (descriptor, maxFileBytes, signal) {
       safeReflectApply(safeBufferSubarray, buffer, [0, bytesRead])
     ])
   }
-  return safeReflectApply(safeBufferConcat, Buffer, [chunks, total])
+  return createValueOutcome(safeReflectApply(safeBufferConcat, undefined, [chunks, total]))
 }
 
 async function copyRegularFile (
@@ -307,8 +601,8 @@ async function copyRegularFile (
 ) {
   let descriptor
   try {
-    descriptor = await hardenSafePromise(openFileDescriptor(sourcePath, READ_ONLY_SAFE_OPEN_FLAGS))
-    const before = await hardenSafePromise(statFileDescriptor(descriptor))
+    descriptor = await awaitSafePromise(openFileDescriptor(sourcePath, READ_ONLY_SAFE_OPEN_FLAGS))
+    const before = (await awaitSafePromise(statFileDescriptor(descriptor))).value
     if (!isFileMode(before.mode)) {
       throw modulePathError(
         'rootDirectory may contain only regular files and directories',
@@ -325,14 +619,14 @@ async function copyRegularFile (
     // Verify the pathname still names the held file and remains in the root.
     // Reading occurs from the handle, so a later pathname replacement cannot
     // redirect this copy to a different file.
-    const canonical = await hardenSafePromise(canonicalPath(sourcePath, 'A root file', signal))
+    const canonical = await awaitSafePromise(canonicalPath(sourcePath, 'A root file', signal))
     if (!isWithin(rootPath, canonical)) {
       throw modulePathError(
         'rootDirectory changed while it was being staged',
         'ERR_UNTRUSTED_MODULE_CHANGED'
       )
     }
-    const current = await hardenSafePromise(stat(canonical))
+    const current = (await awaitSafePromise(stat(canonical))).value
     if (before.dev !== current.dev || before.ino !== current.ino) {
       throw modulePathError(
         'rootDirectory changed while it was being staged',
@@ -340,8 +634,8 @@ async function copyRegularFile (
       )
     }
 
-    const data = await hardenSafePromise(readBoundedFile(descriptor, limits.maxFileBytes, signal))
-    const after = await hardenSafePromise(statFileDescriptor(descriptor))
+    const data = (await awaitSafePromise(readBoundedFile(descriptor, limits.maxFileBytes, signal))).value
+    const after = (await awaitSafePromise(statFileDescriptor(descriptor))).value
     if (before.size !== after.size || before.mtimeMs !== after.mtimeMs ||
         before.ctimeMs !== after.ctimeMs ||
         safeReflectApply(safeTypedArrayByteLength, data, []) !== after.size) {
@@ -357,14 +651,14 @@ async function copyRegularFile (
         'ERR_UNTRUSTED_MODULE_ROOT_LIMIT'
       )
     }
-    await hardenSafePromise(writeFile(destinationPath, data, { flag: 'wx', mode: 0o400 }))
+    await awaitSafePromise(writeFile(destinationPath, data, { flag: 'wx', mode: 0o400 }))
   } catch (error) {
-    if (error instanceof UntrustedCodeError || error?.name === 'AbortError') throw error
+    if (safeIsUntrustedCodeError(error) || safeIsAbortError(error)) throw error
     throw modulePathError('rootDirectory changed while it was being staged', 'ERR_UNTRUSTED_MODULE_CHANGED')
   } finally {
     if (descriptor !== undefined) {
       try {
-        await hardenSafePromise(closeFileDescriptor(descriptor))
+        await awaitSafePromise(closeFileDescriptor(descriptor))
       } catch {}
     }
   }
@@ -377,7 +671,7 @@ async function stageRootTree (rootPath, stagePath, limits, signal) {
   while (pending.length > 0) {
     throwIfAborted(signal)
     const directory = safeReflectApply(safeArrayPop, pending, [])
-    const canonicalDirectory = await hardenSafePromise(canonicalPath(directory.source, 'A root directory', signal))
+    const canonicalDirectory = await awaitSafePromise(canonicalPath(directory.source, 'A root directory', signal))
     if (!isWithin(rootPath, canonicalDirectory)) {
       throw modulePathError(
         'rootDirectory changed while it was being staged',
@@ -386,10 +680,10 @@ async function stageRootTree (rootPath, stagePath, limits, signal) {
     }
 
     try {
-      const directoryHandle = await hardenSafePromise(opendir(directory.source))
+      const directoryHandle = (await awaitSafePromise(opendir(directory.source))).value
       try {
         while (true) {
-          const entry = await hardenSafePromise(readDirectory(directoryHandle))
+          const entry = (await awaitSafePromise(readDirectory(directoryHandle))).value
           if (entry === null) break
           throwIfAborted(signal)
           if (++accounting.entries > limits.maxRootEntries) {
@@ -398,9 +692,9 @@ async function stageRootTree (rootPath, stagePath, limits, signal) {
               'ERR_UNTRUSTED_MODULE_ROOT_LIMIT'
             )
           }
-          const sourcePath = join(directory.source, entry.name)
-          const destinationPath = join(directory.destination, entry.name)
-          const entryStats = await hardenSafePromise(lstat(sourcePath))
+          const sourcePath = safeJoin(directory.source, entry.name)
+          const destinationPath = safeJoin(directory.destination, entry.name)
+          const entryStats = (await awaitSafePromise(lstat(sourcePath))).value
           if (isSymbolicLinkMode(entryStats.mode)) {
             throw modulePathError(
               'rootDirectory must not contain symbolic links',
@@ -408,13 +702,13 @@ async function stageRootTree (rootPath, stagePath, limits, signal) {
             )
           }
           if (isDirectoryMode(entryStats.mode)) {
-            await hardenSafePromise(mkdir(destinationPath, { mode: 0o700 }))
+            await awaitSafePromise(mkdir(destinationPath, { mode: 0o700 }))
             safeReflectApply(safeArrayPush, pending, [{
               source: sourcePath,
               destination: destinationPath
             }])
           } else if (isFileMode(entryStats.mode)) {
-            await hardenSafePromise(copyRegularFile(
+            await awaitSafePromise(copyRegularFile(
               sourcePath,
               destinationPath,
               rootPath,
@@ -425,7 +719,7 @@ async function stageRootTree (rootPath, stagePath, limits, signal) {
             safeReflectApply(
               safeSetAdd,
               accounting.stagedFiles,
-              [relative(rootPath, sourcePath)]
+              [relativeWithin(rootPath, sourcePath)]
             )
           } else {
             throw modulePathError(
@@ -435,17 +729,92 @@ async function stageRootTree (rootPath, stagePath, limits, signal) {
           }
         }
       } finally {
-        await hardenSafePromise(closeDirectory(directoryHandle))
+        await awaitSafePromise(closeDirectory(directoryHandle))
       }
     } catch (error) {
-      if (error instanceof UntrustedCodeError || error?.name === 'AbortError') throw error
+      if (safeIsUntrustedCodeError(error) || safeIsAbortError(error)) throw error
       throw modulePathError(
         'rootDirectory changed while it was being staged',
         'ERR_UNTRUSTED_MODULE_CHANGED'
       )
     }
   }
-  return accounting.stagedFiles
+  return createValueOutcome(accounting.stagedFiles)
+}
+
+function safeAliasSegment (segment) {
+  if (!safeReflectApply(safeStringIncludes, segment, ['\\'])) return segment
+  let encoded = ''
+  const bytes = safeBufferFrom(segment, 'utf8')
+  const byteLength = safeReflectApply(safeTypedArrayByteLength, bytes, [])
+  for (let index = 0; index < byteLength; index++) {
+    encoded += safeReflectApply(
+      safeStringPadStart,
+      safeReflectApply(safeNumberToString, bytes[index], [16]),
+      [2, '0']
+    )
+  }
+  return '.secure-eval-worker-segment-' + encoded
+}
+
+async function createEntryAlias (stagePath, stagedFiles, signal) {
+  throwIfAborted(signal)
+  const aliasName = '.secure-eval-worker-entry-' + safeRandomUUID()
+  const aliasRoot = safeJoin(stagePath, aliasName)
+  await awaitSafePromise(mkdir(aliasRoot, { mode: 0o700 }))
+  throwIfAborted(signal)
+  const destinations = new SafeMap()
+  safeReflectApply(safeMapSet, destinations, ['', 'directory\0'])
+  const iterator = safeReflectApply(safeSetValues, stagedFiles, [])
+  while (true) {
+    throwIfAborted(signal)
+    const item = safeReflectApply(safeSetIteratorNext, iterator, [])
+    if (item.done) break
+    const relativePath = item.value
+    const segments = safeReflectApply(safeStringSplit, relativePath, [pathSeparator])
+    let sourcePath = stagePath
+    let destinationPath = aliasRoot
+    let sourceRelative = ''
+    let destinationRelative = ''
+    for (let index = 0; index < segments.length; index++) {
+      throwIfAborted(signal)
+      const sourceSegment = segments[index]
+      const destinationSegment = safeAliasSegment(sourceSegment)
+      sourcePath = safeJoin(sourcePath, sourceSegment)
+      destinationPath = safeJoin(destinationPath, destinationSegment)
+      sourceRelative = sourceRelative === ''
+        ? sourceSegment
+        : safeJoin(sourceRelative, sourceSegment)
+      destinationRelative = destinationRelative === ''
+        ? destinationSegment
+        : safeJoin(destinationRelative, destinationSegment)
+      const last = index === segments.length - 1
+      const identity = (last ? 'file\0' : 'directory\0') + sourceRelative
+      if (safeReflectApply(safeMapHas, destinations, [destinationRelative])) {
+        if (safeReflectApply(safeMapGet, destinations, [destinationRelative]) !== identity) {
+          throw modulePathError(
+            'A staged entry alias would collide with another root path',
+            'ERR_UNTRUSTED_MODULE_CHANGED'
+          )
+        }
+        continue
+      }
+      safeReflectApply(safeMapSet, destinations, [destinationRelative, identity])
+      throwIfAborted(signal)
+      if (last) await awaitSafePromise(link(sourcePath, destinationPath))
+      else await awaitSafePromise(mkdir(destinationPath, { mode: 0o700 }))
+      throwIfAborted(signal)
+    }
+  }
+  return aliasRoot
+}
+
+function aliasedRelativePath (relativePath) {
+  const segments = safeReflectApply(safeStringSplit, relativePath, [pathSeparator])
+  for (let index = 0; index < segments.length; index++) {
+    segments[index] = safeAliasSegment(segments[index])
+  }
+  return safeReflectApply(safeArrayJoin, segments, [pathSeparator])
 }
 
 export async function attemptLocalModuleCleanup (
@@ -454,7 +823,7 @@ export async function attemptLocalModuleCleanup (
 ) {
   let timer
   const timeout = createSafePromise((resolve) => {
-    timer = safeSetTimeout(() => resolve(safeObjectFreeze({ status: 'pending' })), timeoutMs)
+    timer = safeSetTimeout(() => resolve(createRecord({ status: 'pending' })), timeoutMs)
   })
   const attempt = createSafePromise((resolve, reject) => {
     let cleanup
@@ -468,11 +837,11 @@ export async function attemptLocalModuleCleanup (
   })
   const outcome = thenSafePromise(
     attempt,
-    () => safeObjectFreeze({ status: 'removed' }),
-    (error) => safeObjectFreeze({ status: 'failed', error })
+    () => createRecord({ status: 'removed' }),
+    (error) => createRecord({ status: 'failed', error })
   )
   try {
-    return await hardenSafePromise(raceSafePromises(outcome, timeout))
+    return createValueOutcome(await awaitSafePromise(raceSafePromises(outcome, timeout)))
   } finally {
     safeClearTimeout(timer)
   }
@@ -486,11 +855,11 @@ export async function attemptLocalModuleCleanup (
 export async function resolveLocalModule (modulePath, rootDirectory, limits, signal) {
   const requestedEntry = toPath(modulePath, 'modulePath')
   const requestedRoot = rootDirectory === undefined
-    ? dirname(requestedEntry)
+    ? safeDirname(requestedEntry)
     : toPath(rootDirectory, 'rootDirectory')
 
-  const rootPath = await hardenSafePromise(canonicalPath(requestedRoot, 'rootDirectory', signal))
-  const entryPath = await hardenSafePromise(canonicalPath(requestedEntry, 'modulePath', signal))
+  const rootPath = await awaitSafePromise(canonicalPath(requestedRoot, 'rootDirectory', signal))
+  const entryPath = await awaitSafePromise(canonicalPath(requestedEntry, 'modulePath', signal))
   if (!isWithin(rootPath, entryPath)) {
     throw modulePathError(
       'modulePath must resolve within rootDirectory',
@@ -501,8 +870,8 @@ export async function resolveLocalModule (modulePath, rootDirectory, limits, sig
   let rootStats
   let entryStats
   try {
-    rootStats = await hardenSafePromise(stat(rootPath))
-    entryStats = await hardenSafePromise(stat(entryPath))
+    rootStats = (await awaitSafePromise(stat(rootPath))).value
+    entryStats = (await awaitSafePromise(stat(entryPath))).value
   } catch {
     throw modulePathError('The local module paths could not be inspected', 'ERR_UNTRUSTED_MODULE_PATH')
   }
@@ -524,7 +893,7 @@ export async function resolveLocalModule (modulePath, rootDirectory, limits, sig
     }
     if (cleanupPromise) return cleanupPromise
     cleanupPromise = (async () => {
-      await hardenSafePromise(rm(stagePath, {
+      await awaitSafePromise(rm(stagePath, {
         force: true,
         maxRetries: 3,
         recursive: true,
@@ -533,7 +902,7 @@ export async function resolveLocalModule (modulePath, rootDirectory, limits, sig
       cleaned = true
     })()
     try {
-      await hardenSafePromise(cleanupPromise)
+      await awaitSafePromise(cleanupPromise)
     } finally {
       cleanupPromise = undefined
     }
@@ -543,7 +912,7 @@ export async function resolveLocalModule (modulePath, rootDirectory, limits, sig
     let retryDelayMs = 1_000
     while (!cleaned) {
       try {
-        await hardenSafePromise(cleanup())
+        await awaitSafePromise(cleanup())
       } catch {
         if (!warned) {
           warned = true
@@ -554,17 +923,17 @@ export async function resolveLocalModule (modulePath, rootDirectory, limits, sig
             ])
           } catch {}
         }
-        await createSafePromise((resolve) => {
+        await awaitSafePromise(createSafePromise((resolve) => {
           const timer = safeSetTimeout(resolve, retryDelayMs)
           safeReflectApply(safeTimeoutUnref, timer, [])
-        })
+        }))
         retryDelayMs = safeMathMin(retryDelayMs * 2, 60_000)
       }
     }
   }
 
   try {
-    stagePath = await hardenSafePromise(mkdtemp(join(tmpdir(), 'secure-eval-worker-modules-')))
+    stagePath = await awaitSafePromise(mkdtemp(safeJoin(safeTmpdir(), 'secure-eval-worker-modules-')))
     // macOS exposes /var and /tmp through /private. Node's module loader uses
     // the canonical spelling while its Permission Model compares the granted
     // path literally, so normalize these standard local aliases without an
@@ -581,32 +950,53 @@ export async function resolveLocalModule (modulePath, rootDirectory, limits, sig
         'ERR_UNTRUSTED_MODULE_ROOT'
       )
     }
-    const stagedFiles = await hardenSafePromise(stageRootTree(rootPath, stagePath, limits, signal))
+    const stagedFiles = (await awaitSafePromise(stageRootTree(rootPath, stagePath, limits, signal))).value
     throwIfAborted(signal)
 
-    const entryRelativePath = relative(rootPath, entryPath)
+    const entryRelativePath = relativeWithin(rootPath, entryPath)
     if (!safeReflectApply(safeSetHas, stagedFiles, [entryRelativePath])) {
       throw modulePathError(
         'modulePath changed while it was being staged',
         'ERR_UNTRUSTED_MODULE_CHANGED'
       )
     }
-    const stagedEntryPath = join(stagePath, entryRelativePath)
+    let stagedEntryPath = safeJoin(stagePath, entryRelativePath)
+    const locationReplacements = []
+    // A POSIX backslash is a legal path byte but ESM file URLs reject its
+    // percent-encoded form. Clone the immutable snapshot as hard links under a
+    // package-owned alias root and deterministically encode only backslash
+    // segments. This preserves relative imports and never grants authority
+    // beyond the already staged tree.
+    if (hostPlatform !== 'win32' &&
+        safeReflectApply(safeStringIncludes, entryRelativePath, ['\\'])) {
+      const aliasRoot = await awaitSafePromise(createEntryAlias(stagePath, stagedFiles, signal))
+      const aliasPathPrefix = aliasRoot + pathSeparator
+      stagedEntryPath = safeJoin(aliasRoot, aliasedRelativePath(entryRelativePath))
+      safeReflectApply(safeArrayPush, locationReplacements, [safeObjectFreeze([
+        fileUrlHrefForPath(aliasPathPrefix),
+        'secure-eval-worker-files/'
+      ])])
+      safeReflectApply(safeArrayPush, locationReplacements, [safeObjectFreeze([
+        aliasPathPrefix,
+        'secure-eval-worker-files/'
+      ])])
+    }
 
-    const rootPathPrefix = safeReflectApply(safeStringEndsWith, stagePath, [sep])
+    const rootPathPrefix = safeReflectApply(safeStringEndsWith, stagePath, [pathSeparator])
       ? stagePath
-      : stagePath + sep
-    return safeObjectFreeze({
-      entryUrl: pathToFileURL(stagedEntryPath).href,
+      : stagePath + pathSeparator
+    return createValueOutcome(createRecord({
+      entryUrl: fileUrlHrefForPath(stagedEntryPath),
       rootPath: stagePath,
       rootPathPrefix,
-      rootUrlPrefix: pathToFileURL(rootPathPrefix).href,
+      rootUrlPrefix: fileUrlHrefForPath(rootPathPrefix),
+      locationReplacements: safeObjectFreeze(locationReplacements),
       cleanup,
       cleanupUntilRemoved
-    })
+    }))
   } catch (error) {
     try {
-      await hardenSafePromise(cleanup())
+      await awaitSafePromise(cleanup())
     } catch {
       const error = modulePathError(
         'The private module snapshot could not be removed',

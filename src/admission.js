@@ -2,6 +2,7 @@ import { isMainThread } from 'node:worker_threads'
 
 import { UntrustedCodeError } from './internal.js'
 
+const safeIsMainThread = isMainThread
 const DEFAULT_MAX_CONCURRENT_WORKERS = 4
 const MAX_PROCESS_FILE_DESCRIPTORS = 256
 const DESCRIPTOR_SLOTS_BYTE_LENGTH = Int32Array.BYTES_PER_ELEMENT *
@@ -20,6 +21,7 @@ const numberIsSafeInteger = Number.isSafeInteger
 const objectDefineProperty = Object.defineProperty
 const objectFreeze = Object.freeze
 const objectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor
+const objectHasOwn = Object.hasOwn
 const objectIsFrozen = Object.isFrozen
 const reflectApply = Reflect.apply
 const sharedArrayBufferByteLength = Object.getOwnPropertyDescriptor(
@@ -155,14 +157,25 @@ let descriptorStateCreateWorkerQuota
 let descriptorStateGetWorkerData
 let descriptorStateRelease
 let legacyDescriptorState = false
+const ABSENT_GLOBAL_STATE = objectFreeze({})
+const MALFORMED_GLOBAL_STATE = objectFreeze({})
+
+function readGlobalState (key) {
+  const descriptor = reflectApply(objectGetOwnPropertyDescriptor, undefined, [globalThis, key])
+  if (descriptor === undefined) return ABSENT_GLOBAL_STATE
+  if (!reflectApply(objectHasOwn, undefined, [descriptor, 'value'])) {
+    return MALFORMED_GLOBAL_STATE
+  }
+  return descriptor.value
+}
 
 function immutableStateMethod (candidate, name) {
   const descriptor = reflectApply(
     objectGetOwnPropertyDescriptor,
-    Object,
+    undefined,
     [candidate, name]
   )
-  if (!descriptor || !('value' in descriptor) ||
+  if (!descriptor || !reflectApply(objectHasOwn, undefined, [descriptor, 'value']) ||
       typeof descriptor.value !== 'function' || descriptor.writable !== false ||
       descriptor.configurable !== false) return undefined
   return descriptor.value
@@ -170,7 +183,7 @@ function immutableStateMethod (candidate, name) {
 
 function captureControllerState (candidate, names) {
   if (candidate === null || typeof candidate !== 'object' ||
-      !reflectApply(objectIsFrozen, Object, [candidate])) return undefined
+      !reflectApply(objectIsFrozen, undefined, [candidate])) return undefined
   const captured = {}
   for (let index = 0; index < names.length; index++) {
     const method = immutableStateMethod(candidate, names[index])
@@ -180,9 +193,9 @@ function captureControllerState (candidate, names) {
   return objectFreeze(captured)
 }
 
-if (isMainThread) {
-  state = globalThis[STATE_KEY]
-  if (state === undefined) {
+if (safeIsMainThread) {
+  state = readGlobalState(STATE_KEY)
+  if (state === ABSENT_GLOBAL_STATE) {
     state = createState()
     objectDefineProperty(globalThis, STATE_KEY, {
       value: state,
@@ -192,8 +205,8 @@ if (isMainThread) {
     })
   }
 
-  preparationState = globalThis[PREPARATION_STATE_KEY]
-  if (preparationState === undefined) {
+  preparationState = readGlobalState(PREPARATION_STATE_KEY)
+  if (preparationState === ABSENT_GLOBAL_STATE) {
     preparationState = createPreparationState()
     objectDefineProperty(globalThis, PREPARATION_STATE_KEY, {
       value: preparationState,
@@ -218,8 +231,8 @@ if (isMainThread) {
     preparationStateConfigure = capturedPreparationState.configure
   }
 
-  descriptorState = globalThis[DESCRIPTOR_STATE_KEY]
-  if (descriptorState === undefined) {
+  descriptorState = readGlobalState(DESCRIPTOR_STATE_KEY)
+  if (descriptorState === ABSENT_GLOBAL_STATE) {
     descriptorState = createDescriptorState()
     objectDefineProperty(globalThis, DESCRIPTOR_STATE_KEY, {
       value: descriptorState,
@@ -230,29 +243,32 @@ if (isMainThread) {
   }
 
   if (descriptorState !== null && typeof descriptorState === 'object' &&
-      reflectApply(objectIsFrozen, Object, [descriptorState])) {
+      reflectApply(objectIsFrozen, undefined, [descriptorState])) {
     const createDescriptor = reflectApply(
       objectGetOwnPropertyDescriptor,
-      Object,
+      undefined,
       [descriptorState, 'createWorkerQuota']
     )
-    if (createDescriptor && 'value' in createDescriptor &&
+    if (createDescriptor &&
+        reflectApply(objectHasOwn, undefined, [createDescriptor, 'value']) &&
         typeof createDescriptor.value === 'function' &&
         createDescriptor.writable === false && createDescriptor.configurable === false) {
       const getDescriptor = reflectApply(
         objectGetOwnPropertyDescriptor,
-        Object,
+        undefined,
         [descriptorState, 'getWorkerData']
       )
       const releaseDescriptor = reflectApply(
         objectGetOwnPropertyDescriptor,
-        Object,
+        undefined,
         [descriptorState, 'release']
       )
-      const hasModernMethods = getDescriptor && 'value' in getDescriptor &&
+      const hasModernMethods = getDescriptor &&
+        reflectApply(objectHasOwn, undefined, [getDescriptor, 'value']) &&
         typeof getDescriptor.value === 'function' &&
         getDescriptor.writable === false && getDescriptor.configurable === false &&
-        releaseDescriptor && 'value' in releaseDescriptor &&
+        releaseDescriptor &&
+        reflectApply(objectHasOwn, undefined, [releaseDescriptor, 'value']) &&
         typeof releaseDescriptor.value === 'function' &&
         releaseDescriptor.writable === false && releaseDescriptor.configurable === false
       const hasNoModernMethods = getDescriptor === undefined && releaseDescriptor === undefined
@@ -326,10 +342,10 @@ function requireDescriptorState () {
 function immutableQuotaDataDescriptor (quota, name) {
   const descriptor = reflectApply(
     objectGetOwnPropertyDescriptor,
-    Object,
+    undefined,
     [quota, name]
   )
-  if (!descriptor || !('value' in descriptor) ||
+  if (!descriptor || !reflectApply(objectHasOwn, undefined, [descriptor, 'value']) ||
       descriptor.writable !== false || descriptor.configurable !== false) {
     throw descriptorAdmissionError()
   }
@@ -338,7 +354,7 @@ function immutableQuotaDataDescriptor (quota, name) {
 
 function validateDescriptorWorkerData (workerData) {
   if (workerData === null || typeof workerData !== 'object' ||
-      !reflectApply(objectIsFrozen, Object, [workerData])) {
+      !reflectApply(objectIsFrozen, undefined, [workerData])) {
     throw descriptorAdmissionError()
   }
   const owner = immutableQuotaDataDescriptor(workerData, 'owner')
@@ -349,7 +365,7 @@ function validateDescriptorWorkerData (workerData) {
   } catch {
     throw descriptorAdmissionError()
   }
-  if (!reflectApply(numberIsSafeInteger, Number, [owner]) ||
+  if (!reflectApply(numberIsSafeInteger, undefined, [owner]) ||
       owner <= 0 || owner > 0x7fffffff ||
       slotsByteLength !== DESCRIPTOR_SLOTS_BYTE_LENGTH) {
     throw descriptorAdmissionError()
@@ -385,7 +401,7 @@ function brandDescriptorQuota (quota, workerData, releaseHook) {
 
 function adaptLegacyDescriptorQuota (quota) {
   if (quota === null || typeof quota !== 'object' ||
-      !reflectApply(objectIsFrozen, Object, [quota])) {
+      !reflectApply(objectIsFrozen, undefined, [quota])) {
     throw descriptorAdmissionError()
   }
   const owner = immutableQuotaDataDescriptor(quota, 'owner')
@@ -464,7 +480,7 @@ export function releaseFileDescriptorQuota (quota) {
 
 export function configureWorkerAdmission (options) {
   if (options === null || typeof options !== 'object' ||
-      reflectApply(arrayIsArray, Array, [options])) {
+      reflectApply(arrayIsArray, undefined, [options])) {
     throw new TypeError('admission options must be an object')
   }
   const keys = reflectOwnKeys(options)
@@ -479,13 +495,13 @@ export function configureWorkerAdmission (options) {
   }
   const descriptor = reflectApply(
     objectGetOwnPropertyDescriptor,
-    Object,
+    undefined,
     [options, 'maxConcurrentWorkers']
   )
-  if (!descriptor || !('value' in descriptor)) {
+  if (!descriptor || !reflectApply(objectHasOwn, undefined, [descriptor, 'value'])) {
     throw new TypeError('maxConcurrentWorkers must be a data property')
   }
-  if (!reflectApply(numberIsSafeInteger, Number, [descriptor.value]) || descriptor.value <= 0) {
+  if (!reflectApply(numberIsSafeInteger, undefined, [descriptor.value]) || descriptor.value <= 0) {
     throw new RangeError('maxConcurrentWorkers must be a positive integer')
   }
   requireState()
@@ -498,23 +514,25 @@ function snapshotAdmissionStatus (status) {
   if (status === null || typeof status !== 'object') throw admissionUnavailableError()
   const maxDescriptor = reflectApply(
     objectGetOwnPropertyDescriptor,
-    Object,
+    undefined,
     [status, 'maxConcurrentWorkers']
   )
   const activeDescriptor = reflectApply(
     objectGetOwnPropertyDescriptor,
-    Object,
+    undefined,
     [status, 'activeWorkers']
   )
-  const maxConcurrentWorkers = maxDescriptor && 'value' in maxDescriptor
+  const maxConcurrentWorkers = maxDescriptor &&
+    reflectApply(objectHasOwn, undefined, [maxDescriptor, 'value'])
     ? maxDescriptor.value
     : undefined
-  const activeWorkers = activeDescriptor && 'value' in activeDescriptor
+  const activeWorkers = activeDescriptor &&
+    reflectApply(objectHasOwn, undefined, [activeDescriptor, 'value'])
     ? activeDescriptor.value
     : undefined
-  if (!reflectApply(numberIsSafeInteger, Number, [maxConcurrentWorkers]) ||
+  if (!reflectApply(numberIsSafeInteger, undefined, [maxConcurrentWorkers]) ||
       maxConcurrentWorkers <= 0 ||
-      !reflectApply(numberIsSafeInteger, Number, [activeWorkers]) || activeWorkers < 0) {
+      !reflectApply(numberIsSafeInteger, undefined, [activeWorkers]) || activeWorkers < 0) {
     throw admissionUnavailableError()
   }
   return objectFreeze({ maxConcurrentWorkers, activeWorkers })

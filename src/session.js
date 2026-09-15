@@ -4,17 +4,19 @@ import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { Readable } from 'node:stream'
 import { deserialize as v8Deserialize, serialize as v8Serialize } from 'node:v8'
-import { isPromise as hostIsPromise } from 'node:util/types'
+import { isPromise as hostIsPromise, isProxy as hostIsProxy } from 'node:util/types'
 import { MessagePort, Worker } from 'node:worker_threads'
 
 import {
   abortError,
   assertNoSharedMemory,
+  assertSafePromiseEnvironment,
   assertSupportedProtocolValue,
   cloneWithoutSharedMemory,
   DEFAULT_MAX_SOURCE_BYTES,
   remoteError,
   sanitizeEnvironment,
+  settleProtocolValue,
   UntrustedCodeError,
   validateResourceLimits,
   validateSource,
@@ -35,10 +37,20 @@ import {
   validateHostFunctions
 } from './host-functions.js'
 
+// Snapshot builtin ESM bindings before caller-controlled option processing can
+// synchronize poisoned CommonJS builtin exports.
 const safeHostIsPromise = hostIsPromise
+const safeHostIsProxy = hostIsProxy
+const safeHostCreateHmac = createHmac
+const safeHostRandomUUID = randomUUID
+const safeHostTimingSafeEqual = timingSafeEqual
+const safeHostV8Deserialize = v8Deserialize
+const safeHostV8Serialize = v8Serialize
+const SafeMessagePort = MessagePort
 const Error = globalThis.Error
 const TypeError = globalThis.TypeError
 const RangeError = globalThis.RangeError
+const hostRangeErrorPrototype = RangeError.prototype
 const AggregateError = globalThis.AggregateError
 const DEFAULT_STARTUP_TIMEOUT_MS = 1_000
 const DEFAULT_MESSAGE_TIMEOUT_MS = 1_000
@@ -59,12 +71,13 @@ const SafeMap = Map
 const SafePromise = Promise
 const safeArrayBufferIsView = ArrayBuffer.isView
 const hostArrayIsArray = Array.isArray
+const hostArrayPrototype = Array.prototype
 const hostArrayPush = Array.prototype.push
 const hostArrayShift = Array.prototype.shift
 const hostArraySplice = Array.prototype.splice
 const hostClearTimeout = globalThis.clearTimeout
 const hostDateNow = Date.now
-const hostHmacPrototype = Object.getPrototypeOf(createHmac('sha256', 'capture'))
+const hostHmacPrototype = Object.getPrototypeOf(safeHostCreateHmac('sha256', 'capture'))
 const hostHmacDigest = hostHmacPrototype.digest
 const hostHmacUpdate = hostHmacPrototype.update
 const hostObjectCreate = Object.create
@@ -83,7 +96,6 @@ const hostTypedArrayByteLength = Object.getOwnPropertyDescriptor(
   'byteLength'
 ).get
 const hostReflectApply = Reflect.apply
-const hostReflectDeleteProperty = Reflect.deleteProperty
 const hostReflectOwnKeys = Reflect.ownKeys
 const hostMapClear = Map.prototype.clear
 const hostMapDelete = Map.prototype.delete
@@ -98,10 +110,11 @@ const hostEventEmitterListenerCount = EventEmitter.prototype.listenerCount
 const hostEventEmitterOn = EventEmitter.prototype.on
 const hostEventEmitterOnce = EventEmitter.prototype.once
 const hostEventEmitterRemoveAllListeners = EventEmitter.prototype.removeAllListeners
-const hostMessagePortClose = MessagePort.prototype.close
-const hostMessagePortPostMessage = MessagePort.prototype.postMessage
-const hostMessagePortStart = MessagePort.prototype.start
-const hostMessagePortOn = Object.getPrototypeOf(MessagePort.prototype).on
+const hostMessagePortClose = SafeMessagePort.prototype.close
+const hostMessagePortHasRef = SafeMessagePort.prototype.hasRef
+const hostMessagePortPostMessage = SafeMessagePort.prototype.postMessage
+const hostMessagePortStart = SafeMessagePort.prototype.start
+const hostMessagePortOn = Object.getPrototypeOf(SafeMessagePort.prototype).on
 const hostReadableResume = Readable.prototype.resume
 const hostWorkerStderr = Object.getOwnPropertyDescriptor(Worker.prototype, 'stderr').get
 const hostWorkerStdout = Object.getOwnPropertyDescriptor(Worker.prototype, 'stdout').get
@@ -127,12 +140,16 @@ const sessionSecrets = new WeakMap()
 const sessionData = new WeakMap()
 const internalSessionOptions = new WeakMap()
 const diagnosticContextStorage = new AsyncLocalStorage()
-const HOST_TEMPORARY_PROMISE_CONSTRUCTOR_DESCRIPTOR = hostObjectFreeze({
-  configurable: true,
-  enumerable: false,
-  value: SafePromise,
-  writable: false
-})
+const hostPromisePrototype = SafePromise.prototype
+const hostPromisePrototypeConstructorDescriptor = hostObjectFreeze(
+  hostObjectGetOwnPropertyDescriptor(hostPromisePrototype, 'constructor')
+)
+const hostPromiseSpeciesDescriptor = hostObjectFreeze(
+  hostObjectGetOwnPropertyDescriptor(SafePromise, Symbol.species)
+)
+const HOST_PROMISE_DESCRIPTOR_FIELDS = hostObjectFreeze([
+  'configurable', 'enumerable', 'writable', 'value', 'get', 'set'
+])
 const HOST_PROMISE_CONSTRUCTOR_DESCRIPTOR = hostObjectFreeze({
   configurable: false,
   enumerable: false,
@@ -147,74 +164,94 @@ const HOST_AWAIT_PROMISE_CONSTRUCTOR_DESCRIPTOR = hostObjectFreeze({
 })
 
 function hardenHostPromise (promise) {
-  hostReflectApply(hostObjectDefineProperty, Object, [
+  const descriptor = hostReflectApply(hostObjectGetOwnPropertyDescriptor, undefined, [
     promise,
-    'constructor',
-    HOST_PROMISE_CONSTRUCTOR_DESCRIPTOR
+    'constructor'
   ])
+  if (!descriptor || !hostReflectApply(hostObjectHasOwn, undefined, [descriptor, 'value']) ||
+      descriptor.value !== undefined || descriptor.writable !== false ||
+      descriptor.enumerable !== false || descriptor.configurable !== false) {
+    hostReflectApply(hostObjectDefineProperty, undefined, [
+      promise,
+      'constructor',
+      HOST_PROMISE_CONSTRUCTOR_DESCRIPTOR
+    ])
+  }
   return promise
 }
 
-async function awaitHostValue (value) {
-  return await value
+function createHostValueOutcome (value) {
+  const outcome = hostObjectCreate(null)
+  hostReflectApply(hostObjectDefineProperty, undefined, [outcome, 'value', {
+    configurable: false,
+    enumerable: true,
+    value,
+    writable: false
+  }])
+  return hostObjectFreeze(outcome)
 }
 
-function hasSafeHostPromiseConstructor (value) {
-  let current = value
+function sameHostDescriptor (actual, expected) {
+  if (actual === undefined || expected === undefined) return actual === expected
+  for (let index = 0; index < HOST_PROMISE_DESCRIPTOR_FIELDS.length; index++) {
+    const name = HOST_PROMISE_DESCRIPTOR_FIELDS[index]
+    const actualHas = hostReflectApply(hostObjectHasOwn, undefined, [actual, name])
+    const expectedHas = hostReflectApply(hostObjectHasOwn, undefined, [expected, name])
+    if (actualHas !== expectedHas || (actualHas && actual[name] !== expected[name])) return false
+  }
+  return true
+}
+
+function isCanonicalHostPromise (value) {
+  if ((typeof value !== 'object' || value === null) && typeof value !== 'function') return false
+  if (safeHostIsProxy(value) || !safeHostIsPromise(value)) return false
   try {
-    while (current !== null) {
-      const descriptor = hostReflectApply(hostObjectGetOwnPropertyDescriptor, Object, [
-        current,
-        'constructor'
-      ])
-      if (descriptor !== undefined) {
-        return hostReflectApply(hostObjectHasOwn, Object, [descriptor, 'value']) &&
-          descriptor.value === SafePromise
-      }
-      current = hostReflectApply(hostObjectGetPrototypeOf, Object, [current])
-    }
-  } catch {}
-  return false
+    return hostReflectApply(hostObjectGetPrototypeOf, undefined, [value]) === hostPromisePrototype &&
+      hostReflectApply(hostObjectGetOwnPropertyDescriptor, undefined, [value, 'constructor']) === undefined &&
+      sameHostDescriptor(
+        hostReflectApply(hostObjectGetOwnPropertyDescriptor, undefined, [hostPromisePrototype, 'constructor']),
+        hostPromisePrototypeConstructorDescriptor
+      ) &&
+      sameHostDescriptor(
+        hostReflectApply(hostObjectGetOwnPropertyDescriptor, undefined, [SafePromise, Symbol.species]),
+        hostPromiseSpeciesDescriptor
+      )
+  } catch {
+    return false
+  }
+}
+
+function unsafeHostPromiseRejection () {
+  return bridgeHostControlPromise(createHostPromise((resolve, reject) => {
+    reject(new TypeError('Promise cannot be observed safely'))
+  }))
 }
 
 function adoptHostValue (value) {
-  if (!safeHostIsPromise(value)) return hardenHostAwaitPromise(awaitHostValue(value))
-  const previous = hostReflectApply(hostObjectGetOwnPropertyDescriptor, Object, [
-    value,
-    'constructor'
-  ])
-  let installed = false
-  try {
-    hostReflectApply(hostObjectDefineProperty, Object, [
-      value,
-      'constructor',
-      HOST_TEMPORARY_PROMISE_CONSTRUCTOR_DESCRIPTOR
-    ])
-    installed = true
-  } catch {
-    if (!hasSafeHostPromiseConstructor(value)) {
-      return hardenHostAwaitPromise(new SafePromise((resolve, reject) => {
-        reject(new TypeError('Promise cannot be observed safely'))
-      }))
-    }
+  const objectLike = (typeof value === 'object' && value !== null) || typeof value === 'function'
+  if (objectLike && safeHostIsProxy(value)) return unsafeHostPromiseRejection()
+  if (!safeHostIsPromise(value)) {
+    return bridgeHostControlPromise(createHostPromise(resolve => {
+      resolve(createHostValueOutcome(value))
+    }))
   }
-  let adopted
-  try {
-    adopted = awaitHostValue(value)
-  } finally {
-    if (installed) {
-      if (previous) {
-        hostReflectApply(hostObjectDefineProperty, Object, [value, 'constructor', previous])
-      } else {
-        hostReflectApply(hostReflectDeleteProperty, Reflect, [value, 'constructor'])
-      }
+  if (!isCanonicalHostPromise(value)) return unsafeHostPromiseRejection()
+
+  const control = createHostPromise((resolve, reject) => {
+    try {
+      hostReflectApply(hostPromiseThen, value, [
+        result => resolve(createHostValueOutcome(result)),
+        reject
+      ])
+    } catch (error) {
+      reject(error)
     }
-  }
-  return hardenHostAwaitPromise(adopted)
+  })
+  return bridgeHostControlPromise(control)
 }
 
 function hardenHostAwaitPromise (promise) {
-  hostReflectApply(hostObjectDefineProperty, Object, [
+  hostReflectApply(hostObjectDefineProperty, undefined, [
     promise,
     'constructor',
     HOST_AWAIT_PROMISE_CONSTRUCTOR_DESCRIPTOR
@@ -224,6 +261,13 @@ function hardenHostAwaitPromise (promise) {
 
 function createHostPromise (executor) {
   return hardenHostPromise(new SafePromise(executor))
+}
+
+function bridgeHostControlPromise (promise) {
+  const bridge = new SafePromise((resolve, reject) => {
+    hostReflectApply(hostPromiseThen, promise, [resolve, reject])
+  })
+  return hardenHostAwaitPromise(bridge)
 }
 
 function getSessionSecrets (session) {
@@ -266,6 +310,16 @@ function chainHostPromise (promise, onFulfilled) {
       thenHostPromise(next, resolve, reject)
     }, reject)
   })
+}
+
+function isHostMessagePort (value) {
+  if (value === null || typeof value !== 'object') return false
+  try {
+    hostReflectApply(hostMessagePortHasRef, value, [])
+    return true
+  } catch {
+    return false
+  }
 }
 
 function closeHostMessagePort (port) {
@@ -344,14 +398,20 @@ const SESSION_BOOTSTRAP = String.raw`
 'use strict'
 ;(function trustedBootstrap() {
 
-const { createHmac, randomBytes } = require('node:crypto')
+const cryptoBuiltin = require('node:crypto')
+const { createHmac, randomBytes } = cryptoBuiltin
 const asyncHooksBuiltin = require('node:async_hooks')
+const eventEmitterPrototype = require('node:events').EventEmitter.prototype
 const fsBuiltin = require('node:fs')
 const fsPromisesBuiltin = require('node:fs/promises')
 const dgramBuiltin = require('node:dgram')
+const dnsBuiltin = require('node:dns')
+const dnsPromisesBuiltin = require('node:dns/promises')
 const httpBuiltin = require('node:http')
 const http2Builtin = require('node:http2')
 const httpsBuiltin = require('node:https')
+const httpGlobalAgent = httpBuiltin.globalAgent
+const httpsGlobalAgent = httpsBuiltin.globalAgent
 const moduleBuiltin = require('node:module')
 const netBuiltin = require('node:net')
 const osBuiltin = require('node:os')
@@ -363,6 +423,10 @@ const ttyBuiltin = require('node:tty')
 const v8Builtin = require('node:v8')
 const utilTypesBuiltin = require('node:util/types')
 const workerThreadsBuiltin = require('node:worker_threads')
+let traceEventsBuiltin
+let quicBuiltin
+try { traceEventsBuiltin = require('node:trace_events') } catch {}
+try { quicBuiltin = require('node:quic') } catch {}
 const networkAliasBuiltins = [
   require('_http_agent'),
   require('_http_client'),
@@ -374,8 +438,10 @@ const networkAliasBuiltins = [
   require('_tls_wrap')
 ]
 const { deserialize: v8Deserialize, serialize: v8Serialize } = v8Builtin
+const moduleLoad = moduleBuiltin._load
 const moduleNodeModulePaths = moduleBuiltin._nodeModulePaths
 const moduleResolveLookupPaths = moduleBuiltin._resolveLookupPaths
+const processGetBuiltinModule = processBuiltin.getBuiltinModule
 const { stripTypeScriptTypes } = moduleBuiltin
 const { MessageChannel, parentPort, workerData } = workerThreadsBuiltin
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor
@@ -383,6 +449,7 @@ const safeStructuredClone = globalThis.structuredClone
 const safeV8Deserialize = v8Deserialize
 const safeV8Serialize = v8Serialize
 const reflectApply = Reflect.apply
+const reflectDeleteProperty = Reflect.deleteProperty
 const safeAtomics = Atomics
 const hostAtomicsCompareExchange = Atomics.compareExchange
 const SafePromise = Promise
@@ -397,6 +464,9 @@ const SafeString = String
 const SafeNumber = Number
 const SafeWeakSet = WeakSet
 const numberIsSafeInteger = Number.isSafeInteger
+const maxSafeInteger = Number.MAX_SAFE_INTEGER
+const mathFloor = Math.floor
+const isNativeError = utilTypesBuiltin.isNativeError
 const isPromise = utilTypesBuiltin.isPromise
 const isProxy = utilTypesBuiltin.isProxy
 const promiseThen = Promise.prototype.then
@@ -407,6 +477,7 @@ const arrayBufferIsView = ArrayBuffer.isView
 const arrayIsArray = Array.isArray
 const weakSetHas = WeakSet.prototype.has
 const weakSetAdd = WeakSet.prototype.add
+const weakSetDelete = WeakSet.prototype.delete
 const arrayPush = Array.prototype.push
 const arrayPop = Array.prototype.pop
 const arrayJoin = Array.prototype.join
@@ -416,9 +487,11 @@ const mapSet = Map.prototype.set
 const mapDelete = Map.prototype.delete
 const mapEntries = Map.prototype.entries
 const mapIteratorNext = Object.getPrototypeOf(new Map().entries()).next
+const mapSize = Object.getOwnPropertyDescriptor(Map.prototype, 'size').get
 const setHas = Set.prototype.has
 const setValues = Set.prototype.values
 const setIteratorNext = Object.getPrototypeOf(new Set().values()).next
+const setSize = Object.getOwnPropertyDescriptor(Set.prototype, 'size').get
 const arrayBufferByteLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength').get
 const dateTime = Date.prototype.getTime
 const regexpSource = Object.getOwnPropertyDescriptor(RegExp.prototype, 'source').get
@@ -431,7 +504,6 @@ const typedArrayBuffer = Object.getOwnPropertyDescriptor(
 ).get
 const dataViewPrototype = DataView.prototype
 const dataViewBuffer = Object.getOwnPropertyDescriptor(dataViewPrototype, 'buffer').get
-const dataViewByteLength = Object.getOwnPropertyDescriptor(dataViewPrototype, 'byteLength').get
 const typedArrayLength = Object.getOwnPropertyDescriptor(
   Object.getPrototypeOf(Uint8Array.prototype),
   'length'
@@ -451,14 +523,36 @@ const objectGetPrototypeOf = Object.getPrototypeOf
 const objectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor
 const objectGetOwnPropertyDescriptors = Object.getOwnPropertyDescriptors
 const objectHasOwn = Object.hasOwn
+const objectIsExtensible = Object.isExtensible
 const objectPrototype = Object.prototype
-const reflectDeleteProperty = Reflect.deleteProperty
-const TEMPORARY_PROMISE_CONSTRUCTOR_DESCRIPTOR = objectFreeze({
-  configurable: true,
-  enumerable: false,
-  value: SafePromise,
-  writable: false
-})
+const moduleLocationReplacements = workerData.localModule
+  ? workerData.localModule.locationReplacements
+  : undefined
+if (moduleLocationReplacements) {
+  reflectApply(arrayPush, moduleLocationReplacements, [objectFreeze([
+    workerData.localModule.rootUrlPrefix,
+    'secure-eval-worker-files/'
+  ])])
+  reflectApply(arrayPush, moduleLocationReplacements, [objectFreeze([
+    workerData.localModule.rootPathPrefix,
+    'secure-eval-worker-files/'
+  ])])
+  for (let index = 0; index < moduleLocationReplacements.length; index++) {
+    objectFreeze(moduleLocationReplacements[index])
+  }
+  objectFreeze(moduleLocationReplacements)
+  objectFreeze(workerData.localModule)
+}
+const promisePrototype = SafePromise.prototype
+const promisePrototypeConstructorDescriptor = objectFreeze(
+  objectGetOwnPropertyDescriptor(promisePrototype, 'constructor')
+)
+const promiseSpeciesDescriptor = objectFreeze(
+  objectGetOwnPropertyDescriptor(SafePromise, Symbol.species)
+)
+const PROMISE_DESCRIPTOR_FIELDS = objectFreeze([
+  'configurable', 'enumerable', 'writable', 'value', 'get', 'set'
+])
 const PROMISE_CONSTRUCTOR_DESCRIPTOR = objectFreeze({
   configurable: false,
   enumerable: false,
@@ -475,6 +569,7 @@ const arrayPrototype = Array.prototype
 const arrayBufferPrototype = ArrayBuffer.prototype
 const datePrototype = Date.prototype
 const regexpPrototype = RegExp.prototype
+const syntaxErrorPrototype = SafeSyntaxError.prototype
 const mapPrototype = Map.prototype
 const setPrototype = Set.prototype
 const allowedViewPrototypes = new Set([
@@ -527,6 +622,8 @@ let diagnosticSequence = 0
 let diagnosticRecords = 0
 let diagnosticBytes = 0
 let handler
+const controlPromises = new SafeWeakSet()
+const promiseSettlementGuardedValues = new SafeWeakSet()
 let processing = SafePromise.resolve()
 let nextHostCallId = 1
 let outputMessages = 0
@@ -534,76 +631,151 @@ let outputBytes = 0
 const pendingHostCalls = new Map()
 
 function hardenPromise(promise) {
-  reflectApply(objectDefineProperty, Object, [
+  const descriptor = reflectApply(objectGetOwnPropertyDescriptor, undefined, [
     promise,
-    'constructor',
-    PROMISE_CONSTRUCTOR_DESCRIPTOR
+    'constructor'
   ])
+  if (!descriptor || !reflectApply(objectHasOwn, undefined, [descriptor, 'value']) ||
+      descriptor.value !== undefined || descriptor.writable !== false ||
+      descriptor.enumerable !== false || descriptor.configurable !== false) {
+    reflectApply(objectDefineProperty, undefined, [
+      promise,
+      'constructor',
+      PROMISE_CONSTRUCTOR_DESCRIPTOR
+    ])
+  }
+  reflectApply(weakSetAdd, controlPromises, [promise])
   return promise
 }
 
-async function awaitValue(value) {
-  return await value
+function createValueOutcome(value) {
+  const outcome = objectCreate(null)
+  reflectApply(objectDefineProperty, undefined, [outcome, 'value', {
+    configurable: false,
+    enumerable: true,
+    value,
+    writable: false
+  }])
+  return objectFreeze(outcome)
 }
 
-function hasSafePromiseConstructor(value) {
-  let current = value
+function settleOwnedValue(resolve, reject, value) {
+  if ((typeof value !== 'object' || value === null) && typeof value !== 'function') {
+    resolve(value)
+    return
+  }
   try {
-    while (current !== null) {
-      const descriptor = reflectApply(objectGetOwnPropertyDescriptor, Object, [
-        current,
-        'constructor'
-      ])
-      if (descriptor !== undefined) {
-        return reflectApply(objectHasOwn, Object, [descriptor, 'value']) &&
-          descriptor.value === SafePromise
+    const descriptor = reflectApply(objectGetOwnPropertyDescriptor, undefined, [value, 'then'])
+    if (descriptor !== undefined) {
+      if (!reflectApply(objectHasOwn, undefined, [descriptor, 'value']) ||
+          typeof descriptor.value === 'function') {
+        reject(new TypeError('Protocol value cannot be settled safely'))
+        return
       }
-      current = reflectApply(objectGetPrototypeOf, Object, [current])
+      resolve(value)
+      return
     }
-  } catch {}
-  return false
+    if (!reflectApply(objectIsExtensible, undefined, [value])) {
+      reject(new TypeError('Protocol value cannot be settled safely'))
+      return
+    }
+    reflectApply(objectDefineProperty, undefined, [value, 'then', {
+      configurable: true,
+      enumerable: false,
+      value: undefined,
+      writable: false
+    }])
+    reflectApply(weakSetAdd, promiseSettlementGuardedValues, [value])
+    resolve(value)
+  } catch (error) {
+    reject(error)
+  }
+}
+
+function removePromiseSettlementGuard(value) {
+  if (!reflectApply(weakSetHas, promiseSettlementGuardedValues, [value])) return
+  const descriptor = reflectApply(objectGetOwnPropertyDescriptor, undefined, [value, 'then'])
+  if (descriptor && reflectApply(objectHasOwn, undefined, [descriptor, 'value']) &&
+      descriptor.value === undefined && descriptor.configurable === true &&
+      descriptor.enumerable === false && descriptor.writable === false) {
+    reflectApply(reflectDeleteProperty, undefined, [value, 'then'])
+  }
+  reflectApply(weakSetDelete, promiseSettlementGuardedValues, [value])
+}
+
+function sameDescriptor(actual, expected) {
+  if (actual === undefined || expected === undefined) return actual === expected
+  for (let index = 0; index < PROMISE_DESCRIPTOR_FIELDS.length; index++) {
+    const name = PROMISE_DESCRIPTOR_FIELDS[index]
+    const actualHas = reflectApply(objectHasOwn, undefined, [actual, name])
+    const expectedHas = reflectApply(objectHasOwn, undefined, [expected, name])
+    if (actualHas !== expectedHas || (actualHas && actual[name] !== expected[name])) return false
+  }
+  return true
+}
+
+function isCanonicalPromise(value) {
+  if ((typeof value !== 'object' || value === null) && typeof value !== 'function') return false
+  if (reflectApply(isProxy, utilTypesBuiltin, [value]) ||
+      !reflectApply(isPromise, utilTypesBuiltin, [value])) return false
+  try {
+    return objectGetPrototypeOf(value) === promisePrototype &&
+      objectGetOwnPropertyDescriptor(value, 'constructor') === undefined &&
+      sameDescriptor(
+        objectGetOwnPropertyDescriptor(promisePrototype, 'constructor'),
+        promisePrototypeConstructorDescriptor
+      ) &&
+      sameDescriptor(
+        objectGetOwnPropertyDescriptor(SafePromise, Symbol.species),
+        promiseSpeciesDescriptor
+      )
+  } catch {
+    return false
+  }
+}
+
+function unsafePromiseRejection() {
+  return bridgeControlPromise(createPromise((resolve, reject) => {
+    reject(new TypeError('Promise cannot be observed safely'))
+  }))
 }
 
 function adoptValue(value) {
+  const objectLike = (typeof value === 'object' && value !== null) || typeof value === 'function'
+  if (objectLike && reflectApply(isProxy, utilTypesBuiltin, [value])) {
+    return unsafePromiseRejection()
+  }
   if (!reflectApply(isPromise, utilTypesBuiltin, [value])) {
-    return hardenAwaitPromise(awaitValue(value))
+    return bridgeControlPromise(createPromise(resolve => {
+      resolve(createValueOutcome(value))
+    }))
   }
-  const previous = reflectApply(objectGetOwnPropertyDescriptor, Object, [
-    value,
-    'constructor'
-  ])
-  let installed = false
-  try {
-    reflectApply(objectDefineProperty, Object, [
-      value,
-      'constructor',
-      TEMPORARY_PROMISE_CONSTRUCTOR_DESCRIPTOR
-    ])
-    installed = true
-  } catch {
-    if (!hasSafePromiseConstructor(value)) {
-      return hardenAwaitPromise(new SafePromise((resolve, reject) => {
-        reject(new TypeError('Promise cannot be observed safely'))
-      }))
+  if (objectLike && reflectApply(weakSetHas, controlPromises, [value])) {
+    const control = createPromise((resolve, reject) => {
+      reflectApply(promiseThen, value, [
+        result => resolve(createValueOutcome(result)),
+        reject
+      ])
+    })
+    return bridgeControlPromise(control)
+  }
+  if (!isCanonicalPromise(value)) return unsafePromiseRejection()
+
+  const control = createPromise((resolve, reject) => {
+    try {
+      reflectApply(promiseThen, value, [
+        result => resolve(createValueOutcome(result)),
+        reject
+      ])
+    } catch (error) {
+      reject(error)
     }
-  }
-  let adopted
-  try {
-    adopted = awaitValue(value)
-  } finally {
-    if (installed) {
-      if (previous) {
-        reflectApply(objectDefineProperty, Object, [value, 'constructor', previous])
-      } else {
-        reflectApply(reflectDeleteProperty, Reflect, [value, 'constructor'])
-      }
-    }
-  }
-  return hardenAwaitPromise(adopted)
+  })
+  return bridgeControlPromise(control)
 }
 
 function hardenAwaitPromise(promise) {
-  reflectApply(objectDefineProperty, Object, [
+  reflectApply(objectDefineProperty, undefined, [
     promise,
     'constructor',
     AWAIT_PROMISE_CONSTRUCTOR_DESCRIPTOR
@@ -613,6 +785,13 @@ function hardenAwaitPromise(promise) {
 
 function createPromise(executor) {
   return hardenPromise(new SafePromise(executor))
+}
+
+function bridgeControlPromise(promise) {
+  const bridge = new SafePromise((resolve, reject) => {
+    reflectApply(promiseThen, promise, [resolve, reject])
+  })
+  return hardenAwaitPromise(bridge)
 }
 
 function thenPromise(promise, onFulfilled, onRejected) {
@@ -650,16 +829,69 @@ function unsupportedProtocolValue() {
   throw new TypeError('Unsupported protocol value')
 }
 
-function assertNoOwnProperties(value) {
-  if (reflectOwnKeys(value).length !== 0) unsupportedProtocolValue()
+function traversalLimitError(maxBytes) {
+  throw new RangeError('Protocol message exceeds maxMessageBytes (' + maxBytes + ')')
 }
 
-function assertCanonicalRegExpProperties(value) {
-  const descriptors = objectGetOwnPropertyDescriptors(value)
+function createTraversalBudget(maxBytes) {
+  return {
+    maxBytes,
+    objectNodes: 0,
+    graphEdges: 0,
+    properties: 0,
+    collectionEntries: 0,
+    stringCodeUnits: 0,
+    backingBufferBytes: 0,
+    backingBuffers: new SafeWeakSet()
+  }
+}
+
+function chargeTraversalBudget(budget, field, amount) {
+  if (budget.maxBytes === undefined || amount === 0) return
+  if (!reflectApply(numberIsSafeInteger, SafeNumber, [amount]) || amount < 0 ||
+      budget[field] > budget.maxBytes - amount) {
+    traversalLimitError(budget.maxBytes)
+  }
+  budget[field] += amount
+}
+
+function chargeString(budget, value) {
+  chargeTraversalBudget(budget, 'stringCodeUnits', value.length === 0 ? 1 : value.length)
+}
+
+function isCanonicalArrayIndex(key) {
+  const numeric = +key
+  return reflectApply(numberIsSafeInteger, SafeNumber, [numeric]) && numeric >= 0 &&
+    numeric < 0xffffffff && SafeString(numeric) === key
+}
+
+function reservePending(budget, pending, amount) {
+  if (budget.maxBytes === undefined) return
+  const limit = budget.maxBytes === maxSafeInteger
+    ? maxSafeInteger
+    : budget.maxBytes + 1
+  if (!reflectApply(numberIsSafeInteger, SafeNumber, [amount]) || amount < 0 ||
+      pending.length > limit - amount) {
+    traversalLimitError(budget.maxBytes)
+  }
+}
+
+function assertNoOwnProperties(value, budget) {
+  const keys = reflectOwnKeys(value)
+  chargeTraversalBudget(budget, 'properties', keys.length)
+  for (let index = 0; index < keys.length; index++) {
+    if (typeof keys[index] === 'string') chargeString(budget, keys[index])
+  }
+  if (keys.length !== 0) unsupportedProtocolValue()
+}
+
+function assertCanonicalRegExpProperties(value, budget) {
   const keys = reflectOwnKeys(value)
   if (keys.length !== 1 || keys[0] !== 'lastIndex') unsupportedProtocolValue()
+  chargeTraversalBudget(budget, 'properties', 1)
+  const descriptors = objectGetOwnPropertyDescriptors(value)
   const descriptor = descriptors.lastIndex
-  if (!descriptor || !('value' in descriptor) ||
+  if (!descriptor || !reflectApply(objectHasOwn, undefined, [descriptor, 'value']) ||
       typeof descriptor.value !== 'number' ||
       !reflectApply(numberIsSafeInteger, SafeNumber, [descriptor.value]) ||
       descriptor.value < 0 || descriptor.enumerable || descriptor.configurable ||
@@ -668,36 +900,32 @@ function assertCanonicalRegExpProperties(value) {
   }
 }
 
-function traversalLimitError(maxBytes) {
-  throw new RangeError('Protocol message exceeds maxMessageBytes (' + maxBytes + ')')
+function chargeArrayBuffer(buffer, budget) {
+  if (reflectApply(weakSetHas, budget.backingBuffers, [buffer])) return
+  reflectApply(weakSetAdd, budget.backingBuffers, [buffer])
+  chargeTraversalBudget(
+    budget,
+    'backingBufferBytes',
+    reflectApply(arrayBufferByteLength, buffer, [])
+  )
 }
 
-function assertArrayBufferWithinBudget(buffer, maxBytes) {
-  if (maxBytes !== undefined &&
-      reflectApply(arrayBufferByteLength, buffer, []) > maxBytes) {
-    traversalLimitError(maxBytes)
-  }
-}
-
-function assertViewWithinBudget(value, maxBytes) {
-  if (maxBytes === undefined) return
-  const byteLength = objectGetPrototypeOf(value) === dataViewPrototype
-    ? reflectApply(dataViewByteLength, value, [])
-    : reflectApply(typedArrayByteLength, value, [])
-  if (byteLength > maxBytes) traversalLimitError(maxBytes)
+function assertViewWithinBudget(value, budget) {
   const buffer = getViewBuffer(value)
-  if (!isSharedArrayBuffer(buffer)) assertArrayBufferWithinBudget(buffer, maxBytes)
+  if (!isSharedArrayBuffer(buffer)) chargeArrayBuffer(buffer, budget)
 }
 
-function assertCanonicalViewProperties(value) {
+function assertCanonicalViewProperties(value, budget) {
   const prototype = objectGetPrototypeOf(value)
   if (prototype === dataViewPrototype) {
-    assertNoOwnProperties(value)
+    assertNoOwnProperties(value, budget)
     return
   }
   const length = reflectApply(typedArrayLength, value, [])
-  const descriptors = objectGetOwnPropertyDescriptors(value)
+  chargeTraversalBudget(budget, 'properties', length)
   const keys = reflectOwnKeys(value)
+  if (keys.length !== length) unsupportedProtocolValue()
+  const descriptors = objectGetOwnPropertyDescriptors(value)
   for (let index = 0; index < keys.length; index++) {
     const key = keys[index]
     if (typeof key !== 'string') unsupportedProtocolValue()
@@ -705,24 +933,36 @@ function assertCanonicalViewProperties(value) {
     const descriptor = descriptors[key]
     if (!reflectApply(numberIsSafeInteger, SafeNumber, [numeric]) || numeric < 0 ||
         numeric >= length || SafeString(numeric) !== key || !descriptor ||
-        !('value' in descriptor) || descriptor.writable !== true ||
+        !reflectApply(objectHasOwn, undefined, [descriptor, 'value']) ||
+        descriptor.writable !== true ||
         descriptor.enumerable !== true || descriptor.configurable !== true) {
       unsupportedProtocolValue()
     }
   }
-  if (keys.length !== length) unsupportedProtocolValue()
 }
 
 function sandboxDenied(api) {
   const error = new SafeError(api + ' is disabled for untrusted code')
-  error.code = 'ERR_ACCESS_DENIED'
-  error.permission = 'SandboxEscape'
+  objectDefineProperty(error, 'code', {
+    configurable: true,
+    enumerable: true,
+    value: 'ERR_ACCESS_DENIED',
+    writable: true
+  })
+  objectDefineProperty(error, 'permission', {
+    configurable: true,
+    enumerable: true,
+    value: 'SandboxEscape',
+    writable: true
+  })
   throw error
 }
 
 function replaceProperty(target, name, value) {
   const descriptor = Object.getOwnPropertyDescriptor(target, name)
-  if (!descriptor || descriptor.configurable || ('value' in descriptor && descriptor.writable)) {
+  const dataDescriptor = descriptor &&
+    reflectApply(objectHasOwn, undefined, [descriptor, 'value'])
+  if (!descriptor || descriptor.configurable || (dataDescriptor && descriptor.writable)) {
     objectDefineProperty(target, name, {
       value,
       enumerable: descriptor ? descriptor.enumerable : true,
@@ -732,16 +972,56 @@ function replaceProperty(target, name, value) {
   }
 }
 
+function replaceAndVerifyDataProperty(target, name, value) {
+  replaceProperty(target, name, value)
+  const descriptor = objectGetOwnPropertyDescriptor(target, name)
+  if (!descriptor || !reflectApply(objectHasOwn, undefined, [descriptor, 'value']) ||
+      descriptor.value !== value || descriptor.writable || descriptor.configurable) {
+    throw new SafeError('Failed to virtualize ' + name)
+  }
+}
+
 function denyFunctions(target, prefix, allowedNames) {
   for (const [name, descriptor] of Object.entries(objectGetOwnPropertyDescriptors(target))) {
     // Several security-sensitive builtins expose callable constructors through
     // configurable accessors rather than ordinary value properties.
     if ((!allowedNames || !reflectApply(setHas, allowedNames, [name])) &&
-        (!('value' in descriptor) || typeof descriptor.value === 'function')) {
+        (!reflectApply(objectHasOwn, undefined, [descriptor, 'value']) ||
+         typeof descriptor.value === 'function')) {
       replaceProperty(target, name, function deniedBuiltin() {
         return sandboxDenied(prefix + '.' + name)
       })
     }
+  }
+}
+
+const deniedNetworkAgentObjects = new SafeWeakSet()
+
+function denyNetworkAgentPrototypeChain(target, prefix) {
+  let current = target
+  while (current && current !== objectPrototype && current !== eventEmitterPrototype &&
+         !reflectApply(weakSetHas, deniedNetworkAgentObjects, [current])) {
+    reflectApply(weakSetAdd, deniedNetworkAgentObjects, [current])
+    const descriptors = objectGetOwnPropertyDescriptors(current)
+    const keys = reflectOwnKeys(current)
+    const next = objectGetPrototypeOf(current)
+    for (let index = 0; index < keys.length; index++) {
+      const name = keys[index]
+      const descriptor = descriptors[name]
+      if (reflectApply(objectHasOwn, undefined, [descriptor, 'value']) &&
+          typeof descriptor.value !== 'function') continue
+      const denied = function deniedNetworkAgentOperation() {
+        return sandboxDenied(prefix + '.' + SafeString(name))
+      }
+      replaceProperty(current, name, denied)
+      const replacement = objectGetOwnPropertyDescriptor(current, name)
+      if (!replacement ||
+          !reflectApply(objectHasOwn, undefined, [replacement, 'value']) ||
+          replacement.value !== denied || replacement.writable || replacement.configurable) {
+        throw new SafeError('Failed to disable ' + prefix + '.' + SafeString(name))
+      }
+    }
+    current = next
   }
 }
 
@@ -772,8 +1052,8 @@ function formatDiagnosticValue(value) {
   if (kind === 'symbol') return '[Symbol]'
   if (kind === 'function') return '[Function]'
   try {
-    if (reflectApply(arrayIsArray, Array, [value])) return '[Array]'
-    if (reflectApply(arrayBufferIsView, ArrayBuffer, [value])) return '[ArrayBufferView]'
+    if (reflectApply(arrayIsArray, undefined, [value])) return '[Array]'
+    if (reflectApply(arrayBufferIsView, undefined, [value])) return '[ArrayBufferView]'
   } catch {
     return '[Uninspectable]'
   }
@@ -851,13 +1131,23 @@ function hardenFileSystemForModuleLoading() {
         if (name === 'openSync') {
           if (moduleFileDescriptors.count >= workerData.localModule.maxOpenFileDescriptors) {
             const error = new RangeError('Worker file descriptor limit exceeded')
-            error.code = 'ERR_UNTRUSTED_FILE_DESCRIPTOR_LIMIT'
+            objectDefineProperty(error, 'code', {
+              configurable: true,
+              enumerable: true,
+              value: 'ERR_UNTRUSTED_FILE_DESCRIPTOR_LIMIT',
+              writable: true
+            })
             throw error
           }
           const descriptorSlot = reserveProcessFileDescriptor()
           if (descriptorSlot < 0) {
             const error = new RangeError('Process file descriptor limit exceeded')
-            error.code = 'ERR_UNTRUSTED_FILE_DESCRIPTOR_CAPACITY'
+            objectDefineProperty(error, 'code', {
+              configurable: true,
+              enumerable: true,
+              value: 'ERR_UNTRUSTED_FILE_DESCRIPTOR_CAPACITY',
+              writable: true
+            })
             throw error
           }
           try {
@@ -888,7 +1178,8 @@ function hardenFileSystemForModuleLoading() {
         if (typeof args[0] === 'number') return sandboxDenied('node:fs.' + name)
         return reflectApply(reader, fsBuiltin, args)
       })
-    } else if (!('value' in descriptor) || typeof descriptor.value === 'function') {
+    } else if (!reflectApply(objectHasOwn, undefined, [descriptor, 'value']) ||
+               typeof descriptor.value === 'function') {
       replaceProperty(fsBuiltin, name, function deniedFileSystemApi() {
         return sandboxDenied('node:fs.' + name)
       })
@@ -912,9 +1203,16 @@ function hardenDangerousBuiltins() {
   denyFunctions(netBuiltin, 'node:net')
   denyFunctions(tlsBuiltin, 'node:tls')
   denyFunctions(dgramBuiltin, 'node:dgram')
+  denyFunctions(dnsBuiltin, 'node:dns')
+  denyFunctions(dnsPromisesBuiltin, 'node:dns/promises')
+  denyNetworkAgentPrototypeChain(httpGlobalAgent, 'node:http.globalAgent')
+  denyNetworkAgentPrototypeChain(httpsGlobalAgent, 'node:https.globalAgent')
   denyFunctions(httpBuiltin, 'node:http')
   denyFunctions(http2Builtin, 'node:http2')
   denyFunctions(httpsBuiltin, 'node:https')
+  if (traceEventsBuiltin) denyFunctions(traceEventsBuiltin, 'node:trace_events')
+  if (quicBuiltin) denyFunctions(quicBuiltin, 'node:quic')
+  replaceProperty(cryptoBuiltin, 'setEngine', () => sandboxDenied('node:crypto.setEngine'))
   for (const builtin of networkAliasBuiltins) {
     denyFunctions(builtin, 'internal network builtin')
   }
@@ -922,7 +1220,7 @@ function hardenDangerousBuiltins() {
   // Asynchronous customization hooks execute in an InternalWorker, which does
   // not inherit this realm's permission drop or builtin hardening.
   const originalGlobalPaths = moduleBuiltin.globalPaths
-  if (reflectApply(arrayIsArray, Array, [originalGlobalPaths])) {
+  if (reflectApply(arrayIsArray, undefined, [originalGlobalPaths])) {
     reflectApply(arraySplice, originalGlobalPaths, [0, originalGlobalPaths.length])
   }
   const hiddenGlobalPaths = objectFreeze([])
@@ -931,7 +1229,7 @@ function hardenDangerousBuiltins() {
   replaceProperty(moduleBuiltin, '_cache', objectCreate(null))
   replaceProperty(moduleBuiltin, '_pathCache', objectCreate(null))
   const restrictModulePaths = (paths) => {
-    if (!reflectApply(arrayIsArray, Array, [paths])) return paths
+    if (!reflectApply(arrayIsArray, undefined, [paths])) return paths
     const filtered = []
     if (!workerData.localModule) return filtered
     for (let index = 0; index < paths.length; index++) {
@@ -953,6 +1251,20 @@ function hardenDangerousBuiltins() {
       reflectApply(moduleResolveLookupPaths, moduleBuiltin, [request, parent])
     )
   })
+  replaceProperty(moduleBuiltin, '_load', function restrictedModuleLoad(request, parent, isMain) {
+    if (request === 'trace_events' || request === 'node:trace_events' ||
+        request === 'quic' || request === 'node:quic') {
+      return sandboxDenied(request)
+    }
+    return reflectApply(moduleLoad, moduleBuiltin, [request, parent, isMain])
+  })
+  replaceProperty(processBuiltin, 'getBuiltinModule', function restrictedGetBuiltinModule(request) {
+    if (request === 'trace_events' || request === 'node:trace_events' ||
+        request === 'quic' || request === 'node:quic') {
+      return sandboxDenied(request)
+    }
+    return reflectApply(processGetBuiltinModule, processBuiltin, [request])
+  })
   for (const name of [
     '_initPaths',
     'register',
@@ -969,6 +1281,9 @@ function hardenDangerousBuiltins() {
 
   replaceProperty(processBuiltin, 'argv', objectFreeze(['node', '[secure-eval-worker]']))
   replaceProperty(processBuiltin, 'execArgv', objectFreeze([]))
+  replaceAndVerifyDataProperty(processBuiltin, 'pid', 0)
+  replaceAndVerifyDataProperty(processBuiltin, 'ppid', 0)
+  replaceAndVerifyDataProperty(processBuiltin, 'title', 'secure-eval-worker')
   replaceProperty(
     processBuiltin,
     'execPath',
@@ -1026,8 +1341,8 @@ function hardenDangerousBuiltins() {
   for (let index = 0; index < v8Names.length; index++) {
     const name = v8Names[index]
     const descriptor = v8Descriptors[name]
-    if ('value' in descriptor && descriptor.value !== null &&
-        typeof descriptor.value === 'object') {
+    if (reflectApply(objectHasOwn, undefined, [descriptor, 'value']) &&
+        descriptor.value !== null && typeof descriptor.value === 'object') {
       denyFunctions(
         descriptor.value,
         'node:v8.' + name,
@@ -1043,6 +1358,12 @@ function hardenDangerousBuiltins() {
   })
   replaceProperty(globalThis, 'BroadcastChannel', function DeniedBroadcastChannel() {
     return sandboxDenied('BroadcastChannel')
+  })
+  replaceProperty(globalThis, 'fetch', function deniedFetch() {
+    return sandboxDenied('fetch')
+  })
+  replaceProperty(globalThis, 'WebSocket', function DeniedWebSocket() {
+    return sandboxDenied('WebSocket')
   })
   replaceProperty(workerThreadsBuiltin, 'postMessageToThread', () => {
     return sandboxDenied('node:worker_threads.postMessageToThread')
@@ -1085,7 +1406,8 @@ function hardenDangerousBuiltins() {
     const prototype = objectGetPrototypeOf(stream)
     for (const name of ['write', '_write', '_writev', 'end']) {
       const descriptor = Object.getOwnPropertyDescriptor(prototype, name)
-      if (descriptor && 'value' in descriptor && typeof descriptor.value === 'function') {
+      if (descriptor && reflectApply(objectHasOwn, undefined, [descriptor, 'value']) &&
+          typeof descriptor.value === 'function') {
         replaceProperty(prototype, name, discardOutput)
       }
     }
@@ -1115,19 +1437,26 @@ function cloneValue(value, label) {
 }
 
 function assertSupportedProtocolValue(value, label, maxBytes = workerData.maxMessageBytes) {
+  const budget = createTraversalBudget(maxBytes)
   const pending = [value]
   const seen = new SafeWeakSet()
   while (pending.length > 0) {
     const current = reflectApply(arrayPop, pending, [])
     if (current === null) continue
     const kind = typeof current
-    if (kind === 'string' || kind === 'boolean' || kind === 'number' ||
-        kind === 'bigint' || kind === 'undefined') continue
+    if (kind === 'string') {
+      chargeString(budget, current)
+      continue
+    }
+    if (kind === 'boolean' || kind === 'number' || kind === 'bigint' ||
+        kind === 'undefined') continue
     if (kind !== 'object' || reflectApply(isProxy, utilTypesBuiltin, [current])) {
       throw new TypeError('Unsupported protocol value')
     }
+    removePromiseSettlementGuard(current)
     if (reflectApply(weakSetHas, seen, [current])) continue
     reflectApply(weakSetAdd, seen, [current])
+    chargeTraversalBudget(budget, 'objectNodes', 1)
 
     if (isSharedArrayBuffer(current)) {
       throw new TypeError(label + ' must not contain shared memory')
@@ -1148,19 +1477,19 @@ function assertSupportedProtocolValue(value, label, maxBytes = workerData.maxMes
       if (objectGetPrototypeOf(current) !== arrayBufferPrototype) {
         throw new TypeError('Unsupported protocol value')
       }
-      assertArrayBufferWithinBudget(current, maxBytes)
-      assertNoOwnProperties(current)
+      chargeArrayBuffer(current, budget)
+      assertNoOwnProperties(current, budget)
       continue
     }
-    if (reflectApply(arrayBufferIsView, ArrayBuffer, [current])) {
+    if (reflectApply(arrayBufferIsView, undefined, [current])) {
       if (isSharedArrayBuffer(getViewBuffer(current))) {
         throw new TypeError(label + ' must not contain shared memory')
       }
       if (!reflectApply(setHas, allowedViewPrototypes, [objectGetPrototypeOf(current)])) {
         throw new TypeError('Unsupported protocol value')
       }
-      assertViewWithinBudget(current, maxBytes)
-      assertCanonicalViewProperties(current)
+      assertViewWithinBudget(current, budget)
+      assertCanonicalViewProperties(current, budget)
       continue
     }
     try {
@@ -1173,7 +1502,7 @@ function assertSupportedProtocolValue(value, label, maxBytes = workerData.maxMes
       if (objectGetPrototypeOf(current) !== datePrototype) {
         throw new TypeError('Unsupported protocol value')
       }
-      assertNoOwnProperties(current)
+      assertNoOwnProperties(current, budget)
       continue
     }
     try {
@@ -1186,58 +1515,84 @@ function assertSupportedProtocolValue(value, label, maxBytes = workerData.maxMes
       if (objectGetPrototypeOf(current) !== regexpPrototype) {
         throw new TypeError('Unsupported protocol value')
       }
-      assertCanonicalRegExpProperties(current)
+      assertCanonicalRegExpProperties(current, budget)
       continue
     }
 
-    let iterator
+    let collectionSize
     try {
-      iterator = reflectApply(mapEntries, current, [])
+      collectionSize = reflectApply(mapSize, current, [])
     } catch {}
-    if (iterator) {
+    if (collectionSize !== undefined) {
       if (objectGetPrototypeOf(current) !== mapPrototype) {
         throw new TypeError('Unsupported protocol value')
       }
-      assertNoOwnProperties(current)
-      while (true) {
+      assertNoOwnProperties(current, budget)
+      chargeTraversalBudget(budget, 'collectionEntries', collectionSize)
+      if (maxBytes !== undefined &&
+          collectionSize > reflectApply(mathFloor, undefined, [maxBytes / 2])) {
+        traversalLimitError(maxBytes)
+      }
+      const edgeCount = collectionSize * 2
+      chargeTraversalBudget(budget, 'graphEdges', edgeCount)
+      reservePending(budget, pending, edgeCount)
+      const iterator = reflectApply(mapEntries, current, [])
+      for (let index = 0; index < collectionSize; index++) {
         const item = reflectApply(mapIteratorNext, iterator, [])
-        if (item.done) break
+        if (item.done) unsupportedProtocolValue()
         reflectApply(arrayPush, pending, [item.value[0], item.value[1]])
       }
+      if (!reflectApply(mapIteratorNext, iterator, []).done) unsupportedProtocolValue()
       continue
     }
     try {
-      iterator = reflectApply(setValues, current, [])
+      collectionSize = reflectApply(setSize, current, [])
     } catch {
-      iterator = undefined
+      collectionSize = undefined
     }
-    if (iterator) {
+    if (collectionSize !== undefined) {
       if (objectGetPrototypeOf(current) !== setPrototype) {
         throw new TypeError('Unsupported protocol value')
       }
-      assertNoOwnProperties(current)
-      while (true) {
+      assertNoOwnProperties(current, budget)
+      chargeTraversalBudget(budget, 'collectionEntries', collectionSize)
+      chargeTraversalBudget(budget, 'graphEdges', collectionSize)
+      reservePending(budget, pending, collectionSize)
+      const iterator = reflectApply(setValues, current, [])
+      for (let index = 0; index < collectionSize; index++) {
         const item = reflectApply(setIteratorNext, iterator, [])
-        if (item.done) break
+        if (item.done) unsupportedProtocolValue()
         reflectApply(arrayPush, pending, [item.value])
       }
+      if (!reflectApply(setIteratorNext, iterator, []).done) unsupportedProtocolValue()
       continue
     }
 
-    const isArray = reflectApply(arrayIsArray, Array, [current])
+    const isArray = reflectApply(arrayIsArray, undefined, [current])
     const prototype = objectGetPrototypeOf(current)
     if ((isArray && prototype !== arrayPrototype) ||
         (!isArray && prototype !== objectPrototype && prototype !== null)) {
       throw new TypeError('Unsupported protocol value')
     }
-    const descriptors = objectGetOwnPropertyDescriptors(current)
     const keys = reflectOwnKeys(current)
+    let propertyCount = keys.length
+    if (isArray) propertyCount--
+    chargeTraversalBudget(budget, 'properties', propertyCount)
+    chargeTraversalBudget(budget, 'graphEdges', propertyCount)
+    reservePending(budget, pending, propertyCount)
     for (let index = 0; index < keys.length; index++) {
       const key = keys[index]
       if (isArray && key === 'length') continue
       if (typeof key === 'symbol') throw new TypeError('Unsupported protocol value')
+      if (!isArray || !isCanonicalArrayIndex(key)) chargeString(budget, key)
+    }
+    const descriptors = objectGetOwnPropertyDescriptors(current)
+    for (let index = 0; index < keys.length; index++) {
+      const key = keys[index]
+      if (isArray && key === 'length') continue
       const descriptor = descriptors[key]
-      if (!descriptor.enumerable || !('value' in descriptor)) {
+      if (!descriptor.enumerable ||
+          !reflectApply(objectHasOwn, undefined, [descriptor, 'value'])) {
         throw new TypeError('Unsupported protocol value')
       }
       reflectApply(arrayPush, pending, [descriptor.value])
@@ -1279,7 +1634,7 @@ function protocolMac(direction, sequence, serialized, secret = protocolSecret) {
 }
 
 function postToHost(body, countAgainstOutput = false) {
-  if (!reflectApply(objectHasOwn, Object, [body, 'diagnosticSequence'])) {
+  if (!reflectApply(objectHasOwn, undefined, [body, 'diagnosticSequence'])) {
     objectDefineProperty(body, 'diagnosticSequence', {
       value: diagnosticSequence,
       enumerable: true
@@ -1310,7 +1665,7 @@ function authenticateHostMessage(envelope) {
       reflectApply(numberIsSafeInteger, SafeNumber, [envelope.sequence]) &&
       envelope.sequence === inboundSequence + 1 &&
       envelope.payload !== null && typeof envelope.payload === 'object' &&
-      reflectApply(arrayBufferIsView, ArrayBuffer, [envelope.payload]) &&
+      reflectApply(arrayBufferIsView, undefined, [envelope.payload]) &&
       typeof envelope.mac === 'string') {
     serialized = envelope.payload
     const byteLength = reflectApply(typedArrayByteLength, serialized, [])
@@ -1332,11 +1687,8 @@ function limitedString(value, fallback) {
 function virtualizeModuleLocations(value) {
   if (!workerData.localModule || typeof value !== 'string') return value
   let result = value
-  const replacements = [
-    [workerData.localModule.rootUrlPrefix, 'secure-eval-worker-files/'],
-    [workerData.localModule.rootPathPrefix, 'secure-eval-worker-files/']
-  ]
-  for (let index = 0; index < replacements.length; index++) {
+  for (let index = 0; index < moduleLocationReplacements.length; index++) {
+    const replacements = moduleLocationReplacements
     const location = replacements[index][0]
     const replacement = replacements[index][1]
     result = reflectApply(arrayJoin, reflectApply(stringSplit, result, [location]), [replacement])
@@ -1395,9 +1747,20 @@ function normalizedGuestStack(stack, name, message) {
   return result
 }
 
+function isSyntaxError(value) {
+  if (value === null || typeof value !== 'object') return false
+  try {
+    return reflectApply(isNativeError, utilTypesBuiltin, [value]) &&
+      objectGetPrototypeOf(value) === syntaxErrorPrototype
+  } catch {
+    return false
+  }
+}
+
 function cloneError(error) {
   try {
-    if (error instanceof Error) {
+    if (error !== null && typeof error === 'object' &&
+        reflectApply(isNativeError, utilTypesBuiltin, [error])) {
       const name = sanitizeDiagnosticText(limitedString(error.name, 'Error'))
       const message = sanitizeDiagnosticText(virtualizeModuleLocations(
         limitedString(error.message, 'Untrusted component failed')
@@ -1563,14 +1926,32 @@ function handleHostFunctionResult(envelope) {
   reflectApply(mapDelete, pendingHostCalls, [envelope.id])
 
   if (envelope.type === 'host-result') {
-    pending.resolve(cloneValue(envelope.value, 'host function result'))
+    settleOwnedValue(
+      pending.resolve,
+      pending.reject,
+      cloneValue(envelope.value, 'host function result')
+    )
   } else {
     const detail = envelope.error
     const error = new SafeError(
       detail && typeof detail.message === 'string' ? detail.message : 'Host function failed'
     )
-    if (detail && typeof detail.name === 'string') error.name = detail.name
-    if (detail && typeof detail.code === 'string') error.code = detail.code
+    if (detail && typeof detail.name === 'string') {
+      objectDefineProperty(error, 'name', {
+        configurable: true,
+        enumerable: false,
+        value: detail.name,
+        writable: true
+      })
+    }
+    if (detail && typeof detail.code === 'string') {
+      objectDefineProperty(error, 'code', {
+        configurable: true,
+        enumerable: true,
+        value: detail.code,
+        writable: true
+      })
+    }
     pending.reject(error)
   }
 }
@@ -1600,7 +1981,8 @@ async function dispatch(envelope) {
 
   const value = cloneValue(envelope.value, 'message')
   try {
-    const result = await handler(value)
+    const outcome = await adoptValue(handler(value))
+    const result = outcome.value
     if (envelope.type === 'request') {
       postToHost({
         type: 'response',
@@ -1709,7 +2091,7 @@ async function initialize() {
             executableSource
           )
     } catch (error) {
-      if (workerData.language === 'javascript' && error instanceof SafeSyntaxError) {
+      if (workerData.language === 'javascript' && isSyntaxError(error)) {
         locateJavaScriptSyntaxError(guestSource, error)
       }
       throw error
@@ -1717,7 +2099,7 @@ async function initialize() {
     const execution = workerData.oneShot
       ? execute(workerData.input)
       : execute(workerData.input, send, onMessage, host)
-    setupResult = await adoptValue(execution)
+    setupResult = (await adoptValue(execution)).value
   } else {
     let component
     try {
@@ -1726,14 +2108,14 @@ async function initialize() {
       } else {
         const encoded = reflectApply(
           bufferFrom,
-          Buffer,
+          undefined,
           [guestSource + '\n//# sourceURL=secure-eval-worker-component.mjs\n', 'utf8']
         ).toString('base64')
         component = await import('data:text/javascript;base64,' + encoded)
       }
     } catch (error) {
       if (!workerData.localModule && workerData.language === 'javascript' &&
-          error instanceof SafeSyntaxError) {
+          isSyntaxError(error)) {
         locateJavaScriptSyntaxError(guestSource, error)
       }
       throw error
@@ -1751,7 +2133,7 @@ async function initialize() {
           onMessage,
           host
         }))
-    setupResult = await adoptValue(execution)
+    setupResult = (await adoptValue(execution)).value
   }
 
   const readyValue = workerData.oneShot
@@ -1829,6 +2211,42 @@ function defineSessionPublicPromise (session, name, value) {
   })
 }
 
+function validateLocationReplacements (value) {
+  if (value === undefined) return hostObjectFreeze([])
+  if (!hostArrayIsArray(value) ||
+      hostReflectApply(hostObjectGetPrototypeOf, undefined, [value]) !== hostArrayPrototype) {
+    throw new TypeError('Invalid local module location replacements')
+  }
+  const descriptors = hostReflectApply(hostObjectGetOwnPropertyDescriptors, undefined, [value])
+  const keys = hostReflectApply(hostReflectOwnKeys, undefined, [value])
+  const lengthDescriptor = descriptors.length
+  if (!lengthDescriptor || !hostReflectApply(hostObjectHasOwn, undefined, [lengthDescriptor, 'value']) ||
+      !hostReflectApply(hostNumberIsSafeInteger, undefined, [lengthDescriptor.value]) ||
+      lengthDescriptor.value < 0 || lengthDescriptor.value > 4 ||
+      keys.length !== lengthDescriptor.value + 1) {
+    throw new TypeError('Invalid local module location replacements')
+  }
+  for (let index = 0; index < lengthDescriptor.value; index++) {
+    const descriptor = descriptors[index]
+    if (!descriptor || !hostReflectApply(hostObjectHasOwn, undefined, [descriptor, 'value'])) {
+      throw new TypeError('Invalid local module location replacements')
+    }
+    const pair = descriptor.value
+    if (!hostArrayIsArray(pair) ||
+        hostReflectApply(hostObjectGetPrototypeOf, undefined, [pair]) !== hostArrayPrototype) {
+      throw new TypeError('Invalid local module location replacement')
+    }
+    const pairDescriptors = hostReflectApply(hostObjectGetOwnPropertyDescriptors, undefined, [pair])
+    const pairKeys = hostReflectApply(hostReflectOwnKeys, undefined, [pair])
+    if (pairKeys.length !== 3 || pairDescriptors.length?.value !== 2 ||
+        typeof pairDescriptors[0]?.value !== 'string' ||
+        typeof pairDescriptors[1]?.value !== 'string') {
+      throw new TypeError('Invalid local module location replacement')
+    }
+  }
+  return value
+}
+
 function prepareSessionConfiguration (session, source, rawOptions) {
   const data = getSessionData(session)
   const options = snapshotSessionOptions(rawOptions, SESSION_OPTION_NAMES, true)
@@ -1874,6 +2292,9 @@ function prepareSessionConfiguration (session, source, rawOptions) {
        typeof localModule.cleanupUntilRemoved !== 'function')) {
     throw new TypeError('Invalid local module configuration')
   }
+  const locationReplacements = localModule === undefined
+    ? undefined
+    : validateLocationReplacements(localModule.locationReplacements)
   validateTimeout(startupTimeoutMs, 'startupTimeoutMs')
   validateTimeout(data.messageTimeoutMs, 'messageTimeoutMs')
   validateTimeout(data.lifetimeTimeoutMs, 'lifetimeTimeoutMs')
@@ -1899,7 +2320,7 @@ function prepareSessionConfiguration (session, source, rawOptions) {
     throw abortError(hostReflectApply(hostAbortSignalReason, signal, []))
   }
 
-  const startedAt = hostReflectApply(hostDateNow, Date, [])
+  const startedAt = hostReflectApply(hostDateNow, undefined, [])
   const input = cloneWithoutSharedMemory(
     options.input,
     'input',
@@ -1907,7 +2328,7 @@ function prepareSessionConfiguration (session, source, rawOptions) {
     'maxInputBytes'
   )
   assertSupportedProtocolValue(input, 'input', data.maxInputBytes, 'maxInputBytes')
-  const serializedInput = v8Serialize(input)
+  const serializedInput = safeHostV8Serialize(input)
   if (hostReflectApply(hostTypedArrayByteLength, serializedInput, []) > data.maxInputBytes) {
     throw new RangeError(`input exceeds maxInputBytes (${data.maxInputBytes})`)
   }
@@ -1917,7 +2338,7 @@ function prepareSessionConfiguration (session, source, rawOptions) {
   if (signal && hostReflectApply(hostAbortSignalAborted, signal, [])) {
     throw abortError(hostReflectApply(hostAbortSignalReason, signal, []))
   }
-  const remainingStartupMs = startupTimeoutMs - (hostReflectApply(hostDateNow, Date, []) - startedAt)
+  const remainingStartupMs = startupTimeoutMs - (hostReflectApply(hostDateNow, undefined, []) - startedAt)
   if (remainingStartupMs <= 0) {
     throw sessionError(`Startup exceeded ${startupTimeoutMs} ms`, 'ERR_UNTRUSTED_WORKER_STARTUP_TIMEOUT')
   }
@@ -1928,6 +2349,7 @@ function prepareSessionConfiguration (session, source, rawOptions) {
     input,
     language,
     localModule,
+    locationReplacements,
     maxSourceBytes,
     options,
     preparationSlot,
@@ -1954,6 +2376,7 @@ export class UntrustedWorkerSession extends EventEmitter {
       throw new TypeError('UntrustedWorkerSession cannot be subclassed')
     }
     try {
+      assertSafePromiseEnvironment()
       super()
       for (let index = 0; index < trustedSessionMethods.length; index++) {
         const name = trustedSessionMethods[index][0]
@@ -1986,6 +2409,7 @@ export class UntrustedWorkerSession extends EventEmitter {
       input,
       language,
       localModule,
+      locationReplacements,
       maxSourceBytes,
       options: sessionOptions,
       preparationSlot,
@@ -2017,7 +2441,7 @@ export class UntrustedWorkerSession extends EventEmitter {
       defineSessionData(this, 'inFlightHostFunctions', 0)
       defineSessionData(this, 'hostFunctions', hostFunctionConfiguration.functions)
       defineSessionData(this, 'hostAbortController', new SafeAbortController())
-      defineSessionData(this, 'sessionId', randomUUID())
+      defineSessionData(this, 'sessionId', safeHostRandomUUID())
       getSessionData(this).readySettled = false
       getSessionData(this).closedSettled = false
       getSessionData(this).failure = undefined
@@ -2030,11 +2454,15 @@ export class UntrustedWorkerSession extends EventEmitter {
       )))
 
       defineSessionPublicPromise(this, 'ready', createHostPromise((resolve, reject) => {
-        defineSessionData(this, 'resolveReady', resolve)
+        defineSessionData(this, 'resolveReady', (value) => {
+          settleProtocolValue(resolve, reject, value)
+        })
         defineSessionData(this, 'rejectReady', reject)
       }))
-      defineSessionPublicPromise(this, 'closed', createHostPromise((resolve) => {
-        defineSessionData(this, 'resolveClosed', resolve)
+      defineSessionPublicPromise(this, 'closed', createHostPromise((resolve, reject) => {
+        defineSessionData(this, 'resolveClosed', (value) => {
+          settleProtocolValue(resolve, reject, value)
+        })
       }))
 
       getSessionSecrets(this).releaseWorkerSlot = releaseWorkerSlot
@@ -2064,6 +2492,7 @@ export class UntrustedWorkerSession extends EventEmitter {
           rootPath: localModule.rootPath,
           rootPathPrefix: localModule.rootPathPrefix,
           rootUrlPrefix: localModule.rootUrlPrefix,
+          locationReplacements,
           maxOpenFileDescriptors: MAX_LOCAL_OPEN_FILE_DESCRIPTORS,
           descriptorOwner: descriptorQuotaWorkerData.owner,
           globalDescriptorSlots: descriptorQuotaWorkerData.slotsBuffer
@@ -2127,7 +2556,8 @@ export class UntrustedWorkerSession extends EventEmitter {
         return
       }
       try {
-        const cleanup = thenHostPromise(attemptLocalModuleCleanup(localModule), (outcome) => {
+        const cleanup = thenHostPromise(attemptLocalModuleCleanup(localModule), (cleanupOutcome) => {
+          const outcome = cleanupOutcome.value
           if (outcome.status === 'removed') {
             preparationSlot?.()
             this.#handleExit(code)
@@ -2186,19 +2616,29 @@ export class UntrustedWorkerSession extends EventEmitter {
       hostReflectApply(hostReadableResume, stderr, [])
       hostReflectApply(hostEventEmitterOn, worker, [
         'message',
-        (message) => this.#handleHandshake(message)
+        (message) => {
+          try {
+            this.#handleHandshake(message)
+          } catch (error) {
+            this.#failSafely(sessionError(
+              'The worker handshake could not be handled safely',
+              'ERR_UNTRUSTED_WORKER_PROTOCOL',
+              error
+            ))
+          }
+        }
       ])
       hostReflectApply(hostEventEmitterOn, worker, ['messageerror', () => {
-        this.#fail(sessionError(
+        this.#failSafely(sessionError(
           'The worker handshake could not be deserialized',
           'ERR_UNTRUSTED_WORKER_PROTOCOL'
         ))
       }])
       hostReflectApply(hostEventEmitterOn, worker, ['error', (error) => {
-        this.#fail(sessionError('The worker failed', 'ERR_UNTRUSTED_WORKER', error))
+        this.#failSafely(sessionError('The worker failed', 'ERR_UNTRUSTED_WORKER', error))
       }])
 
-      const startupDelay = startupTimeoutMs - (hostReflectApply(hostDateNow, Date, []) - startedAt)
+      const startupDelay = startupTimeoutMs - (hostReflectApply(hostDateNow, undefined, []) - startedAt)
       if (startupDelay <= 0) {
         this.#fail(sessionError(
           `Startup exceeded ${startupTimeoutMs} ms`,
@@ -2282,7 +2722,7 @@ export class UntrustedWorkerSession extends EventEmitter {
     this.#assertOpen()
     const timeoutMs = options.timeoutMs ?? getSessionData(this).messageTimeoutMs
     validateTimeout(timeoutMs, 'timeoutMs')
-    const deadline = hostReflectApply(hostDateNow, Date, []) + timeoutMs
+    const deadline = hostReflectApply(hostDateNow, undefined, []) + timeoutMs
     const cloned = cloneWithoutSharedMemory(
       value,
       'message',
@@ -2293,7 +2733,7 @@ export class UntrustedWorkerSession extends EventEmitter {
     const id = getSessionData(this).nextRequestId++
     const body = { type: 'request', id, value: cloned }
     const serialized = assertProtocolBody(body, 'message', getSessionData(this).maxMessageBytes)
-    const remainingMs = deadline - hostReflectApply(hostDateNow, Date, [])
+    const remainingMs = deadline - hostReflectApply(hostDateNow, undefined, [])
     if (remainingMs <= 0) {
       const error = sessionError(
         `Message handling exceeded ${timeoutMs} ms`,
@@ -2304,7 +2744,13 @@ export class UntrustedWorkerSession extends EventEmitter {
     }
 
     return createHostPromise((resolve, reject) => {
-      const pending = { resolve, reject, timer: undefined, deadline, timeoutMs }
+      const pending = {
+        resolve: (result) => settleProtocolValue(resolve, reject, result),
+        reject,
+        timer: undefined,
+        deadline,
+        timeoutMs
+      }
       const expire = () => {
         if (!hostReflectApply(hostMapDelete, getSessionData(this).pending, [id])) return
         const error = sessionError(
@@ -2320,7 +2766,7 @@ export class UntrustedWorkerSession extends EventEmitter {
         if (getSessionData(this).state !== 'ready' ||
             !hostReflectApply(hostMapHas, getSessionData(this).pending, [id])) return
         this.#sendProtocol(body, serialized)
-        if (hostReflectApply(hostDateNow, Date, []) >= deadline) expire()
+        if (hostReflectApply(hostDateNow, undefined, []) >= deadline) expire()
       }
 
       if (getSessionData(this).state === 'ready') send()
@@ -2457,6 +2903,12 @@ export class UntrustedWorkerSession extends EventEmitter {
     return getSessionData(this).termination
   }
 
+  #failSafely (error) {
+    try {
+      this.#fail(error)
+    } catch {}
+  }
+
   #settleWithoutWorkerExit (error) {
     if (getSessionData(this).closedSettled) return
     getSessionData(this).failure = error
@@ -2476,10 +2928,10 @@ export class UntrustedWorkerSession extends EventEmitter {
       return
     }
     const validDiagnosticHandshake = getSessionData(this).diagnostics.enabled
-      ? message?.diagnosticPort instanceof MessagePort &&
+      ? isHostMessagePort(message?.diagnosticPort) &&
         typeof message.diagnosticSecret === 'string' && message.diagnosticSecret.length >= 32
       : message?.diagnosticPort === undefined && message?.diagnosticSecret === undefined
-    if (message?.type !== 'session-port' || !(message.port instanceof MessagePort) ||
+    if (message?.type !== 'session-port' || !isHostMessagePort(message.port) ||
         typeof message.protocolSecret !== 'string' || message.protocolSecret.length < 32 ||
         !validDiagnosticHandshake) {
       this.#fail(sessionError('Invalid worker handshake', 'ERR_UNTRUSTED_WORKER_PROTOCOL'))
@@ -2497,27 +2949,22 @@ export class UntrustedWorkerSession extends EventEmitter {
       secrets.diagnosticPort = message.diagnosticPort
       secrets.diagnosticSecret = message.diagnosticSecret
       hostReflectApply(hostMessagePortOn, secrets.diagnosticPort, ['message', (message) => {
-        let record
-        let sequence
         try {
-          record = this.#authenticateDiagnostic(message)
-          sequence = getSessionData(this).diagnosticSequence
+          const record = this.#authenticateDiagnostic(message)
+          const sequence = getSessionData(this).diagnosticSequence
+          const processing = chainHostPromise(
+            getSessionData(this).diagnosticProcessing,
+            () => this.#handleDiagnostic(record, sequence)
+          )
+          getSessionData(this).diagnosticProcessing = catchHostPromise(processing, (error) => {
+            this.#failSafely(error)
+          })
         } catch (error) {
-          this.#fail(error)
-          return
+          this.#failSafely(error)
         }
-        const processing = chainHostPromise(
-          getSessionData(this).diagnosticProcessing,
-          () => this.#handleDiagnostic(record, sequence)
-        )
-        getSessionData(this).diagnosticProcessing = catchHostPromise(processing, (error) => {
-          try {
-            this.#fail(error)
-          } catch {}
-        })
       }])
       hostReflectApply(hostMessagePortOn, secrets.diagnosticPort, ['messageerror', () => {
-        this.#fail(sessionError(
+        this.#failSafely(sessionError(
           'The worker diagnostic message could not be deserialized',
           'ERR_UNTRUSTED_WORKER_DIAGNOSTIC_PROTOCOL'
         ))
@@ -2529,11 +2976,11 @@ export class UntrustedWorkerSession extends EventEmitter {
       try {
         this.#handleMessage(this.#authenticateMessage(message))
       } catch (error) {
-        this.#fail(error)
+        this.#failSafely(error)
       }
     }])
     hostReflectApply(hostMessagePortOn, secrets.port, ['messageerror', () => {
-      this.#fail(sessionError(
+      this.#failSafely(sessionError(
         'The worker protocol message could not be deserialized',
         'ERR_UNTRUSTED_WORKER_PROTOCOL'
       ))
@@ -2553,9 +3000,9 @@ export class UntrustedWorkerSession extends EventEmitter {
 
   #authenticateMessage (message) {
     if (message === null || typeof message !== 'object' ||
-        !hostReflectApply(hostNumberIsSafeInteger, Number, [message.sequence]) || message.sequence !== getSessionData(this).inboundSequence + 1 ||
+        !hostReflectApply(hostNumberIsSafeInteger, undefined, [message.sequence]) || message.sequence !== getSessionData(this).inboundSequence + 1 ||
         message.payload === null || typeof message.payload !== 'object' ||
-        !hostReflectApply(safeArrayBufferIsView, ArrayBuffer, [message.payload]) ||
+        !hostReflectApply(safeArrayBufferIsView, undefined, [message.payload]) ||
         typeof message.mac !== 'string') {
       throw sessionError('Unauthenticated worker protocol message', 'ERR_UNTRUSTED_WORKER_PROTOCOL')
     }
@@ -2570,19 +3017,19 @@ export class UntrustedWorkerSession extends EventEmitter {
     if (byteLength > getSessionData(this).maxMessageBytes) {
       throw sessionError('Worker protocol message is too large', 'ERR_UNTRUSTED_WORKER_PROTOCOL')
     }
-    const expected = hostReflectApply(hostBufferFrom, Buffer, [protocolMac(
+    const expected = hostReflectApply(hostBufferFrom, undefined, [protocolMac(
       getSessionSecrets(this).protocolSecret,
       'worker-to-host',
       message.sequence,
       message.payload
     ), 'base64'])
-    const actual = hostReflectApply(hostBufferFrom, Buffer, [message.mac, 'base64'])
-    if (expected.length !== actual.length || !timingSafeEqual(expected, actual)) {
+    const actual = hostReflectApply(hostBufferFrom, undefined, [message.mac, 'base64'])
+    if (expected.length !== actual.length || !safeHostTimingSafeEqual(expected, actual)) {
       throw sessionError('Unauthenticated worker protocol message', 'ERR_UNTRUSTED_WORKER_PROTOCOL')
     }
     let body
     try {
-      body = v8Deserialize(message.payload)
+      body = safeHostV8Deserialize(message.payload)
       assertSupportedProtocolValue(
         body,
         'message',
@@ -2598,10 +3045,10 @@ export class UntrustedWorkerSession extends EventEmitter {
 
   #authenticateDiagnostic (message) {
     if (message === null || typeof message !== 'object' ||
-        !hostReflectApply(hostNumberIsSafeInteger, Number, [message.sequence]) ||
+        !hostReflectApply(hostNumberIsSafeInteger, undefined, [message.sequence]) ||
         message.sequence !== getSessionData(this).diagnosticSequence + 1 ||
         message.payload === null || typeof message.payload !== 'object' ||
-        !hostReflectApply(safeArrayBufferIsView, ArrayBuffer, [message.payload]) ||
+        !hostReflectApply(safeArrayBufferIsView, undefined, [message.payload]) ||
         typeof message.mac !== 'string') {
       throw sessionError(
         'Unauthenticated worker diagnostic message',
@@ -2623,14 +3070,14 @@ export class UntrustedWorkerSession extends EventEmitter {
         'ERR_UNTRUSTED_WORKER_DIAGNOSTIC_PROTOCOL'
       )
     }
-    const expected = hostReflectApply(hostBufferFrom, Buffer, [protocolMac(
+    const expected = hostReflectApply(hostBufferFrom, undefined, [protocolMac(
       getSessionSecrets(this).diagnosticSecret,
       'worker-diagnostic-to-host',
       message.sequence,
       message.payload
     ), 'base64'])
-    const actual = hostReflectApply(hostBufferFrom, Buffer, [message.mac, 'base64'])
-    if (expected.length !== actual.length || !timingSafeEqual(expected, actual)) {
+    const actual = hostReflectApply(hostBufferFrom, undefined, [message.mac, 'base64'])
+    if (expected.length !== actual.length || !safeHostTimingSafeEqual(expected, actual)) {
       throw sessionError(
         'Unauthenticated worker diagnostic message',
         'ERR_UNTRUSTED_WORKER_DIAGNOSTIC_PROTOCOL'
@@ -2638,7 +3085,7 @@ export class UntrustedWorkerSession extends EventEmitter {
     }
     let record
     try {
-      record = v8Deserialize(message.payload)
+      record = safeHostV8Deserialize(message.payload)
       assertSupportedProtocolValue(
         record,
         'diagnostic payload',
@@ -2669,18 +3116,15 @@ export class UntrustedWorkerSession extends EventEmitter {
     if (getSessionData(this).state === 'closing' || getSessionData(this).state === 'closed') return
     const store = { active: true, session: this }
     try {
-      const diagnostic = hostReflectApply(
+      const callback = hostReflectApply(
         hostAsyncLocalStorageRun,
         diagnosticContextStorage,
-        [store, async () => {
-          if (getSessionData(this).onDiagnostic) {
-            const callback = getSessionData(this).onDiagnostic(record)
-            await adoptHostValue(callback)
-          }
-          emitHostEvent(this, 'diagnostic', record)
-        }]
+        [store, () => getSessionData(this).onDiagnostic
+          ? getSessionData(this).onDiagnostic(record)
+          : undefined]
       )
-      await adoptHostValue(diagnostic)
+      await adoptHostValue(callback)
+      emitHostEvent(this, 'diagnostic', record)
     } catch (error) {
       throw sessionError(
         'The diagnostic callback failed',
@@ -2704,7 +3148,7 @@ export class UntrustedWorkerSession extends EventEmitter {
   #handleMessage (envelope, diagnosticsReady = false) {
     if (getSessionData(this).state === 'closing' || getSessionData(this).state === 'closed') return
     if (envelope === null || typeof envelope !== 'object' || typeof envelope.type !== 'string' ||
-        !hostReflectApply(hostNumberIsSafeInteger, Number, [envelope.diagnosticSequence]) ||
+        !hostReflectApply(hostNumberIsSafeInteger, undefined, [envelope.diagnosticSequence]) ||
         envelope.diagnosticSequence < 0) {
       this.#fail(sessionError('Invalid worker protocol message', 'ERR_UNTRUSTED_WORKER_PROTOCOL'))
       return
@@ -2726,7 +3170,7 @@ export class UntrustedWorkerSession extends EventEmitter {
     }
 
     try {
-      if ('value' in envelope) {
+      if (hostReflectApply(hostObjectHasOwn, undefined, [envelope, 'value'])) {
         assertNoSharedMemory(
           envelope.value,
           'message',
@@ -2779,7 +3223,7 @@ export class UntrustedWorkerSession extends EventEmitter {
       }
       hostReflectApply(hostMapDelete, getSessionData(this).pending, [envelope.id])
       hostClearTimeout(pending.timer)
-      if (hostReflectApply(hostDateNow, Date, []) >= pending.deadline) {
+      if (hostReflectApply(hostDateNow, undefined, []) >= pending.deadline) {
         const error = sessionError(
           `Message handling exceeded ${pending.timeoutMs} ms`,
           'ERR_UNTRUSTED_WORKER_MESSAGE_TIMEOUT'
@@ -2799,7 +3243,7 @@ export class UntrustedWorkerSession extends EventEmitter {
 
   #handleHostCall (envelope) {
     if (getSessionData(this).state !== 'starting' && getSessionData(this).state !== 'ready') return
-    if (!hostReflectApply(hostNumberIsSafeInteger, Number, [envelope.id]) || envelope.id <= 0 ||
+    if (!hostReflectApply(hostNumberIsSafeInteger, undefined, [envelope.id]) || envelope.id <= 0 ||
         typeof envelope.name !== 'string' || !hostArrayIsArray(envelope.arguments)) {
       this.#fail(sessionError('Invalid host function request', 'ERR_UNTRUSTED_WORKER_PROTOCOL'))
       return
@@ -2855,7 +3299,7 @@ export class UntrustedWorkerSession extends EventEmitter {
 
   async #invokeHostFunction (envelope, hostFunction, requestIndex) {
     try {
-      const value = await adoptHostValue(invokeHostFunction(
+      const outcome = await invokeHostFunction(
         hostFunction,
         envelope.arguments,
         {
@@ -2869,7 +3313,8 @@ export class UntrustedWorkerSession extends EventEmitter {
           requestIndex,
           hostFunctionName: envelope.name
         }
-      ))
+      )
+      const value = outcome.value
       const hostAbortSignal = hostReflectApply(
         hostAbortControllerSignal,
         getSessionData(this).hostAbortController,
@@ -3003,7 +3448,7 @@ export class UntrustedWorkerSession extends EventEmitter {
 }
 
 function protocolMac (secret, direction, sequence, serialized) {
-  const hmac = createHmac('sha256', secret)
+  const hmac = safeHostCreateHmac('sha256', secret)
   hostReflectApply(hostHmacUpdate, hmac, [`${direction}\0${sequence}\0`])
   hostReflectApply(hostHmacUpdate, hmac, [serialized])
   return hostReflectApply(hostHmacDigest, hmac, ['base64'])
@@ -3013,11 +3458,11 @@ function serializeProtocolBody (body, maxMessageBytes) {
   let serialized
   try {
     assertSupportedProtocolValue(body, 'message', maxMessageBytes, 'maxMessageBytes')
-    serialized = v8Serialize(body)
+    serialized = safeHostV8Serialize(body)
   } catch {
     throw new TypeError('Message is not supported by the authenticated protocol')
   }
-  if (serialized.byteLength > maxMessageBytes) {
+  if (hostReflectApply(hostTypedArrayByteLength, serialized, []) > maxMessageBytes) {
     throw new RangeError(`Message exceeds maxMessageBytes (${maxMessageBytes})`)
   }
   return serialized
@@ -3027,14 +3472,20 @@ function assertProtocolBody (body, label, maxMessageBytes) {
   try {
     return serializeProtocolBody(body, maxMessageBytes)
   } catch (error) {
-    if (error instanceof RangeError) throw error
+    try {
+      if (hostReflectApply(hostObjectGetPrototypeOf, undefined, [error]) === hostRangeErrorPrototype) {
+        throw error
+      }
+    } catch (classificationError) {
+      if (classificationError === error) throw error
+    }
     throw new TypeError(`${label} is not supported by the authenticated protocol`)
   }
 }
 
 function assertProtocolSerializable (value, label) {
   try {
-    v8Serialize(value)
+    safeHostV8Serialize(value)
   } catch {
     throw new TypeError(`${label} is not supported by the authenticated protocol`)
   }
@@ -3064,7 +3515,9 @@ function serializeHostError (error) {
 trustedSessionMethods = Object.freeze(Object.entries(
   Object.getOwnPropertyDescriptors(UntrustedWorkerSession.prototype)
 ).filter(([name, descriptor]) => {
-  return name !== 'constructor' && 'value' in descriptor && typeof descriptor.value === 'function'
+  return name !== 'constructor' &&
+    hostReflectApply(hostObjectHasOwn, undefined, [descriptor, 'value']) &&
+    typeof descriptor.value === 'function'
 }).map(([name, descriptor]) => Object.freeze([name, descriptor.value])))
 
 function snapshotSessionOptions (options, allowedNames, allowInternalSymbols = false) {
@@ -3082,7 +3535,8 @@ function snapshotSessionOptions (options, allowedNames, allowInternalSymbols = f
       throw new TypeError(`Unknown option: ${key}`)
     }
     const descriptor = descriptors[key]
-    if (!descriptor.enumerable || !('value' in descriptor)) {
+    if (!descriptor.enumerable ||
+        !hostReflectApply(hostObjectHasOwn, undefined, [descriptor, 'value'])) {
       throw new TypeError(`options.${String(key)} must be an enumerable data property`)
     }
     snapshot[key] = descriptor.value
@@ -3120,11 +3574,12 @@ function validateDiagnostics (diagnostics, onDiagnostic) {
     }
     for (let index = 0; index < keys.length; index++) {
       const key = keys[index]
-      if (!hostReflectApply(hostObjectHasOwn, Object, [values, key])) {
+      if (!hostReflectApply(hostObjectHasOwn, undefined, [values, key])) {
         throw new TypeError(`Unknown diagnostics option: ${key}`)
       }
-      const descriptor = hostReflectApply(hostObjectGetOwnPropertyDescriptor, Object, [diagnostics, key])
-      if (!descriptor.enumerable || !('value' in descriptor)) {
+      const descriptor = hostReflectApply(hostObjectGetOwnPropertyDescriptor, undefined, [diagnostics, key])
+      if (!descriptor.enumerable ||
+          !hostReflectApply(hostObjectHasOwn, undefined, [descriptor, 'value'])) {
         throw new TypeError(`diagnostics.${key} must be an enumerable data property`)
       }
       validatePositiveInteger(descriptor.value, `diagnostics.${key}`)

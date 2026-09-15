@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
 import { Dir } from 'node:fs'
 import { cp, link, mkdtemp, mkdir, open, readdir, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises'
+import { createRequire, syncBuiltinESMExports } from 'node:module'
 import { platform, tmpdir } from 'node:os'
 import { isAbsolute, join, relative, sep } from 'node:path'
 import { test } from 'node:test'
@@ -14,11 +15,14 @@ import {
   createUntrustedWorker,
   createUntrustedWorkerFromFile,
   runUntrustedCode,
-  runUntrustedFile
+  runUntrustedFile,
+  UntrustedCodeError
 } from '../src/index.js'
 import { getFileDescriptorQuotaWorkerData } from '../src/admission.js'
+import { resolveLocalModule } from '../src/local-files.js'
 import { createUntrustedFileSession } from '../src/session.js'
 
+const require = createRequire(import.meta.url)
 const execFileAsync = promisify(execFile)
 const packageUrl = new URL('../src/index.js', import.meta.url).href
 const admissionUrl = new URL('../src/admission.js', import.meta.url).href
@@ -80,6 +84,296 @@ test('runs a local module with static and dynamic relative imports', async (t) =
     input: { left: 10, right: 11 },
     timeoutMs: 5_000
   }), 42)
+})
+
+test('local file URLs preserve encoded path bytes and trailing root separators', async (t) => {
+  const files = await fixture({
+    'entry # % (value).mjs': 'export default () => 42'
+  })
+  t.after(() => files.cleanup())
+  assert.equal(await runUntrustedFile(files.path('entry # % (value).mjs'), {
+    rootDirectory: files.directory + sep,
+    timeoutMs: 5_000
+  }), 42)
+})
+
+test('local file URLs preserve literal backslashes in any POSIX entry segment', async (t) => {
+  if (platform() === 'win32') {
+    t.skip('Backslash is a path separator on Windows')
+    return
+  }
+  const files = await fixture({
+    'a\\b/entry.mjs': "import value from './relative.mjs'; export default () => value",
+    'a\\b/relative.mjs': "export default 'literal-backslash'",
+    'a\\b/failure.mjs': "export default () => { throw new Error('literal failure') }",
+    'a/b/entry.mjs': "export default () => 'nested-path'"
+  })
+  t.after(() => files.cleanup())
+
+  assert.equal(await runUntrustedFile(files.path('a\\b/entry.mjs'), {
+    rootDirectory: files.directory,
+    timeoutMs: 5_000
+  }), 'literal-backslash')
+
+  await assert.rejects(
+    runUntrustedFile(files.path('a\\b/failure.mjs'), {
+      rootDirectory: files.directory,
+      timeoutMs: 5_000
+    }),
+    (error) => {
+      assert.match(error.remoteStack, /secure-eval-worker-files\//)
+      assert.doesNotMatch(error.remoteStack, /secure-eval-worker-entry-[0-9a-f-]{36}/i)
+      return true
+    }
+  )
+})
+
+test('POSIX backslash aliases fail closed on deterministic source collisions', async (t) => {
+  if (platform() === 'win32') {
+    t.skip('Backslash is a path separator on Windows')
+    return
+  }
+  const files = await fixture({
+    'a\\b/entry.mjs': "import value from './sibling.mjs'; export default () => value",
+    '.secure-eval-worker-segment-615c62/sibling.mjs': 'export default 99'
+  })
+  t.after(() => files.cleanup())
+  await assert.rejects(
+    runUntrustedFile(files.path('a\\b/entry.mjs'), {
+      rootDirectory: files.directory,
+      timeoutMs: 5_000
+    }),
+    (error) => error.code === 'ERR_UNTRUSTED_MODULE_CHANGED' ||
+      error.cause?.code === 'ERR_UNTRUSTED_MODULE_CHANGED'
+  )
+})
+
+test('local staging uses snapshotted builtin exports after option poisoning', async (t) => {
+  const files = await fixture({ 'entry.mjs': 'export default input => input' })
+  t.after(() => files.cleanup())
+  const builtins = [
+    [require('node:crypto'), ['randomUUID']],
+    [require('node:fs'), ['realpath', 'open', 'read', 'write', 'fstat', 'close', 'link', 'opendir', 'lstat', 'stat', 'mkdir', 'mkdtemp', 'unlink', 'rmdir']],
+    [require('node:path'), ['extname', 'join', 'relative', 'dirname', 'isAbsolute']],
+    [require('node:os'), ['tmpdir', 'platform']],
+    [require('node:url'), ['fileURLToPath', 'pathToFileURL']]
+  ]
+  const originals = []
+  let poisoned = false
+  const restore = () => {
+    if (!poisoned) return
+    poisoned = false
+    for (const [target, name, descriptor] of originals) {
+      Object.defineProperty(target, name, descriptor)
+    }
+    syncBuiltinESMExports()
+  }
+  t.after(restore)
+  const poison = () => {
+    if (poisoned) return
+    poisoned = true
+    for (const [target, names] of builtins) {
+      for (const name of names) {
+        const descriptor = Object.getOwnPropertyDescriptor(target, name)
+        if (!descriptor || !('value' in descriptor) || typeof descriptor.value !== 'function') continue
+        originals.push([target, name, descriptor])
+        Object.defineProperty(target, name, {
+          ...descriptor,
+          value () { throw new Error(`poisoned builtin ${name}`) }
+        })
+      }
+    }
+    syncBuiltinESMExports()
+  }
+  const options = new Proxy({
+    rootDirectory: files.directory,
+    input: 42,
+    timeoutMs: 5_000
+  }, {
+    ownKeys (target) {
+      poison()
+      return Reflect.ownKeys(target)
+    }
+  })
+  try {
+    assert.equal(await runUntrustedFile(files.path('entry.mjs'), options), 42)
+  } finally {
+    restore()
+  }
+  assert.equal(await runUntrustedFile(files.path('entry.mjs'), {
+    rootDirectory: files.directory,
+    input: 43,
+    timeoutMs: 5_000
+  }), 43)
+})
+
+test('file URL conversion never consults a non-returning live path resolver', async (t) => {
+  const files = await fixture({ 'entry.mjs': 'export default () => 42' })
+  t.after(() => files.cleanup())
+  const source = `
+    import { createRequire, syncBuiltinESMExports } from 'node:module'
+    import { runUntrustedFile } from ${JSON.stringify(packageUrl)}
+    const require = createRequire(import.meta.url)
+    const pathBuiltin = require('node:path')
+    const block = () => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0)
+    Object.defineProperty(pathBuiltin, 'resolve', {
+      ...Object.getOwnPropertyDescriptor(pathBuiltin, 'resolve'),
+      value: block
+    })
+    if (pathBuiltin.posix !== pathBuiltin) {
+      Object.defineProperty(pathBuiltin.posix, 'resolve', {
+        ...Object.getOwnPropertyDescriptor(pathBuiltin.posix, 'resolve'),
+        value: block
+      })
+    }
+    syncBuiltinESMExports()
+    const result = await runUntrustedFile(${JSON.stringify(files.path('entry.mjs'))}, {
+      rootDirectory: ${JSON.stringify(files.directory)},
+      timeoutMs: 5000
+    })
+    process.stdout.write(String(result))
+  `
+  const { stdout } = await execFileAsync(process.execPath, ['--input-type=module', '--eval', source], {
+    timeout: 10_000
+  })
+  assert.equal(stdout, '42')
+})
+
+test('poisoned Error prototype metadata cannot strand local admission', async (t) => {
+  const files = await fixture({ 'entry.mjs': 'export default () => 42' })
+  t.after(() => files.cleanup())
+  const source = `
+    import { runUntrustedFile } from ${JSON.stringify(packageUrl)}
+    const defineProperty = Object.defineProperty
+    const getOwnPropertyDescriptor = Object.getOwnPropertyDescriptor
+    const nameDescriptor = getOwnPropertyDescriptor(Error.prototype, 'name')
+    let setterCalls = 0
+    defineProperty(Error.prototype, 'name', {
+      configurable: true,
+      get: nameDescriptor.get,
+      set () { setterCalls++; throw new Error('poisoned Error name setter') }
+    })
+    const restore = () => defineProperty(Error.prototype, 'name', nameDescriptor)
+    try {
+      const result = await runUntrustedFile(${JSON.stringify(files.path('entry.mjs'))}, {
+        rootDirectory: ${JSON.stringify(files.directory)},
+        timeoutMs: 5000
+      })
+      restore()
+      process.stdout.write(JSON.stringify({ result, setterCalls }))
+    } catch (error) {
+      restore()
+      process.stdout.write(JSON.stringify({ error: error.message, setterCalls }))
+    }
+  `
+  const { stdout } = await execFileAsync(process.execPath, ['--input-type=module', '--eval', source], {
+    timeout: 10_000
+  })
+  assert.deepEqual(JSON.parse(stdout), { result: 42, setterCalls: 0 })
+})
+
+test('Object.prototype then pollution cannot assimilate settled public results', async (t) => {
+  const files = await fixture({
+    'one-shot.mjs': 'export default () => ({ answer: 42 })',
+    'persistent.mjs': 'export default ({ onMessage }) => onMessage(value => ({ value }))'
+  })
+  t.after(() => files.cleanup())
+  const source = `
+    import * as api from ${JSON.stringify(packageUrl)}
+    const promiseThen = Promise.prototype.then
+    const defineProperty = Object.defineProperty
+    const deleteProperty = Reflect.deleteProperty
+    const stringify = JSON.stringify
+    api.configureWorkerAdmission({ maxConcurrentWorkers: 1 })
+    const session = await api.createUntrustedWorkerFromFile(
+      ${JSON.stringify(files.path('persistent.mjs'))},
+      {
+        rootDirectory: ${JSON.stringify(files.directory)},
+        startupTimeoutMs: 5000,
+        messageTimeoutMs: 5000,
+        lifetimeTimeoutMs: 5000
+      }
+    )
+    const ready = session.ready
+    await ready
+    const request = session.request('value')
+    const response = await request
+    const termination = session.terminate()
+    await termination
+    const closed = session.closed
+    const closedResult = await closed
+
+    let thenCalls = 0
+    let observations = 0
+    defineProperty(Object.prototype, 'then', {
+      configurable: true,
+      value (resolve) {
+        thenCalls++
+        if (typeof resolve === 'function') resolve('assimilated')
+      },
+      writable: true
+    })
+    for (const promise of [ready, request, closed]) {
+      Reflect.apply(promiseThen, promise, [() => { observations++ }])
+    }
+    queueMicrotask(() => {
+      const denied = api.runUntrustedFile(${JSON.stringify(files.path('one-shot.mjs'))}, {
+        rootDirectory: ${JSON.stringify(files.directory)},
+        timeoutMs: 5000
+      })
+      Reflect.apply(promiseThen, denied, [
+        () => {},
+        (error) => {
+          const denial = error.message
+          deleteProperty(Object.prototype, 'then')
+          const reuse = api.runUntrustedFile(${JSON.stringify(files.path('one-shot.mjs'))}, {
+            rootDirectory: ${JSON.stringify(files.directory)},
+            timeoutMs: 5000
+          })
+          Reflect.apply(promiseThen, reuse, [
+            (reused) => process.stdout.write(stringify({
+              response: response.value,
+              closed: closedResult.code,
+              observations,
+              denial,
+              reused: reused.answer,
+              thenCalls
+            })),
+            (reuseError) => process.stdout.write(stringify({ error: reuseError.message, thenCalls }))
+          ])
+        }
+      ])
+    })
+  `
+  const { stdout } = await execFileAsync(process.execPath, ['--input-type=module', '--eval', source], {
+    timeout: 12_000
+  })
+  assert.deepEqual(JSON.parse(stdout), {
+    response: 'value',
+    closed: 1,
+    observations: 3,
+    denial: 'Object.prototype.then must not be callable or accessor-backed',
+    reused: 42,
+    thenCalls: 0
+  })
+})
+
+test('private read-only snapshots can be removed with captured cleanup operations', async (t) => {
+  const files = await fixture({ 'entry.mjs': 'export default () => 42' })
+  t.after(() => files.cleanup())
+  const localModule = (await resolveLocalModule(
+    files.path('entry.mjs'),
+    files.directory,
+    {
+      maxRootEntries: 16,
+      maxFileBytes: 1024,
+      maxTotalFileBytes: 4096
+    }
+  )).value
+  const snapshotRoot = localModule.rootPath
+  assert.equal((await stat(join(snapshotRoot, 'entry.mjs'))).isFile(), true)
+  await localModule.cleanup()
+  await assert.rejects(stat(snapshotRoot), (error) => error.code === 'ENOENT')
 })
 
 test('resolves packages contained within the trusted root', async (t) => {
@@ -788,6 +1082,7 @@ test('validates local-file options without invoking accessors', async (t) => {
 
 test('hostile path errors cannot forge snapshot cleanup ownership', async (t) => {
   configureWorkerAdmission({ maxConcurrentWorkers: 1 })
+  t.after(() => configureWorkerAdmission({ maxConcurrentWorkers: 4 }))
   const files = await fixture({ 'entry.mjs': 'export default () => 42' })
   t.after(() => files.cleanup())
 
@@ -809,8 +1104,36 @@ test('hostile path errors cannot forge snapshot cleanup ownership', async (t) =>
   }), 42)
 })
 
+test('local cleanup classification ignores poisoned UntrustedCodeError instanceof', async (t) => {
+  configureWorkerAdmission({ maxConcurrentWorkers: 1 })
+  t.after(() => configureWorkerAdmission({ maxConcurrentWorkers: 4 }))
+  const files = await fixture({ 'entry.mjs': 'export default () => 42' })
+  t.after(() => files.cleanup())
+  const descriptor = Object.getOwnPropertyDescriptor(UntrustedCodeError, Symbol.hasInstance)
+  t.after(() => {
+    if (descriptor) Object.defineProperty(UntrustedCodeError, Symbol.hasInstance, descriptor)
+    else delete UntrustedCodeError[Symbol.hasInstance]
+  })
+  Object.defineProperty(UntrustedCodeError, Symbol.hasInstance, {
+    configurable: true,
+    value () { throw new Error('poisoned UntrustedCodeError.hasInstance') }
+  })
+  await assert.rejects(
+    runUntrustedFile(files.path('missing.mjs'), {
+      rootDirectory: files.directory,
+      timeoutMs: 5_000
+    }),
+    (error) => error.code === 'ERR_UNTRUSTED_MODULE_PATH'
+  )
+  assert.equal(await runUntrustedFile(files.path('entry.mjs'), {
+    rootDirectory: files.directory,
+    timeoutMs: 5_000
+  }), 42)
+})
+
 test('snapshot cleanup uses captured promise operations', async (t) => {
   configureWorkerAdmission({ maxConcurrentWorkers: 1 })
+  t.after(() => configureWorkerAdmission({ maxConcurrentWorkers: 4 }))
   const files = await fixture({
     'entry.mjs': 'export default ({ onMessage }) => onMessage(() => 42)',
     'one-shot.mjs': 'export default () => 42'
@@ -873,6 +1196,7 @@ test('promise species poisoning cannot strand local preparation or admission', a
       'constructor'
     )
     const originalSpecies = Object.getOwnPropertyDescriptor(Promise, Symbol.species)
+    const originalThen = Promise.prototype.then
     class PoisonPromiseSpecies {
       constructor () { throw new Error('poisoned promise species') }
     }
@@ -889,10 +1213,12 @@ test('promise species poisoning cannot strand local preparation or admission', a
         configurable: true,
         value: PoisonPromiseSpecies
       })
+      Promise.prototype.then = () => new Promise(() => {})
     }
     const restore = () => {
       Object.defineProperty(Promise.prototype, 'constructor', originalConstructor)
       Object.defineProperty(Promise, Symbol.species, originalSpecies)
+      Promise.prototype.then = originalThen
     }
     let success
     let successHardened
@@ -1118,6 +1444,7 @@ test('staging uses captured directory operations', async (t) => {
 
 test('local-file deadlines use a captured clock', async (t) => {
   configureWorkerAdmission({ maxConcurrentWorkers: 1 })
+  t.after(() => configureWorkerAdmission({ maxConcurrentWorkers: 4 }))
   const files = await fixture({ 'entry.mjs': 'export default () => 42' })
   t.after(() => files.cleanup())
 
@@ -1142,6 +1469,7 @@ test('local-file deadlines use a captured clock', async (t) => {
 
 test('descriptor cleanup uses captured atomic operations', async (t) => {
   configureWorkerAdmission({ maxConcurrentWorkers: 1 })
+  t.after(() => configureWorkerAdmission({ maxConcurrentWorkers: 4 }))
   const files = await fixture({
     'entry.mjs': 'export default ({ onMessage }) => onMessage(() => 42)'
   })
@@ -1584,6 +1912,62 @@ test('cancellation stops preparation without starving worker admission', async (
   await assert.rejects(execution, (error) => error.name === 'AbortError')
   assert.equal(await runUntrustedCode('return 42', { timeoutMs: 5_000 }), 42)
   await waitForFilePreparation(files.path('entry.mjs'), files.directory)
+})
+
+test('cancellation is observed during POSIX backslash alias construction', {
+  skip: process.platform === 'win32'
+}, async (t) => {
+  const files = await fixture({
+    'nested\\entry.mjs': 'export default () => 42'
+  })
+  t.after(() => files.cleanup())
+  const childSource = `
+    import fs from 'node:fs'
+    import { syncBuiltinESMExports } from 'node:module'
+    const realLink = fs.link
+    let controller
+    fs.link = (...args) => {
+      controller?.abort('alias-cancelled')
+      return Reflect.apply(realLink, undefined, args)
+    }
+    syncBuiltinESMExports()
+    const api = await import(${JSON.stringify(packageUrl)})
+    fs.link = realLink
+    syncBuiltinESMExports()
+    api.configureWorkerAdmission({ maxConcurrentWorkers: 1 })
+    controller = new AbortController()
+    let cancellation
+    try {
+      await api.runUntrustedFile(${JSON.stringify(files.path('nested\\entry.mjs'))}, {
+        rootDirectory: ${JSON.stringify(files.directory)},
+        signal: controller.signal,
+        timeoutMs: 5000
+      })
+      cancellation = 'resolved'
+    } catch (error) {
+      cancellation = error.name
+    }
+    controller = undefined
+    const deadline = Date.now() + 5000
+    let reused
+    while (Date.now() < deadline) {
+      try {
+        reused = await api.runUntrustedFile(${JSON.stringify(files.path('nested\\entry.mjs'))}, {
+          rootDirectory: ${JSON.stringify(files.directory)},
+          timeoutMs: 5000
+        })
+        break
+      } catch (error) {
+        if (error.code !== 'ERR_UNTRUSTED_CODE_CAPACITY') throw error
+        await new Promise(resolve => setTimeout(resolve, 20))
+      }
+    }
+    process.stdout.write(JSON.stringify({ cancellation, reused }))
+  `
+  const { stdout } = await execFileAsync(process.execPath, ['--input-type=module', '--eval', childSource], {
+    timeout: 12_000
+  })
+  assert.deepEqual(JSON.parse(stdout), { cancellation: 'AbortError', reused: 42 })
 })
 
 test('host worker threads fail before resolving local module paths', async () => {

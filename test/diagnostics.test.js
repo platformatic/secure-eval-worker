@@ -63,12 +63,45 @@ test('async one-shot diagnostic callbacks settle before the result', async () =>
   )
 })
 
-test('persistent diagnostic chaining ignores poisoned promise species', async (t) => {
+test('synchronous diagnostic results never assimilate then properties', async (t) => {
+  let getterReads = 0
+  let callableCalls = 0
+  let callbackIndex = 0
+  const callable = () => { callableCalls++; return new Promise(() => {}) }
+  const values = [
+    Object.defineProperty(Object.create(null), 'then', {
+      enumerable: true,
+      get () { getterReads++; return callable }
+    }),
+    { then: callable },
+    Object.assign(Object.create({ then: callable }), { value: 42 })
+  ]
+  const session = createUntrustedWorker(`
+    onMessage(value => { console.log('diagnostic', value); return value })
+  `, {
+    ...SESSION_OPTIONS,
+    messageTimeoutMs: 1_000,
+    diagnostics: true,
+    onDiagnostic () { return values[callbackIndex++] }
+  })
+  t.after(() => session.terminate().catch(() => {}))
+  await session.ready
+  for (let index = 0; index < values.length; index++) {
+    assert.equal(await session.request(index), index)
+  }
+  assert.equal(getterReads, 0)
+  assert.equal(callableCalls, 0)
+  await session.terminate()
+  await session.closed
+})
+
+test('persistent diagnostics fail closed under poisoned promise species', async (t) => {
   const originalConstructor = Object.getOwnPropertyDescriptor(
     Promise.prototype,
     'constructor'
   )
   const originalSpecies = Object.getOwnPropertyDescriptor(Promise, Symbol.species)
+  const originalThen = Promise.prototype.then
   let restored = false
   const restore = () => {
     if (restored) return
@@ -111,11 +144,23 @@ test('persistent diagnostic chaining ignores poisoned promise species', async (t
     configurable: true,
     value: PoisonPromiseSpecies
   })
-  assert.equal(await session.request(42), 42)
+  const request = session.request(42)
+  const observed = new Promise(resolve => {
+    Reflect.apply(originalThen, request, [
+      value => resolve({ value }),
+      error => resolve({ error })
+    ])
+  })
+  Object.defineProperty(observed, 'constructor', {
+    configurable: false,
+    value: Promise,
+    writable: false
+  })
+  const outcome = await observed
   restore()
+  assert.match(outcome.error?.message, /diagnostic callback/i)
   assert.equal(Object.hasOwn(retainedPromise, 'constructor'), false)
   assert.deepEqual(records, [{ level: 'log', text: 'diagnostic 42' }])
-  await session.terminate()
   await session.closed
 })
 

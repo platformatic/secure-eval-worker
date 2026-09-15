@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict'
-import { AsyncLocalStorage } from 'node:async_hooks'
+import { AsyncLocalStorage, createHook } from 'node:async_hooks'
 import { createRequire, syncBuiltinESMExports } from 'node:module'
 import { test } from 'node:test'
 
 import {
+  configureWorkerAdmission,
   createUntrustedWorker,
   getHostFunctionContext,
   HostFunctionError,
@@ -301,7 +302,7 @@ test('host function context uses captured AsyncLocalStorage operations', async (
   }
 })
 
-test('host-function promise settlement ignores poisoned promise species', async (t) => {
+test('host-function promise settlement fails closed under poisoned promise species', async (t) => {
   const originalConstructor = Object.getOwnPropertyDescriptor(
     Promise.prototype,
     'constructor'
@@ -363,7 +364,7 @@ test('host-function promise settlement ignores poisoned promise species', async 
     value: () => false
   })
   syncBuiltinESMExports()
-  assert.equal(await session.request(null), 42)
+  await assert.rejects(session.request(null), /Host function failed/)
   assert.equal(Object.hasOwn(retainedPromise, 'constructor'), false)
   restore()
   await session.terminate()
@@ -418,7 +419,7 @@ test('frozen host promises fail closed under constructor poisoning', async (t) =
   await session.terminate()
 })
 
-test('host functions preserve Promise subclasses and retained promise descriptors', async () => {
+test('host functions preserve canonical promises and reject Promise subclasses', async () => {
   class ResultPromise extends Promise {}
   const promises = []
   const session = createUntrustedWorker('onMessage(value => tools[value]())', {
@@ -448,11 +449,119 @@ test('host functions preserve Promise subclasses and retained promise descriptor
   await session.ready
   assert.equal(await session.request('native'), 41)
   assert.equal(await session.request('frozenNative'), 42)
-  assert.equal(await session.request('subclass'), 43)
+  await assert.rejects(session.request('subclass'), /Host function failed/)
   for (const promise of promises) {
     assert.equal(Object.hasOwn(promise, 'constructor'), false)
   }
   await session.terminate()
+})
+
+test('host promise adoption never mutates retained promise descriptors', async (t) => {
+  let retainedPromise
+  let observedDescriptor
+  const hook = createHook({
+    init () {
+      if (!retainedPromise || observedDescriptor !== undefined) return
+      observedDescriptor = Object.getOwnPropertyDescriptor(retainedPromise, 'constructor') ?? null
+      hook.disable()
+    }
+  })
+  t.after(() => hook.disable())
+
+  const session = createUntrustedWorker('onMessage(() => tools.value())', {
+    hostFunctions: {
+      tools: {
+        value () {
+          retainedPromise = Promise.resolve(46)
+          hook.enable()
+          return retainedPromise
+        }
+      }
+    },
+    startupTimeoutMs: 5_000,
+    messageTimeoutMs: 5_000,
+    lifetimeTimeoutMs: 5_000
+  })
+  t.after(() => session.terminate().catch(() => {}))
+  await session.ready
+  assert.equal(await session.request(null), 46)
+  assert.equal(observedDescriptor, null)
+  assert.equal(Object.getOwnPropertyDescriptor(retainedPromise, 'constructor'), undefined)
+  await session.terminate()
+})
+
+test('host promise adoption rejects custom proxy prototypes without traps', async (t) => {
+  let descriptorReads = 0
+  let prototypeReads = 0
+  let valueReads = 0
+  const session = createUntrustedWorker('onMessage(() => tools.value())', {
+    hostFunctions: {
+      tools: {
+        value () {
+          const proxyPrototype = new Proxy(Object.create(Promise.prototype), {
+            getOwnPropertyDescriptor () { descriptorReads++; throw new Error('descriptor trap') },
+            getPrototypeOf () { prototypeReads++; throw new Error('prototype trap') },
+            get () { valueReads++; throw new Error('value trap') }
+          })
+          const promise = Promise.resolve(47)
+          Object.setPrototypeOf(promise, proxyPrototype)
+          Object.preventExtensions(promise)
+          return promise
+        }
+      }
+    },
+    startupTimeoutMs: 5_000,
+    messageTimeoutMs: 1_000,
+    lifetimeTimeoutMs: 5_000
+  })
+  t.after(() => session.terminate().catch(() => {}))
+  await session.ready
+  await assert.rejects(session.request(null), /Host function failed/)
+  assert.equal(descriptorReads, 0)
+  assert.equal(prototypeReads, 0)
+  assert.equal(valueReads, 0)
+  await session.terminate()
+})
+
+test('synchronous host results never assimilate untrusted then properties', async (t) => {
+  let getterReads = 0
+  let callableCalls = 0
+  const callable = () => { callableCalls++; return new Promise(() => {}) }
+  const inherited = Object.create({ then: callable })
+  inherited.value = 42
+  const accessor = { value: 43 }
+  Object.defineProperty(accessor, 'then', {
+    enumerable: true,
+    get () { getterReads++; return callable }
+  })
+  const session = createUntrustedWorker(`
+    onMessage(async name => {
+      try { return await tools[name]() } catch (error) { return error.code }
+    })
+  `, {
+    hostFunctions: {
+      tools: {
+        data: () => ({ then: 'ordinary-data', value: 41 }),
+        inherited: () => inherited,
+        accessor: () => accessor,
+        callable: () => ({ then: callable, value: 44 }),
+        nonreturning: () => ({ then () { callableCalls++; return new Promise(() => {}) } })
+      }
+    },
+    startupTimeoutMs: 5_000,
+    messageTimeoutMs: 1_000,
+    lifetimeTimeoutMs: 5_000
+  })
+  t.after(() => session.terminate().catch(() => {}))
+  await session.ready
+  assert.deepEqual(await session.request('data'), { then: 'ordinary-data', value: 41 })
+  for (const name of ['inherited', 'accessor', 'callable', 'nonreturning']) {
+    assert.equal(await session.request(name), 'ERR_UNTRUSTED_WORKER_HOST_FUNCTION')
+  }
+  assert.equal(getterReads, 0)
+  assert.equal(callableCalls, 0)
+  await session.terminate()
+  await session.closed
 })
 
 test('frozen Promise subclasses fail closed without invoking host species', async (t) => {
@@ -652,6 +761,148 @@ test('host errors are redacted unless explicitly marked public', async () => {
     code: 'NOT_FOUND'
   })
   assert.equal(await session.request('ok'), 'still running')
+  await session.terminate()
+})
+
+test('HostFunctionError validates canonical own options without invoking accessors', () => {
+  const cause = new Error('trusted cause')
+  const valid = new HostFunctionError('public', { code: 'PUBLIC', cause })
+  assert.equal(valid.code, 'PUBLIC')
+  assert.equal(valid.cause, cause)
+
+  const inherited = Object.create({ code: 'INHERITED_SECRET', cause: new Error('hidden') })
+  assert.throws(() => new HostFunctionError('public', inherited), /plain object/)
+
+  let reads = 0
+  for (const name of ['code', 'cause']) {
+    const options = Object.defineProperty({}, name, {
+      enumerable: true,
+      get () { reads++; return 'secret' }
+    })
+    assert.throws(() => new HostFunctionError('public', options), /data property/)
+  }
+  assert.equal(reads, 0)
+
+  let traps = 0
+  const proxy = new Proxy({}, {
+    getPrototypeOf () { traps++; throw new Error('prototype trap') },
+    ownKeys () { traps++; throw new Error('ownKeys trap') }
+  })
+  assert.throws(() => new HostFunctionError('public', proxy), /plain object/)
+  assert.equal(traps, 0)
+  assert.throws(() => new HostFunctionError('public', []), /plain object/)
+  assert.throws(() => new HostFunctionError('public', null), /plain object/)
+  assert.throws(() => new HostFunctionError('public', { unknown: true }), /unsupported property/)
+  assert.throws(() => new HostFunctionError('public', { code: 42 }), /must be a string/)
+  assert.throws(
+    () => new HostFunctionError('public', { [Symbol('secret')]: true }),
+    /unsupported property/
+  )
+})
+
+test('host-function descriptors ignore polluted Object.prototype.value', async (t) => {
+  configureWorkerAdmission({ maxConcurrentWorkers: 1 })
+  t.after(() => configureWorkerAdmission({ maxConcurrentWorkers: 4 }))
+  const original = Object.getOwnPropertyDescriptor(Object.prototype, 'value')
+  const restore = () => {
+    if (original) Object.defineProperty(Object.prototype, 'value', original)
+    else delete Object.prototype.value
+  }
+  t.after(restore)
+
+  for (const pollution of ['data', 'accessor']) {
+    let namespaceReads = 0
+    let prototypeReads = 0
+    if (pollution === 'data') {
+      Object.defineProperty(Object.prototype, 'value', {
+        configurable: true,
+        value: { hidden: () => 42 },
+        writable: true
+      })
+    } else {
+      Object.defineProperty(Object.prototype, 'value', {
+        configurable: true,
+        get () {
+          prototypeReads++
+          throw new Error('poisoned descriptor value')
+        }
+      })
+    }
+    const namespaceDescriptor = Object.create(null)
+    namespaceDescriptor.enumerable = true
+    namespaceDescriptor.get = () => {
+      namespaceReads++
+      return { hidden: () => 42 }
+    }
+    const hostFunctions = Object.defineProperty({}, 'tools', namespaceDescriptor)
+    assert.throws(
+      () => createUntrustedWorker('onMessage(value => value)', {
+        hostFunctions,
+        startupTimeoutMs: 5_000,
+        messageTimeoutMs: 5_000,
+        lifetimeTimeoutMs: 5_000
+      }),
+      /Host function namespace .* must be a data property/
+    )
+    assert.equal(namespaceReads, 0)
+    assert.equal(prototypeReads, 0)
+    restore()
+
+    const session = createUntrustedWorker('onMessage(value => value)', {
+      startupTimeoutMs: 5_000,
+      messageTimeoutMs: 5_000,
+      lifetimeTimeoutMs: 5_000
+    })
+    await session.ready
+    assert.equal(await session.request(42), 42)
+    await session.terminate()
+    await session.closed
+  }
+})
+
+test('HostFunctionError ignores polluted inherited disclosure fields', async (t) => {
+  const codeDescriptor = Object.getOwnPropertyDescriptor(Object.prototype, 'code')
+  const causeDescriptor = Object.getOwnPropertyDescriptor(Object.prototype, 'cause')
+  let causeReads = 0
+  t.after(() => {
+    if (codeDescriptor) Object.defineProperty(Object.prototype, 'code', codeDescriptor)
+    else delete Object.prototype.code
+    if (causeDescriptor) Object.defineProperty(Object.prototype, 'cause', causeDescriptor)
+    else delete Object.prototype.cause
+  })
+  Object.defineProperty(Object.prototype, 'code', {
+    configurable: true,
+    value: 'INHERITED_SECRET',
+    writable: true
+  })
+  Object.defineProperty(Object.prototype, 'cause', {
+    configurable: true,
+    get () { causeReads++; return new Error('secret cause') }
+  })
+  const publicError = new HostFunctionError('Safe public text')
+  if (codeDescriptor) Object.defineProperty(Object.prototype, 'code', codeDescriptor)
+  else delete Object.prototype.code
+  if (causeDescriptor) Object.defineProperty(Object.prototype, 'cause', causeDescriptor)
+  else delete Object.prototype.cause
+  const session = createUntrustedWorker(`
+    onMessage(async () => {
+      try { await tools.fail() } catch (error) {
+        return { message: error.message, code: error.code }
+      }
+    })
+  `, {
+    hostFunctions: { tools: { fail: () => { throw publicError } } },
+    startupTimeoutMs: 5_000,
+    messageTimeoutMs: 5_000,
+    lifetimeTimeoutMs: 5_000
+  })
+  t.after(() => session.terminate().catch(() => {}))
+  await session.ready
+  assert.deepEqual(await session.request(null), {
+    message: 'Safe public text',
+    code: 'ERR_HOST_FUNCTION'
+  })
+  assert.equal(causeReads, 0)
   await session.terminate()
 })
 

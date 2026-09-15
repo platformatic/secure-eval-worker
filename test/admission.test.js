@@ -19,6 +19,7 @@ import {
 
 const execFileAsync = promisify(execFile)
 const packageUrl = new URL('../src/index.js', import.meta.url).href
+const admissionUrl = new URL('../src/admission.js', import.meta.url).href
 const legacyAdmissionStateUrl = new URL(
   '../fixtures/security/legacy-admission-state-v1.mjs',
   import.meta.url
@@ -51,6 +52,56 @@ test('worker admission validates process-wide configuration', () => {
     configureWorkerAdmission({ maxConcurrentWorkers: 1 }),
     { maxConcurrentWorkers: 1, activeWorkers: 0 }
   )
+})
+
+test('admission descriptors ignore polluted Object.prototype.value', () => {
+  const original = Object.getOwnPropertyDescriptor(Object.prototype, 'value')
+  const restore = () => {
+    if (original) Object.defineProperty(Object.prototype, 'value', original)
+    else delete Object.prototype.value
+  }
+  try {
+    for (const pollution of ['data', 'accessor']) {
+      let optionReads = 0
+      let prototypeReads = 0
+      if (pollution === 'data') {
+        Object.defineProperty(Object.prototype, 'value', {
+          configurable: true,
+          value: 1,
+          writable: true
+        })
+      } else {
+        Object.defineProperty(Object.prototype, 'value', {
+          configurable: true,
+          get () {
+            prototypeReads++
+            throw new Error('poisoned descriptor value')
+          }
+        })
+      }
+      const optionDescriptor = Object.create(null)
+      optionDescriptor.enumerable = true
+      optionDescriptor.get = () => {
+        optionReads++
+        return 1
+      }
+      const options = Object.defineProperty({}, 'maxConcurrentWorkers', optionDescriptor)
+      assert.throws(
+        () => configureWorkerAdmission(options),
+        /maxConcurrentWorkers must be a data property/
+      )
+      assert.equal(optionReads, 0)
+      assert.equal(prototypeReads, 0)
+      restore()
+      assert.deepEqual(
+        configureWorkerAdmission({ maxConcurrentWorkers: 1 }),
+        { maxConcurrentWorkers: 1, activeWorkers: 0 }
+      )
+    }
+  } finally {
+    restore()
+    configureWorkerAdmission({ maxConcurrentWorkers: 4 })
+  }
 })
 
 test('admission rejects rather than queues and releases only after worker exit', async () => {
@@ -423,6 +474,70 @@ test('legacy-first worker and preparation controllers preserve repeated lifecycl
     local: [42, 43],
     status: { maxConcurrentWorkers: 1, activeWorkers: 0 },
     snapshots: []
+  })
+})
+
+test('process-global admission accessors are never invoked and fail closed', async () => {
+  const keys = [
+    'secure-eval-worker.admission.main.v1',
+    'secure-eval-worker.admission.preparation.main.v1',
+    'secure-eval-worker.admission.descriptors.main.v1'
+  ]
+  for (let index = 0; index < keys.length; index++) {
+    const childSource = `
+      let reads = 0
+      Object.defineProperty(globalThis, Symbol.for(${JSON.stringify(keys[index])}), {
+        configurable: false,
+        get () { reads++; throw new Error('controller getter invoked') }
+      })
+      const admission = await import(${JSON.stringify(admissionUrl)})
+      let code
+      try {
+        if (${index} === 0) admission.acquireWorkerSlot()
+        else if (${index} === 1) admission.acquireFilePreparationSlot()
+        else admission.createFileDescriptorQuota()
+      } catch (error) { code = error.code }
+      console.log(JSON.stringify({ reads, code }))
+    `
+    const { stdout } = await execFileAsync(process.execPath, [
+      '--input-type=module',
+      '--eval',
+      childSource
+    ], { timeout: 10_000 })
+    assert.deepEqual(JSON.parse(stdout), {
+      reads: 0,
+      code: 'ERR_UNTRUSTED_WORKER_ADMISSION_UNAVAILABLE'
+    })
+  }
+})
+
+test('current-first admission state remains usable by the maintained legacy consumer', async () => {
+  const childSource = `
+    const admission = await import(${JSON.stringify(admissionUrl)})
+    const legacy = await import(${JSON.stringify(legacyAdmissionStateUrl)})
+    admission.configureWorkerAdmission({ maxConcurrentWorkers: 2 })
+    legacy.legacyConfigurePreparationsV1(2)
+    const first = legacy.legacyAcquireWorkerV1()
+    const second = legacy.legacyAcquireWorkerV1()
+    const preparationOne = legacy.legacyAcquirePreparationV1()
+    const preparationTwo = legacy.legacyAcquirePreparationV1()
+    const occupied = legacy.legacyWorkerStatusV1()
+    first(); first(); second()
+    preparationOne(); preparationOne(); preparationTwo()
+    const released = legacy.legacyWorkerStatusV1()
+    const direct = admission.acquireWorkerSlot()
+    direct()
+    console.log(JSON.stringify({ occupied, released, final: admission.getWorkerAdmissionStatus() }))
+  `
+  const { stdout } = await execFileAsync(process.execPath, [
+    '--input-type=module',
+    '--eval',
+    childSource
+  ], { timeout: 10_000 })
+  assert.deepEqual(JSON.parse(stdout), {
+    occupied: { maxConcurrentWorkers: 2, activeWorkers: 2 },
+    released: { maxConcurrentWorkers: 2, activeWorkers: 0 },
+    final: { maxConcurrentWorkers: 2, activeWorkers: 0 }
   })
 })
 

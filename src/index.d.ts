@@ -21,7 +21,7 @@ export interface WorkerResourceLimits {
 
 export type WorkerEnvironment = Readonly<Record<string, string>>
 export type HostFunction<Arguments extends readonly unknown[] = readonly unknown[], Result = unknown> =
-  (...argumentsList: Arguments) => Result | PromiseLike<Result>
+  (...argumentsList: Arguments) => Result | Promise<Result>
 export type HostFunctionNamespace = Readonly<Record<string, HostFunction<any, any>>>
 export type HostFunctionNamespaces = Readonly<Record<string, HostFunctionNamespace>>
 
@@ -85,7 +85,7 @@ export interface CommonWorkerOptions<Input = unknown, Hosts extends HostFunction
   maxHostFunctionCalls?: number
   maxInFlightHostFunctions?: number
   diagnostics?: boolean | DiagnosticOptions
-  onDiagnostic?: (record: DiagnosticRecord) => void | PromiseLike<void>
+  onDiagnostic?: (record: DiagnosticRecord) => void | Promise<void>
 }
 
 export interface RunUntrustedCodeOptions<Input = unknown, Hosts extends HostFunctionNamespaces = HostFunctionNamespaces>

@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 import { once } from 'node:events'
+import { createRequire, syncBuiltinESMExports } from 'node:module'
 import { test } from 'node:test'
+import { MessagePort } from 'node:worker_threads'
 
 import {
   configureWorkerAdmission,
@@ -8,6 +10,8 @@ import {
   UntrustedCodeError,
   UntrustedWorkerSession
 } from '../src/index.js'
+
+const require = createRequire(import.meta.url)
 
 const SCRIPT_COMPONENT = `
   send({ type: 'started', input })
@@ -327,7 +331,7 @@ for (const type of ['script', 'module']) {
     await session.terminate()
   })
 
-  test(`${type} source cannot poison bootstrap promise handling`, async () => {
+  test(`${type} source promise poisoning fails closed`, async () => {
     const poison = `
       const nativePromise = (async () => {})()
       if (!(nativePromise instanceof Promise) || nativePromise.constructor !== Promise) {
@@ -366,17 +370,8 @@ for (const type of ['script', 'module']) {
       lifetimeTimeoutMs: 5_000
     })
 
-    await session.ready
-    const result = await session.request('value')
-    if (type === 'script') {
-      assert.equal(result, 'real')
-    } else {
-      assert.deepEqual(result, {
-        value: 'real',
-        ownConstructor: false
-      })
-    }
-    await session.terminate()
+    await assert.rejects(session.ready, /Promise cannot be observed safely/)
+    await session.closed
   })
 
   test(`${type} authenticated traffic uses captured numeric validation`, async () => {
@@ -416,6 +411,276 @@ for (const type of ['script', 'module']) {
     await session.closed
   })
 }
+
+test('guest prototype then pollution cannot assimilate handler or host-call results', async (t) => {
+  const synchronous = createUntrustedWorker(`
+    let calls = 0
+    onMessage(() => {
+      Object.defineProperty(Object.prototype, 'then', {
+        configurable: true,
+        value (resolve) { calls++; resolve('assimilated') }
+      })
+      return { calls, value: 42 }
+    })
+  `, {
+    startupTimeoutMs: 5_000,
+    messageTimeoutMs: 5_000,
+    lifetimeTimeoutMs: 5_000
+  })
+  t.after(() => synchronous.terminate().catch(() => {}))
+  await synchronous.ready
+  assert.deepEqual(await synchronous.request(null), { calls: 0, value: 42 })
+  await synchronous.terminate()
+  await synchronous.closed
+
+  const hostCall = createUntrustedWorker(`
+    let calls = 0
+    onMessage(async () => {
+      Object.defineProperty(Object.prototype, 'then', {
+        configurable: true,
+        value (resolve) { calls++; resolve('assimilated') }
+      })
+      const result = await tools.value()
+      return result.answer + calls
+    })
+  `, {
+    hostFunctions: { tools: { value: () => ({ answer: 43 }) } },
+    startupTimeoutMs: 5_000,
+    messageTimeoutMs: 5_000,
+    lifetimeTimeoutMs: 5_000
+  })
+  t.after(() => hostCall.terminate().catch(() => {}))
+  await hostCall.ready
+  assert.equal(await hostCall.request(null), 43)
+  await hostCall.terminate()
+  await hostCall.closed
+})
+
+test('guest descriptor validation ignores polluted Object.prototype.value', async (t) => {
+  configureWorkerAdmission({ maxConcurrentWorkers: 1 })
+  t.after(() => configureWorkerAdmission({ maxConcurrentWorkers: 4 }))
+
+  for (const pollution of ['data', 'accessor']) {
+    const session = createUntrustedWorker(`
+      let propertyReads = 0
+      let prototypeReads = 0
+      onMessage(kind => {
+        if (kind === 'counts') {
+          Reflect.deleteProperty(Object.prototype, 'value')
+          return { propertyReads, prototypeReads }
+        }
+        if (${JSON.stringify(pollution)} === 'data') {
+          Object.defineProperty(Object.prototype, 'value', {
+            configurable: true,
+            value: 42,
+            writable: true
+          })
+        } else {
+          Object.defineProperty(Object.prototype, 'value', {
+            configurable: true,
+            get () {
+              prototypeReads++
+              throw new Error('poisoned descriptor value')
+            }
+          })
+        }
+        const descriptor = Object.create(null)
+        descriptor.enumerable = true
+        descriptor.get = () => {
+          propertyReads++
+          return 42
+        }
+        return Object.defineProperty({}, 'secret', descriptor)
+      })
+    `, {
+      startupTimeoutMs: 5_000,
+      messageTimeoutMs: 1_000,
+      lifetimeTimeoutMs: 5_000
+    })
+    session.on('error', () => {})
+    t.after(() => session.terminate().catch(() => {}))
+    await session.ready
+    await assert.rejects(session.request('attack'), /Unsupported protocol value/)
+    assert.deepEqual(await session.request('counts'), {
+      propertyReads: 0,
+      prototypeReads: 0
+    })
+    await session.terminate()
+    await session.closed
+  }
+
+  const replacement = createUntrustedWorker('onMessage(value => value)', {
+    startupTimeoutMs: 5_000,
+    messageTimeoutMs: 5_000,
+    lifetimeTimeoutMs: 5_000
+  })
+  await replacement.ready
+  assert.equal(await replacement.request(42), 42)
+  await replacement.terminate()
+  await replacement.closed
+})
+
+test('host protocol shape checks ignore polluted Object.prototype.value', async (t) => {
+  configureWorkerAdmission({ maxConcurrentWorkers: 1 })
+  t.after(() => configureWorkerAdmission({ maxConcurrentWorkers: 4 }))
+  const original = Object.getOwnPropertyDescriptor(Object.prototype, 'value')
+  const restore = () => {
+    if (original) Object.defineProperty(Object.prototype, 'value', original)
+    else delete Object.prototype.value
+  }
+  t.after(restore)
+
+  for (const pollution of ['data', 'accessor']) {
+    let prototypeReads = 0
+    const session = createUntrustedWorker(`
+      onMessage(value => {
+        if (value === 'fail') throw new Error('expected failure')
+        return value
+      })
+    `, {
+      startupTimeoutMs: 5_000,
+      messageTimeoutMs: 1_000,
+      lifetimeTimeoutMs: 5_000
+    })
+    session.on('error', () => {})
+    t.after(() => session.terminate().catch(() => {}))
+    await session.ready
+    if (pollution === 'data') {
+      Object.defineProperty(Object.prototype, 'value', {
+        configurable: true,
+        value: new SharedArrayBuffer(8),
+        writable: true
+      })
+    } else {
+      Object.defineProperty(Object.prototype, 'value', {
+        configurable: true,
+        get () {
+          prototypeReads++
+          throw new Error('poisoned protocol value')
+        }
+      })
+    }
+    try {
+      await assert.rejects(session.request('fail'), /expected failure/)
+    } finally {
+      restore()
+    }
+    assert.equal(prototypeReads, 0)
+    assert.equal(await session.request(42), 42)
+    await session.terminate()
+    await session.closed
+  }
+
+  const replacement = createUntrustedWorker('onMessage(value => value)', {
+    startupTimeoutMs: 5_000,
+    messageTimeoutMs: 5_000,
+    lifetimeTimeoutMs: 5_000
+  })
+  await replacement.ready
+  assert.equal(await replacement.request(43), 43)
+  await replacement.terminate()
+  await replacement.closed
+})
+
+test('guest handlers treat non-Promise then properties as synchronous data', async (t) => {
+  const session = createUntrustedWorker(`
+    let getterReads = 0
+    let callableCalls = 0
+    const callable = () => { callableCalls++; return new Promise(() => {}) }
+    onMessage(kind => {
+      if (kind === 'counts') return { getterReads, callableCalls }
+      if (kind === 'data') return { then: 'ordinary-data', value: 42 }
+      if (kind === 'accessor') {
+        return Object.defineProperty({ value: 43 }, 'then', {
+          enumerable: true,
+          get () { getterReads++; return callable }
+        })
+      }
+      if (kind === 'inherited') return Object.assign(Object.create({ then: callable }), { value: 44 })
+      return { then () { callableCalls++; return new Promise(() => {}) } }
+    })
+  `, {
+    startupTimeoutMs: 5_000,
+    messageTimeoutMs: 1_000,
+    lifetimeTimeoutMs: 5_000
+  })
+  t.after(() => session.terminate().catch(() => {}))
+  await session.ready
+  assert.deepEqual(await session.request('data'), { then: 'ordinary-data', value: 42 })
+  for (const kind of ['accessor', 'inherited', 'callable']) {
+    await assert.rejects(session.request(kind), /Unsupported protocol value/)
+  }
+  assert.deepEqual(await session.request('counts'), { getterReads: 0, callableCalls: 0 })
+  await session.terminate()
+  await session.closed
+})
+
+test('module setup treats non-Promise then properties as ignored synchronous data', async () => {
+  for (const kind of ['accessor', 'inherited', 'callable']) {
+    const session = createUntrustedWorker(`
+      export default ({ onMessage }) => {
+        let getterReads = 0
+        let callableCalls = 0
+        const callable = () => { callableCalls++; return new Promise(() => {}) }
+        let result
+        if (${JSON.stringify(kind)} === 'accessor') {
+          result = Object.defineProperty({}, 'then', {
+            enumerable: true,
+            get () { getterReads++; return callable }
+          })
+        } else if (${JSON.stringify(kind)} === 'inherited') {
+          result = Object.create({ then: callable })
+        } else {
+          result = { then () { callableCalls++; return new Promise(() => {}) } }
+        }
+        onMessage(() => ({ getterReads, callableCalls }))
+        return result
+      }
+    `, {
+      type: 'module',
+      startupTimeoutMs: 5_000,
+      messageTimeoutMs: 1_000,
+      lifetimeTimeoutMs: 5_000
+    })
+    await session.ready
+    assert.deepEqual(await session.request(null), { getterReads: 0, callableCalls: 0 })
+    await session.terminate()
+    await session.closed
+  }
+})
+
+test('frozen canonical guest promises remain supported', async (t) => {
+  const session = createUntrustedWorker(`
+    export default ({ onMessage }) => {
+      onMessage(() => Object.freeze(Promise.resolve(53)))
+      return Object.freeze(Promise.resolve())
+    }
+  `, {
+    type: 'module',
+    startupTimeoutMs: 5_000,
+    messageTimeoutMs: 5_000,
+    lifetimeTimeoutMs: 5_000
+  })
+  t.after(() => session.terminate().catch(() => {}))
+  await session.ready
+  assert.equal(await session.request(null), 53)
+  await session.terminate()
+})
+
+test('guest handler Promise subclasses fail closed', async (t) => {
+  const session = createUntrustedWorker(`
+    class ResultPromise extends Promise {}
+    onMessage(() => new ResultPromise(resolve => resolve(54)))
+  `, {
+    startupTimeoutMs: 5_000,
+    messageTimeoutMs: 5_000,
+    lifetimeTimeoutMs: 5_000
+  })
+  t.after(() => session.terminate().catch(() => {}))
+  await session.ready
+  await assert.rejects(session.request(null), /Promise cannot be observed safely/)
+  await session.terminate()
+})
 
 test('frozen guest Promise subclasses fail closed without invoking species', async (t) => {
   configureWorkerAdmission({ maxConcurrentWorkers: 1 })
@@ -469,6 +734,47 @@ test('frozen guest Promise subclasses fail closed without invoking species', asy
   })
   await replacement.ready
   assert.equal(await replacement.request(45), 45)
+  await replacement.terminate()
+  await replacement.closed
+})
+
+test('guest promises with proxy prototypes fail closed without invoking traps', async (t) => {
+  configureWorkerAdmission({ maxConcurrentWorkers: 1 })
+  t.after(() => configureWorkerAdmission({ maxConcurrentWorkers: 4 }))
+  const session = createUntrustedWorker(`
+    export default ({ send }) => {
+      const proxyPrototype = new Proxy(Object.create(Promise.prototype), {
+        getOwnPropertyDescriptor () { send('descriptor-trap'); throw new Error('descriptor trap') },
+        getPrototypeOf () { send('prototype-trap'); throw new Error('prototype trap') },
+        get () { send('value-trap'); throw new Error('value trap') }
+      })
+      const result = Promise.resolve()
+      Object.setPrototypeOf(result, proxyPrototype)
+      Object.preventExtensions(result)
+      return result
+    }
+  `, {
+    type: 'module',
+    startupTimeoutMs: 5_000,
+    messageTimeoutMs: 1_000,
+    lifetimeTimeoutMs: 5_000
+  })
+  session.on('error', () => {})
+  const messages = []
+  session.on('message', value => messages.push(value))
+  t.after(() => session.terminate().catch(() => {}))
+
+  await assert.rejects(session.ready, /Promise cannot be observed safely/)
+  await session.closed
+  assert.deepEqual(messages, [])
+
+  const replacement = createUntrustedWorker('onMessage(value => value)', {
+    startupTimeoutMs: 5_000,
+    messageTimeoutMs: 5_000,
+    lifetimeTimeoutMs: 5_000
+  })
+  await replacement.ready
+  assert.equal(await replacement.request(52), 52)
   await replacement.terminate()
   await replacement.closed
 })
@@ -537,6 +843,145 @@ test('frozen guest promises reject constructor accessors without invoking them',
   assert.equal(await replacement.request(51), 51)
   await replacement.terminate()
   await replacement.closed
+})
+
+test('protocol operations use snapshotted crypto and V8 builtin exports', async (t) => {
+  const targets = [
+    [require('node:crypto'), ['createHmac', 'randomUUID', 'timingSafeEqual']],
+    [require('node:v8'), ['serialize', 'deserialize']]
+  ]
+  const originals = []
+  let poisoned = false
+  const restore = () => {
+    if (!poisoned) return
+    poisoned = false
+    for (const [target, name, descriptor] of originals) {
+      Object.defineProperty(target, name, descriptor)
+    }
+    syncBuiltinESMExports()
+  }
+  t.after(restore)
+  const options = new Proxy({
+    startupTimeoutMs: 5_000,
+    messageTimeoutMs: 5_000,
+    lifetimeTimeoutMs: 5_000
+  }, {
+    ownKeys (target) {
+      if (!poisoned) {
+        poisoned = true
+        for (const [builtin, names] of targets) {
+          for (const name of names) {
+            const descriptor = Object.getOwnPropertyDescriptor(builtin, name)
+            originals.push([builtin, name, descriptor])
+            Object.defineProperty(builtin, name, {
+              ...descriptor,
+              value () { throw new Error(`poisoned builtin ${name}`) }
+            })
+          }
+        }
+        syncBuiltinESMExports()
+      }
+      return Reflect.ownKeys(target)
+    }
+  })
+  const session = createUntrustedWorker('onMessage(value => value)', options)
+  t.after(() => session.terminate().catch(() => {}))
+  await session.ready
+  assert.deepEqual(await session.request({ value: 42 }), { value: 42 })
+  restore()
+  await session.terminate()
+  await session.closed
+})
+
+test('protocol serialization uses the captured typed-array byteLength getter', async (t) => {
+  const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype)
+  const descriptor = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteLength')
+  const intrinsicByteLength = descriptor.get
+  const session = createUntrustedWorker('onMessage(value => value)', {
+    startupTimeoutMs: 5_000,
+    messageTimeoutMs: 5_000,
+    lifetimeTimeoutMs: 5_000
+  })
+  t.after(() => session.terminate().catch(() => {}))
+  await session.ready
+  let serializationReads = 0
+  Object.defineProperty(typedArrayPrototype, 'byteLength', {
+    ...descriptor,
+    get () {
+      if (new Error().stack.includes('serializeProtocolBody')) serializationReads++
+      return Reflect.apply(intrinsicByteLength, this, [])
+    }
+  })
+  t.after(() => Object.defineProperty(typedArrayPrototype, 'byteLength', descriptor))
+  assert.deepEqual(await session.request({ value: 43 }), { value: 43 })
+  assert.equal(serializationReads, 0)
+  Object.defineProperty(typedArrayPrototype, 'byteLength', descriptor)
+  await session.terminate()
+  await session.closed
+})
+
+test('handshake branding ignores poisoned MessagePort identity without uncaught exceptions', async (t) => {
+  configureWorkerAdmission({ maxConcurrentWorkers: 1 })
+  t.after(() => configureWorkerAdmission({ maxConcurrentWorkers: 4 }))
+  const workerThreads = require('node:worker_threads')
+  const exportDescriptor = Object.getOwnPropertyDescriptor(workerThreads, 'MessagePort')
+  const hasInstanceDescriptor = Object.getOwnPropertyDescriptor(MessagePort, Symbol.hasInstance)
+  const uncaught = []
+  const onUncaught = error => uncaught.push(error)
+  process.on('uncaughtException', onUncaught)
+  let poisoned = false
+  const restore = () => {
+    if (!poisoned) return
+    poisoned = false
+    Object.defineProperty(workerThreads, 'MessagePort', exportDescriptor)
+    if (hasInstanceDescriptor) Object.defineProperty(MessagePort, Symbol.hasInstance, hasInstanceDescriptor)
+    else delete MessagePort[Symbol.hasInstance]
+    syncBuiltinESMExports()
+  }
+  t.after(() => {
+    restore()
+    process.off('uncaughtException', onUncaught)
+  })
+
+  const options = new Proxy({
+    startupTimeoutMs: 5_000,
+    messageTimeoutMs: 5_000,
+    lifetimeTimeoutMs: 5_000
+  }, {
+    ownKeys (target) {
+      if (!poisoned) {
+        poisoned = true
+        Object.defineProperty(MessagePort, Symbol.hasInstance, {
+          configurable: true,
+          value () { throw new Error('poisoned MessagePort.hasInstance') }
+        })
+        Object.defineProperty(workerThreads, 'MessagePort', {
+          ...exportDescriptor,
+          value: class PoisonedMessagePort {}
+        })
+        syncBuiltinESMExports()
+      }
+      return Reflect.ownKeys(target)
+    }
+  })
+  const session = createUntrustedWorker('onMessage(value => value)', options)
+  t.after(() => session.terminate().catch(() => {}))
+  await session.ready
+  assert.equal(await session.request(42), 42)
+  restore()
+  await session.terminate()
+  await session.closed
+  await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual(uncaught, [])
+
+  const replacement = createUntrustedWorker('onMessage(value => value)', {
+    startupTimeoutMs: 5_000,
+    messageTimeoutMs: 5_000,
+    lifetimeTimeoutMs: 5_000
+  })
+  await replacement.ready
+  assert.equal(await replacement.request(43), 43)
+  await replacement.terminate()
 })
 
 test('persistent runtime errors use stable guest filenames without bootstrap frames', async () => {
