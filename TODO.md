@@ -130,10 +130,11 @@ features.
   - Include bridge memory in admission calculations.
 
 - [x] **Reassess runtime compatibility**
-  - Keep Node.js 26.3 as the floor while `process.permission.drop()` is a core
-    invariant.
-  - Do not weaken permission-drop ordering merely to support older Node.js or
-    Bun versions.
+  - Keep Node.js 26.5.1 as the floor because it combines
+    `process.permission.drop()` with the required runtime and Permission Model
+    security fixes.
+  - Do not weaken permission-drop ordering or the patched-runtime floor merely
+    to support older Node.js releases or Bun.
   - Revisit only when another runtime offers equivalent enforceable primitives.
   - The deferred capability decisions are recorded in
     [`docs/deferred-capabilities.md`](docs/deferred-capabilities.md).

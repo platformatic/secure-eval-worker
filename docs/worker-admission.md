@@ -29,20 +29,30 @@ this package.
 Every execution API acquires a slot before inspecting caller-controlled options,
 cloning input, or validating nested policy objects. Local-file execution also
 acquires a preparation slot before touching the source tree and transfers the
-worker lease after staging. Preparation failures release the worker lease after
-staging has stopped and temporary files have been removed. Once a worker starts,
+worker lease after staging. Preparation failures that settle normally release
+both leases after staging has stopped and temporary files have been removed.
+Once a worker starts,
 the slot remains occupied until its `exit` event; calling `terminate()` or
 reaching the bounded public termination-settlement deadline does not release it
 early. This prevents preparation and termination races from exceeding the
-configured cap. A public staging timeout or cancellation rejects
-promptly. Its worker slot is released, while a separate bounded preparation
-slot remains occupied until any in-flight filesystem call settles and cleanup
-finishes. Cleanup gets only a bounded public wait before the session or one-shot
+configured cap. A public staging timeout or cancellation rejects promptly and
+releases its worker slot, while the separate bounded preparation slot remains
+occupied until any in-flight filesystem call settles and cleanup finishes.
+Cleanup gets only a bounded public wait before the session or one-shot
 promise settles; unresolved removal continues in a separately admitted janitor,
 and completed failures are retried with exponential backoff. A stalled removal
 remains in flight. This prevents abandoned preparation from starving
 ordinary workers or allowing unbounded additional scans; avoid source and
 temporary roots on filesystems that can stall indefinitely.
+
+Version-1 process-global admission controllers are accepted only when frozen
+and composed of immutable callable methods. Release tokens are captured and
+invoked at most once. JavaScript cannot prove that a structurally valid release
+callback will return; a behaviorally malicious or incompatible package copy can
+therefore stall the host while that callback runs. Descriptor slots are cleared
+independently with captured Atomics before legacy bookkeeping is attempted, but
+worker and preparation controller implementations remain part of the trusted
+same-process package boundary.
 
 A local worker may hold at most 64 descriptors opened through its constrained
 filesystem facade, and a separate shared counter caps them at 256 process-wide

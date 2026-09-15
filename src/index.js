@@ -118,9 +118,31 @@ const PERSISTENT_FILE_OPTION_NAMES = new Set([
   ...FILE_POLICY_OPTION_NAMES
 ])
 const DIAGNOSTIC_OPTION_NAMES = new Set(['maxRecords', 'maxBytes', 'maxRecordBytes'])
+const SAFE_PROMISE_CONSTRUCTOR_DESCRIPTOR = safeObjectFreeze({
+  configurable: false,
+  enumerable: false,
+  value: undefined,
+  writable: false
+})
+
+function hardenSafePromise (promise) {
+  safeReflectApply(safeObjectDefineProperty, Object, [
+    promise,
+    'constructor',
+    SAFE_PROMISE_CONSTRUCTOR_DESCRIPTOR
+  ])
+  return promise
+}
 
 function thenSafePromise (promise, onFulfilled, onRejected) {
-  return safeReflectApply(safePromiseThen, promise, [onFulfilled, onRejected])
+  hardenSafePromise(promise)
+  return hardenSafePromise(
+    safeReflectApply(safePromiseThen, promise, [onFulfilled, onRejected])
+  )
+}
+
+function createSafePromise (executor) {
+  return hardenSafePromise(new SafePromise(executor))
 }
 
 function catchSafePromise (promise, onRejected) {
@@ -128,7 +150,7 @@ function catchSafePromise (promise, onRejected) {
 }
 
 function finallySafePromise (promise, onFinally) {
-  return new SafePromise((resolve, reject) => {
+  return hardenSafePromise(new SafePromise((resolve, reject) => {
     const settle = (fulfilled, value) => {
       let finalization
       try {
@@ -148,18 +170,18 @@ function finallySafePromise (promise, onFinally) {
       (value) => settle(true, value),
       (error) => settle(false, error)
     )
-  })
+  }))
 }
 
 function raceSafePromises (first, second) {
-  return new SafePromise((resolve, reject) => {
+  return createSafePromise((resolve, reject) => {
     thenSafePromise(first, resolve, reject)
     thenSafePromise(second, resolve, reject)
   })
 }
 
 function rejectSafePromise (error) {
-  return safeReflectApply(safePromiseReject, SafePromise, [error])
+  return hardenSafePromise(safeReflectApply(safePromiseReject, SafePromise, [error]))
 }
 
 /**
@@ -240,7 +262,11 @@ function runUntrustedCodeAdmitted (source, options, releaseWorkerSlot) {
  * Execute a local ESM entry module and its imports in a fresh worker. The
  * module must default-export a function receiving the one-shot input.
  */
-export async function runUntrustedFile (modulePath, options = {}) {
+export function runUntrustedFile (modulePath, options = {}) {
+  return hardenSafePromise(runUntrustedFileAdmitted(modulePath, options))
+}
+
+async function runUntrustedFileAdmitted (modulePath, options) {
   const startedAt = safeReflectApply(safeDateNow, Date, [])
   let releaseWorkerSlot
   try {
@@ -282,7 +308,7 @@ export async function runUntrustedFile (modulePath, options = {}) {
     throw error
   }
 
-  const localModule = await prepareLocalModule(
+  const localModule = await hardenSafePromise(prepareLocalModule(
     modulePath,
     options,
     timeoutMs - (safeReflectApply(safeDateNow, Date, []) - startedAt),
@@ -291,7 +317,7 @@ export async function runUntrustedFile (modulePath, options = {}) {
     }),
     releaseWorkerSlot,
     releasePreparationSlot
-  )
+  ))
 
   const remainingTimeoutMs = timeoutMs - (safeReflectApply(safeDateNow, Date, []) - startedAt)
   if (remainingTimeoutMs <= 0) {
@@ -299,7 +325,7 @@ export async function runUntrustedFile (modulePath, options = {}) {
     const timeoutError = new UntrustedCodeError(`Execution exceeded ${timeoutMs} ms`, {
       code: 'ERR_UNTRUSTED_CODE_TIMEOUT'
     })
-    await cleanupLocalModule(localModule, releasePreparationSlot, timeoutError)
+    await hardenSafePromise(cleanupLocalModule(localModule, releasePreparationSlot, timeoutError))
     throw timeoutError
   }
   delete options.rootDirectory
@@ -311,7 +337,7 @@ export async function runUntrustedFile (modulePath, options = {}) {
   let transferred = false
   let primaryError
   try {
-    return await runOneShot(options, remainingTimeoutMs, timeoutMs, (sessionOptions) => {
+    return await hardenSafePromise(runOneShot(options, remainingTimeoutMs, timeoutMs, (sessionOptions) => {
       const session = createUntrustedFileSession(
         localModule,
         sessionOptions,
@@ -321,14 +347,14 @@ export async function runUntrustedFile (modulePath, options = {}) {
       )
       transferred = true
       return session
-    }, releaseWorkerSlot)
+    }, releaseWorkerSlot))
   } catch (error) {
     primaryError = error
     throw error
   } finally {
     if (!transferred) {
       releaseWorkerSlot()
-      await cleanupLocalModule(localModule, releasePreparationSlot, primaryError)
+      await hardenSafePromise(cleanupLocalModule(localModule, releasePreparationSlot, primaryError))
     }
   }
 }
@@ -339,7 +365,11 @@ export async function runUntrustedFile (modulePath, options = {}) {
  * facade. File preparation is asynchronous, so this factory returns a promise
  * for the session.
  */
-export async function createUntrustedWorkerFromFile (modulePath, options = {}) {
+export function createUntrustedWorkerFromFile (modulePath, options = {}) {
+  return hardenSafePromise(createUntrustedWorkerFromFileAdmitted(modulePath, options))
+}
+
+async function createUntrustedWorkerFromFileAdmitted (modulePath, options) {
   const startedAt = safeReflectApply(safeDateNow, Date, [])
   const releaseWorkerSlot = acquireWorkerSlot()
   let startupTimeoutMs
@@ -373,7 +403,7 @@ export async function createUntrustedWorkerFromFile (modulePath, options = {}) {
     releasePreparationSlot()
     throw error
   }
-  const localModule = await prepareLocalModule(
+  const localModule = await hardenSafePromise(prepareLocalModule(
     modulePath,
     options,
     startupTimeoutMs - (safeReflectApply(safeDateNow, Date, []) - startedAt),
@@ -382,7 +412,7 @@ export async function createUntrustedWorkerFromFile (modulePath, options = {}) {
     }),
     releaseWorkerSlot,
     releasePreparationSlot
-  )
+  ))
 
   const remainingStartupMs = startupTimeoutMs - (safeReflectApply(safeDateNow, Date, []) - startedAt)
   if (remainingStartupMs <= 0) {
@@ -390,7 +420,7 @@ export async function createUntrustedWorkerFromFile (modulePath, options = {}) {
     const timeoutError = new UntrustedCodeError(`Startup exceeded ${startupTimeoutMs} ms`, {
       code: 'ERR_UNTRUSTED_WORKER_STARTUP_TIMEOUT'
     })
-    await cleanupLocalModule(localModule, releasePreparationSlot, timeoutError)
+    await hardenSafePromise(cleanupLocalModule(localModule, releasePreparationSlot, timeoutError))
     throw timeoutError
   }
   delete options.rootDirectory
@@ -408,7 +438,7 @@ export async function createUntrustedWorkerFromFile (modulePath, options = {}) {
     )
   } catch (error) {
     releaseWorkerSlot()
-    await cleanupLocalModule(localModule, releasePreparationSlot, error)
+    await hardenSafePromise(cleanupLocalModule(localModule, releasePreparationSlot, error))
     throw error
   }
 }
@@ -431,7 +461,7 @@ async function prepareLocalModule (
   const controllerSignal = safeReflectApply(abortControllerSignal, controller, [])
   const callerSignal = options.signal
   let rejectInterruption
-  const interruption = new SafePromise((resolve, reject) => {
+  const interruption = createSafePromise((resolve, reject) => {
     rejectInterruption = reject
   })
   const interrupt = (error) => {
@@ -468,7 +498,7 @@ async function prepareLocalModule (
     },
     controllerSignal
   )
-  const preparation = new SafePromise((resolve, reject) => {
+  const preparation = createSafePromise((resolve, reject) => {
     thenSafePromise(
       preparationRequest,
       (localModule) => {
@@ -497,7 +527,7 @@ async function prepareLocalModule (
   void catchSafePromise(preparation, () => {})
 
   try {
-    return await raceSafePromises(preparation, interruption)
+    return await hardenSafePromise(raceSafePromises(preparation, interruption))
   } catch (error) {
     releaseWorkerSlot()
     if (safeReflectApply(abortSignalAborted, controllerSignal, [])) {
@@ -560,7 +590,7 @@ function releaseAfterPreparationError (error, releasePreparationSlot) {
 }
 
 async function cleanupLocalModule (localModule, releasePreparationSlot, primaryError) {
-  const outcome = await attemptLocalModuleCleanup(localModule)
+  const outcome = await hardenSafePromise(attemptLocalModuleCleanup(localModule))
   if (outcome.status === 'removed') {
     releasePreparationSlot()
     return
@@ -648,9 +678,9 @@ function runOneShot (
   })
   return finallySafePromise(translatedReady, async () => {
     try {
-      await session.terminate()
+      await hardenSafePromise(session.terminate())
     } catch {}
-    const closed = await session.closed
+    const closed = await hardenSafePromise(session.closed)
     if (closed.error?.code === 'ERR_UNTRUSTED_WORKER_CLEANUP' ||
         closed.error?.code === 'ERR_UNTRUSTED_WORKER_TERMINATION_TIMEOUT' ||
         closed.error?.code === 'ERR_UNTRUSTED_WORKER_TERMINATION') {
@@ -680,8 +710,13 @@ function snapshotFilePolicies (options) {
   }
   safeObjectAssign(options, snapshotRunnerDefaults(policyInput))
 
-  const input = cloneWithoutSharedMemory(options.input, 'input')
-  assertSupportedProtocolValue(input, 'input')
+  const input = cloneWithoutSharedMemory(
+    options.input,
+    'input',
+    options.maxInputBytes,
+    'maxInputBytes'
+  )
+  assertSupportedProtocolValue(input, 'input', options.maxInputBytes, 'maxInputBytes')
   options.input = input
 
   const fileLimits = [
@@ -702,7 +737,10 @@ function snapshotFilePolicies (options) {
 }
 
 function validateSignal (signal) {
-  if (signal !== undefined && !(signal instanceof AbortSignal)) {
+  if (signal === undefined) return signal
+  try {
+    safeReflectApply(abortSignalAborted, signal, [])
+  } catch {
     throw new TypeError('signal must be an AbortSignal')
   }
   return signal

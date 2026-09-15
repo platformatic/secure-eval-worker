@@ -146,10 +146,40 @@ const descriptorQuotaData = new WeakMap()
 let state
 let preparationState
 let descriptorState
+let stateAcquire
+let stateConfigure
+let stateStatus
+let preparationStateAcquire
+let preparationStateConfigure
 let descriptorStateCreateWorkerQuota
 let descriptorStateGetWorkerData
 let descriptorStateRelease
 let legacyDescriptorState = false
+
+function immutableStateMethod (candidate, name) {
+  const descriptor = reflectApply(
+    objectGetOwnPropertyDescriptor,
+    Object,
+    [candidate, name]
+  )
+  if (!descriptor || !('value' in descriptor) ||
+      typeof descriptor.value !== 'function' || descriptor.writable !== false ||
+      descriptor.configurable !== false) return undefined
+  return descriptor.value
+}
+
+function captureControllerState (candidate, names) {
+  if (candidate === null || typeof candidate !== 'object' ||
+      !reflectApply(objectIsFrozen, Object, [candidate])) return undefined
+  const captured = {}
+  for (let index = 0; index < names.length; index++) {
+    const method = immutableStateMethod(candidate, names[index])
+    if (!method) return undefined
+    captured[names[index]] = method
+  }
+  return objectFreeze(captured)
+}
+
 if (isMainThread) {
   state = globalThis[STATE_KEY]
   if (state === undefined) {
@@ -171,6 +201,21 @@ if (isMainThread) {
       enumerable: false,
       writable: false
     })
+  }
+
+  const capturedWorkerState = captureControllerState(state, ['acquire', 'configure', 'status'])
+  if (capturedWorkerState) {
+    stateAcquire = capturedWorkerState.acquire
+    stateConfigure = capturedWorkerState.configure
+    stateStatus = capturedWorkerState.status
+  }
+  const capturedPreparationState = captureControllerState(
+    preparationState,
+    ['acquire', 'configure']
+  )
+  if (capturedPreparationState) {
+    preparationStateAcquire = capturedPreparationState.acquire
+    preparationStateConfigure = capturedPreparationState.configure
   }
 
   descriptorState = globalThis[DESCRIPTOR_STATE_KEY]
@@ -224,8 +269,17 @@ if (isMainThread) {
   }
 }
 
+function admissionUnavailableError () {
+  return new UntrustedCodeError(
+    'Process-wide worker admission state is unavailable or incompatible',
+    { code: 'ERR_UNTRUSTED_WORKER_ADMISSION_UNAVAILABLE' }
+  )
+}
+
 function requireState () {
-  if (!state || !preparationState || !descriptorState) {
+  if (!state || !preparationState || !descriptorState || !stateAcquire ||
+      !stateConfigure || !stateStatus || !preparationStateAcquire ||
+      !preparationStateConfigure) {
     throw new UntrustedCodeError(
       'Sandbox workers must be created from the main thread so process-wide admission cannot be orphaned',
       { code: 'ERR_UNTRUSTED_WORKER_ADMISSION_UNAVAILABLE' }
@@ -234,13 +288,27 @@ function requireState () {
   return state
 }
 
+function acquireControllerSlot (receiver, acquire) {
+  const release = reflectApply(acquire, receiver, [])
+  if (typeof release !== 'function') throw admissionUnavailableError()
+  let released = false
+  return () => {
+    if (released) return
+    released = true
+    try {
+      reflectApply(release, undefined, [])
+    } catch {}
+  }
+}
+
 export function acquireWorkerSlot () {
-  return requireState().acquire()
+  requireState()
+  return acquireControllerSlot(state, stateAcquire)
 }
 
 export function acquireFilePreparationSlot () {
   requireState()
-  return preparationState.acquire()
+  return acquireControllerSlot(preparationState, preparationStateAcquire)
 }
 
 function descriptorAdmissionError () {
@@ -268,14 +336,13 @@ function immutableQuotaDataDescriptor (quota, name) {
   return descriptor.value
 }
 
-function adaptLegacyDescriptorQuota (quota) {
-  if (quota === null || typeof quota !== 'object' ||
-      !reflectApply(objectIsFrozen, Object, [quota])) {
+function validateDescriptorWorkerData (workerData) {
+  if (workerData === null || typeof workerData !== 'object' ||
+      !reflectApply(objectIsFrozen, Object, [workerData])) {
     throw descriptorAdmissionError()
   }
-  const owner = immutableQuotaDataDescriptor(quota, 'owner')
-  const slotsBuffer = immutableQuotaDataDescriptor(quota, 'slotsBuffer')
-  const capturedRelease = immutableQuotaDataDescriptor(quota, 'release')
+  const owner = immutableQuotaDataDescriptor(workerData, 'owner')
+  const slotsBuffer = immutableQuotaDataDescriptor(workerData, 'slotsBuffer')
   let slotsByteLength
   try {
     slotsByteLength = reflectApply(sharedArrayBufferByteLength, slotsBuffer, [])
@@ -284,24 +351,53 @@ function adaptLegacyDescriptorQuota (quota) {
   }
   if (!reflectApply(numberIsSafeInteger, Number, [owner]) ||
       owner <= 0 || owner > 0x7fffffff ||
-      slotsByteLength !== DESCRIPTOR_SLOTS_BYTE_LENGTH ||
-      typeof capturedRelease !== 'function') {
+      slotsByteLength !== DESCRIPTOR_SLOTS_BYTE_LENGTH) {
     throw descriptorAdmissionError()
   }
+  return objectFreeze({ owner, slotsBuffer })
+}
+
+function brandDescriptorQuota (quota, workerData, releaseHook) {
+  const validated = validateDescriptorWorkerData(workerData)
+  const slots = new Int32Array(validated.slotsBuffer)
   let released = false
   const release = () => {
     if (released) return
     released = true
-    reflectApply(capturedRelease, quota, [])
+    for (let index = 0; index < MAX_PROCESS_FILE_DESCRIPTORS; index++) {
+      reflectApply(atomicsCompareExchange, safeAtomics, [
+        slots,
+        index,
+        validated.owner,
+        0
+      ])
+    }
+    try {
+      reflectApply(releaseHook, undefined, [])
+    } catch {}
   }
   reflectApply(weakMapSet, descriptorQuotaData, [
     quota,
-    objectFreeze({
-      release,
-      workerData: objectFreeze({ owner, slotsBuffer })
-    })
+    objectFreeze({ release, workerData: validated })
   ])
   return quota
+}
+
+function adaptLegacyDescriptorQuota (quota) {
+  if (quota === null || typeof quota !== 'object' ||
+      !reflectApply(objectIsFrozen, Object, [quota])) {
+    throw descriptorAdmissionError()
+  }
+  const owner = immutableQuotaDataDescriptor(quota, 'owner')
+  const slotsBuffer = immutableQuotaDataDescriptor(quota, 'slotsBuffer')
+  const capturedRelease = immutableQuotaDataDescriptor(quota, 'release')
+  if (typeof capturedRelease !== 'function') throw descriptorAdmissionError()
+  const workerData = objectFreeze({ owner, slotsBuffer })
+  return brandDescriptorQuota(
+    quota,
+    workerData,
+    () => reflectApply(capturedRelease, quota, [])
+  )
 }
 
 export function createFileDescriptorQuota () {
@@ -313,7 +409,38 @@ export function createFileDescriptorQuota () {
     if (legacyDescriptorState) throw descriptorAdmissionError()
     throw error
   }
-  return legacyDescriptorState ? adaptLegacyDescriptorQuota(quota) : quota
+  if (legacyDescriptorState) {
+    try {
+      return adaptLegacyDescriptorQuota(quota)
+    } catch (error) {
+      try {
+        const release = immutableQuotaDataDescriptor(quota, 'release')
+        if (typeof release === 'function') reflectApply(release, quota, [])
+      } catch {}
+      throw error
+    }
+  }
+  let workerData
+  try {
+    workerData = reflectApply(descriptorStateGetWorkerData, descriptorState, [quota])
+  } catch (error) {
+    try {
+      reflectApply(descriptorStateRelease, descriptorState, [quota])
+    } catch {}
+    throw error
+  }
+  try {
+    return brandDescriptorQuota(
+      quota,
+      workerData,
+      () => reflectApply(descriptorStateRelease, descriptorState, [quota])
+    )
+  } catch (error) {
+    try {
+      reflectApply(descriptorStateRelease, descriptorState, [quota])
+    } catch {}
+    throw error
+  }
 }
 
 export function getFileDescriptorQuotaWorkerData (quota) {
@@ -361,12 +488,39 @@ export function configureWorkerAdmission (options) {
   if (!reflectApply(numberIsSafeInteger, Number, [descriptor.value]) || descriptor.value <= 0) {
     throw new RangeError('maxConcurrentWorkers must be a positive integer')
   }
-  const admissionState = requireState()
-  const status = admissionState.configure(descriptor.value)
-  preparationState.configure(descriptor.value)
-  return status
+  requireState()
+  const status = reflectApply(stateConfigure, state, [descriptor.value])
+  reflectApply(preparationStateConfigure, preparationState, [descriptor.value])
+  return snapshotAdmissionStatus(status)
+}
+
+function snapshotAdmissionStatus (status) {
+  if (status === null || typeof status !== 'object') throw admissionUnavailableError()
+  const maxDescriptor = reflectApply(
+    objectGetOwnPropertyDescriptor,
+    Object,
+    [status, 'maxConcurrentWorkers']
+  )
+  const activeDescriptor = reflectApply(
+    objectGetOwnPropertyDescriptor,
+    Object,
+    [status, 'activeWorkers']
+  )
+  const maxConcurrentWorkers = maxDescriptor && 'value' in maxDescriptor
+    ? maxDescriptor.value
+    : undefined
+  const activeWorkers = activeDescriptor && 'value' in activeDescriptor
+    ? activeDescriptor.value
+    : undefined
+  if (!reflectApply(numberIsSafeInteger, Number, [maxConcurrentWorkers]) ||
+      maxConcurrentWorkers <= 0 ||
+      !reflectApply(numberIsSafeInteger, Number, [activeWorkers]) || activeWorkers < 0) {
+    throw admissionUnavailableError()
+  }
+  return objectFreeze({ maxConcurrentWorkers, activeWorkers })
 }
 
 export function getWorkerAdmissionStatus () {
-  return requireState().status()
+  requireState()
+  return snapshotAdmissionStatus(reflectApply(stateStatus, state, []))
 }

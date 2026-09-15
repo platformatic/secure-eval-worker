@@ -4,6 +4,7 @@ import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { Readable } from 'node:stream'
 import { deserialize as v8Deserialize, serialize as v8Serialize } from 'node:v8'
+import { isPromise as hostIsPromise } from 'node:util/types'
 import { MessagePort, Worker } from 'node:worker_threads'
 
 import {
@@ -28,12 +29,13 @@ import {
 } from './admission.js'
 import { attemptLocalModuleCleanup } from './local-files.js'
 import {
-  HostFunctionError,
   invokeHostFunction,
   isHostFunctionContextActiveForSession,
+  isPublicHostFunctionError,
   validateHostFunctions
 } from './host-functions.js'
 
+const safeHostIsPromise = hostIsPromise
 const Error = globalThis.Error
 const TypeError = globalThis.TypeError
 const RangeError = globalThis.RangeError
@@ -70,6 +72,7 @@ const hostObjectDefineProperty = Object.defineProperty
 const hostObjectFreeze = Object.freeze
 const hostObjectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor
 const hostObjectGetOwnPropertyDescriptors = Object.getOwnPropertyDescriptors
+const hostObjectGetPrototypeOf = Object.getPrototypeOf
 const hostObjectHasOwn = Object.hasOwn
 const hostPromiseReject = Promise.reject
 const hostPromiseResolve = Promise.resolve
@@ -80,6 +83,7 @@ const hostTypedArrayByteLength = Object.getOwnPropertyDescriptor(
   'byteLength'
 ).get
 const hostReflectApply = Reflect.apply
+const hostReflectDeleteProperty = Reflect.deleteProperty
 const hostReflectOwnKeys = Reflect.ownKeys
 const hostMapClear = Map.prototype.clear
 const hostMapDelete = Map.prototype.delete
@@ -123,6 +127,104 @@ const sessionSecrets = new WeakMap()
 const sessionData = new WeakMap()
 const internalSessionOptions = new WeakMap()
 const diagnosticContextStorage = new AsyncLocalStorage()
+const HOST_TEMPORARY_PROMISE_CONSTRUCTOR_DESCRIPTOR = hostObjectFreeze({
+  configurable: true,
+  enumerable: false,
+  value: SafePromise,
+  writable: false
+})
+const HOST_PROMISE_CONSTRUCTOR_DESCRIPTOR = hostObjectFreeze({
+  configurable: false,
+  enumerable: false,
+  value: undefined,
+  writable: false
+})
+const HOST_AWAIT_PROMISE_CONSTRUCTOR_DESCRIPTOR = hostObjectFreeze({
+  configurable: false,
+  enumerable: false,
+  value: SafePromise,
+  writable: false
+})
+
+function hardenHostPromise (promise) {
+  hostReflectApply(hostObjectDefineProperty, Object, [
+    promise,
+    'constructor',
+    HOST_PROMISE_CONSTRUCTOR_DESCRIPTOR
+  ])
+  return promise
+}
+
+async function awaitHostValue (value) {
+  return await value
+}
+
+function hasSafeHostPromiseConstructor (value) {
+  let current = value
+  try {
+    while (current !== null) {
+      const descriptor = hostReflectApply(hostObjectGetOwnPropertyDescriptor, Object, [
+        current,
+        'constructor'
+      ])
+      if (descriptor !== undefined) {
+        return hostReflectApply(hostObjectHasOwn, Object, [descriptor, 'value']) &&
+          descriptor.value === SafePromise
+      }
+      current = hostReflectApply(hostObjectGetPrototypeOf, Object, [current])
+    }
+  } catch {}
+  return false
+}
+
+function adoptHostValue (value) {
+  if (!safeHostIsPromise(value)) return hardenHostAwaitPromise(awaitHostValue(value))
+  const previous = hostReflectApply(hostObjectGetOwnPropertyDescriptor, Object, [
+    value,
+    'constructor'
+  ])
+  let installed = false
+  try {
+    hostReflectApply(hostObjectDefineProperty, Object, [
+      value,
+      'constructor',
+      HOST_TEMPORARY_PROMISE_CONSTRUCTOR_DESCRIPTOR
+    ])
+    installed = true
+  } catch {
+    if (!hasSafeHostPromiseConstructor(value)) {
+      return hardenHostAwaitPromise(new SafePromise((resolve, reject) => {
+        reject(new TypeError('Promise cannot be observed safely'))
+      }))
+    }
+  }
+  let adopted
+  try {
+    adopted = awaitHostValue(value)
+  } finally {
+    if (installed) {
+      if (previous) {
+        hostReflectApply(hostObjectDefineProperty, Object, [value, 'constructor', previous])
+      } else {
+        hostReflectApply(hostReflectDeleteProperty, Reflect, [value, 'constructor'])
+      }
+    }
+  }
+  return hardenHostAwaitPromise(adopted)
+}
+
+function hardenHostAwaitPromise (promise) {
+  hostReflectApply(hostObjectDefineProperty, Object, [
+    promise,
+    'constructor',
+    HOST_AWAIT_PROMISE_CONSTRUCTOR_DESCRIPTOR
+  ])
+  return promise
+}
+
+function createHostPromise (executor) {
+  return hardenHostPromise(new SafePromise(executor))
+}
 
 function getSessionSecrets (session) {
   return hostReflectApply(hostWeakMapGet, sessionSecrets, [session])
@@ -133,15 +235,18 @@ function getSessionData (session) {
 }
 
 function resolveHostPromise (value) {
-  return hostReflectApply(hostPromiseResolve, SafePromise, [value])
+  return hardenHostPromise(hostReflectApply(hostPromiseResolve, SafePromise, [value]))
 }
 
 function rejectHostPromise (error) {
-  return hostReflectApply(hostPromiseReject, SafePromise, [error])
+  return hardenHostPromise(hostReflectApply(hostPromiseReject, SafePromise, [error]))
 }
 
 function thenHostPromise (promise, onFulfilled, onRejected) {
-  return hostReflectApply(hostPromiseThen, promise, [onFulfilled, onRejected])
+  hardenHostPromise(promise)
+  return hardenHostPromise(
+    hostReflectApply(hostPromiseThen, promise, [onFulfilled, onRejected])
+  )
 }
 
 function catchHostPromise (promise, onRejected) {
@@ -149,7 +254,7 @@ function catchHostPromise (promise, onRejected) {
 }
 
 function chainHostPromise (promise, onFulfilled) {
-  return new SafePromise((resolve, reject) => {
+  return createHostPromise((resolve, reject) => {
     thenHostPromise(promise, (value) => {
       let next
       try {
@@ -256,6 +361,7 @@ const sqliteBuiltin = require('node:sqlite')
 const tlsBuiltin = require('node:tls')
 const ttyBuiltin = require('node:tty')
 const v8Builtin = require('node:v8')
+const utilTypesBuiltin = require('node:util/types')
 const workerThreadsBuiltin = require('node:worker_threads')
 const networkAliasBuiltins = [
   require('_http_agent'),
@@ -291,6 +397,8 @@ const SafeString = String
 const SafeNumber = Number
 const SafeWeakSet = WeakSet
 const numberIsSafeInteger = Number.isSafeInteger
+const isPromise = utilTypesBuiltin.isPromise
+const isProxy = utilTypesBuiltin.isProxy
 const promiseThen = Promise.prototype.then
 const safeSetInterval = globalThis.setInterval
 const safeClearInterval = globalThis.clearInterval
@@ -321,7 +429,13 @@ const typedArrayBuffer = Object.getOwnPropertyDescriptor(
   Object.getPrototypeOf(Uint8Array.prototype),
   'buffer'
 ).get
-const dataViewBuffer = Object.getOwnPropertyDescriptor(DataView.prototype, 'buffer').get
+const dataViewPrototype = DataView.prototype
+const dataViewBuffer = Object.getOwnPropertyDescriptor(dataViewPrototype, 'buffer').get
+const dataViewByteLength = Object.getOwnPropertyDescriptor(dataViewPrototype, 'byteLength').get
+const typedArrayLength = Object.getOwnPropertyDescriptor(
+  Object.getPrototypeOf(Uint8Array.prototype),
+  'length'
+).get
 const typedArrayByteLength = Object.getOwnPropertyDescriptor(
   Object.getPrototypeOf(Uint8Array.prototype),
   'byteLength'
@@ -334,9 +448,29 @@ const objectCreate = Object.create
 const objectDefineProperty = Object.defineProperty
 const objectFreeze = Object.freeze
 const objectGetPrototypeOf = Object.getPrototypeOf
+const objectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor
 const objectGetOwnPropertyDescriptors = Object.getOwnPropertyDescriptors
 const objectHasOwn = Object.hasOwn
 const objectPrototype = Object.prototype
+const reflectDeleteProperty = Reflect.deleteProperty
+const TEMPORARY_PROMISE_CONSTRUCTOR_DESCRIPTOR = objectFreeze({
+  configurable: true,
+  enumerable: false,
+  value: SafePromise,
+  writable: false
+})
+const PROMISE_CONSTRUCTOR_DESCRIPTOR = objectFreeze({
+  configurable: false,
+  enumerable: false,
+  value: undefined,
+  writable: false
+})
+const AWAIT_PROMISE_CONSTRUCTOR_DESCRIPTOR = objectFreeze({
+  configurable: false,
+  enumerable: false,
+  value: SafePromise,
+  writable: false
+})
 const arrayPrototype = Array.prototype
 const arrayBufferPrototype = ArrayBuffer.prototype
 const datePrototype = Date.prototype
@@ -344,7 +478,7 @@ const regexpPrototype = RegExp.prototype
 const mapPrototype = Map.prototype
 const setPrototype = Set.prototype
 const allowedViewPrototypes = new Set([
-  DataView.prototype,
+  dataViewPrototype,
   Int8Array.prototype,
   Uint8Array.prototype,
   Uint8ClampedArray.prototype,
@@ -399,6 +533,93 @@ let outputMessages = 0
 let outputBytes = 0
 const pendingHostCalls = new Map()
 
+function hardenPromise(promise) {
+  reflectApply(objectDefineProperty, Object, [
+    promise,
+    'constructor',
+    PROMISE_CONSTRUCTOR_DESCRIPTOR
+  ])
+  return promise
+}
+
+async function awaitValue(value) {
+  return await value
+}
+
+function hasSafePromiseConstructor(value) {
+  let current = value
+  try {
+    while (current !== null) {
+      const descriptor = reflectApply(objectGetOwnPropertyDescriptor, Object, [
+        current,
+        'constructor'
+      ])
+      if (descriptor !== undefined) {
+        return reflectApply(objectHasOwn, Object, [descriptor, 'value']) &&
+          descriptor.value === SafePromise
+      }
+      current = reflectApply(objectGetPrototypeOf, Object, [current])
+    }
+  } catch {}
+  return false
+}
+
+function adoptValue(value) {
+  if (!reflectApply(isPromise, utilTypesBuiltin, [value])) {
+    return hardenAwaitPromise(awaitValue(value))
+  }
+  const previous = reflectApply(objectGetOwnPropertyDescriptor, Object, [
+    value,
+    'constructor'
+  ])
+  let installed = false
+  try {
+    reflectApply(objectDefineProperty, Object, [
+      value,
+      'constructor',
+      TEMPORARY_PROMISE_CONSTRUCTOR_DESCRIPTOR
+    ])
+    installed = true
+  } catch {
+    if (!hasSafePromiseConstructor(value)) {
+      return hardenAwaitPromise(new SafePromise((resolve, reject) => {
+        reject(new TypeError('Promise cannot be observed safely'))
+      }))
+    }
+  }
+  let adopted
+  try {
+    adopted = awaitValue(value)
+  } finally {
+    if (installed) {
+      if (previous) {
+        reflectApply(objectDefineProperty, Object, [value, 'constructor', previous])
+      } else {
+        reflectApply(reflectDeleteProperty, Reflect, [value, 'constructor'])
+      }
+    }
+  }
+  return hardenAwaitPromise(adopted)
+}
+
+function hardenAwaitPromise(promise) {
+  reflectApply(objectDefineProperty, Object, [
+    promise,
+    'constructor',
+    AWAIT_PROMISE_CONSTRUCTOR_DESCRIPTOR
+  ])
+  return promise
+}
+
+function createPromise(executor) {
+  return hardenPromise(new SafePromise(executor))
+}
+
+function thenPromise(promise, onFulfilled, onRejected) {
+  hardenPromise(promise)
+  return hardenPromise(reflectApply(promiseThen, promise, [onFulfilled, onRejected]))
+}
+
 function isSharedArrayBuffer(value) {
   if (!sharedByteLength || value === null || typeof value !== 'object') return false
   try {
@@ -423,6 +644,73 @@ function getViewBuffer(value) {
   } catch {
     return reflectApply(dataViewBuffer, value, [])
   }
+}
+
+function unsupportedProtocolValue() {
+  throw new TypeError('Unsupported protocol value')
+}
+
+function assertNoOwnProperties(value) {
+  if (reflectOwnKeys(value).length !== 0) unsupportedProtocolValue()
+}
+
+function assertCanonicalRegExpProperties(value) {
+  const descriptors = objectGetOwnPropertyDescriptors(value)
+  const keys = reflectOwnKeys(value)
+  if (keys.length !== 1 || keys[0] !== 'lastIndex') unsupportedProtocolValue()
+  const descriptor = descriptors.lastIndex
+  if (!descriptor || !('value' in descriptor) ||
+      typeof descriptor.value !== 'number' ||
+      !reflectApply(numberIsSafeInteger, SafeNumber, [descriptor.value]) ||
+      descriptor.value < 0 || descriptor.enumerable || descriptor.configurable ||
+      descriptor.writable !== true) {
+    unsupportedProtocolValue()
+  }
+}
+
+function traversalLimitError(maxBytes) {
+  throw new RangeError('Protocol message exceeds maxMessageBytes (' + maxBytes + ')')
+}
+
+function assertArrayBufferWithinBudget(buffer, maxBytes) {
+  if (maxBytes !== undefined &&
+      reflectApply(arrayBufferByteLength, buffer, []) > maxBytes) {
+    traversalLimitError(maxBytes)
+  }
+}
+
+function assertViewWithinBudget(value, maxBytes) {
+  if (maxBytes === undefined) return
+  const byteLength = objectGetPrototypeOf(value) === dataViewPrototype
+    ? reflectApply(dataViewByteLength, value, [])
+    : reflectApply(typedArrayByteLength, value, [])
+  if (byteLength > maxBytes) traversalLimitError(maxBytes)
+  const buffer = getViewBuffer(value)
+  if (!isSharedArrayBuffer(buffer)) assertArrayBufferWithinBudget(buffer, maxBytes)
+}
+
+function assertCanonicalViewProperties(value) {
+  const prototype = objectGetPrototypeOf(value)
+  if (prototype === dataViewPrototype) {
+    assertNoOwnProperties(value)
+    return
+  }
+  const length = reflectApply(typedArrayLength, value, [])
+  const descriptors = objectGetOwnPropertyDescriptors(value)
+  const keys = reflectOwnKeys(value)
+  for (let index = 0; index < keys.length; index++) {
+    const key = keys[index]
+    if (typeof key !== 'string') unsupportedProtocolValue()
+    const numeric = +key
+    const descriptor = descriptors[key]
+    if (!reflectApply(numberIsSafeInteger, SafeNumber, [numeric]) || numeric < 0 ||
+        numeric >= length || SafeString(numeric) !== key || !descriptor ||
+        !('value' in descriptor) || descriptor.writable !== true ||
+        descriptor.enumerable !== true || descriptor.configurable !== true) {
+      unsupportedProtocolValue()
+    }
+  }
+  if (keys.length !== length) unsupportedProtocolValue()
 }
 
 function sandboxDenied(api) {
@@ -815,73 +1103,18 @@ function hardenDangerousBuiltins() {
   moduleBuiltin.syncBuiltinESMExports()
 }
 
-function assertNoSharedMemory(value, label) {
-  if (value === null || typeof value !== 'object') return
-
-  const pending = [value]
-  const seen = new SafeWeakSet()
-  while (pending.length > 0) {
-    const current = reflectApply(arrayPop, pending, [])
-    if (current === null || typeof current !== 'object') continue
-    if (reflectApply(weakSetHas, seen, [current])) continue
-    reflectApply(weakSetAdd, seen, [current])
-
-    if (isSharedArrayBuffer(current)) {
-      throw new TypeError(label + ' must not contain shared memory')
-    }
-
-    const memoryBuffer = getWasmMemoryBuffer(current)
-    if (memoryBuffer !== undefined) {
-      reflectApply(arrayPush, pending, [memoryBuffer])
-      continue
-    }
-    if (reflectApply(arrayBufferIsView, ArrayBuffer, [current])) {
-      reflectApply(arrayPush, pending, [getViewBuffer(current)])
-      continue
-    }
-
-    let iterator
-    try {
-      iterator = reflectApply(mapEntries, current, [])
-    } catch {}
-    if (iterator) {
-      while (true) {
-        const item = reflectApply(mapIteratorNext, iterator, [])
-        if (item.done) break
-        reflectApply(arrayPush, pending, [item.value[0], item.value[1]])
-      }
-      continue
-    }
-
-    try {
-      iterator = reflectApply(setValues, current, [])
-    } catch {
-      iterator = undefined
-    }
-    if (iterator) {
-      while (true) {
-        const item = reflectApply(setIteratorNext, iterator, [])
-        if (item.done) break
-        reflectApply(arrayPush, pending, [item.value])
-      }
-      continue
-    }
-
-    const keys = reflectOwnKeys(current)
-    for (let index = 0; index < keys.length; index++) {
-      reflectApply(arrayPush, pending, [current[keys[index]]])
-    }
-  }
+function assertNoSharedMemory(value, label, maxBytes) {
+  assertSupportedProtocolValue(value, label, maxBytes)
 }
 
 function cloneValue(value, label) {
-  assertSupportedProtocolValue(value, label)
+  assertSupportedProtocolValue(value, label, workerData.maxMessageBytes)
   const cloned = safeStructuredClone(value)
-  assertNoSharedMemory(cloned, label)
+  assertSupportedProtocolValue(cloned, label, workerData.maxMessageBytes)
   return cloned
 }
 
-function assertSupportedProtocolValue(value, label) {
+function assertSupportedProtocolValue(value, label, maxBytes = workerData.maxMessageBytes) {
   const pending = [value]
   const seen = new SafeWeakSet()
   while (pending.length > 0) {
@@ -890,7 +1123,9 @@ function assertSupportedProtocolValue(value, label) {
     const kind = typeof current
     if (kind === 'string' || kind === 'boolean' || kind === 'number' ||
         kind === 'bigint' || kind === 'undefined') continue
-    if (kind !== 'object') throw new TypeError('Unsupported protocol value')
+    if (kind !== 'object' || reflectApply(isProxy, utilTypesBuiltin, [current])) {
+      throw new TypeError('Unsupported protocol value')
+    }
     if (reflectApply(weakSetHas, seen, [current])) continue
     reflectApply(weakSetAdd, seen, [current])
 
@@ -913,6 +1148,8 @@ function assertSupportedProtocolValue(value, label) {
       if (objectGetPrototypeOf(current) !== arrayBufferPrototype) {
         throw new TypeError('Unsupported protocol value')
       }
+      assertArrayBufferWithinBudget(current, maxBytes)
+      assertNoOwnProperties(current)
       continue
     }
     if (reflectApply(arrayBufferIsView, ArrayBuffer, [current])) {
@@ -922,6 +1159,8 @@ function assertSupportedProtocolValue(value, label) {
       if (!reflectApply(setHas, allowedViewPrototypes, [objectGetPrototypeOf(current)])) {
         throw new TypeError('Unsupported protocol value')
       }
+      assertViewWithinBudget(current, maxBytes)
+      assertCanonicalViewProperties(current)
       continue
     }
     try {
@@ -934,6 +1173,7 @@ function assertSupportedProtocolValue(value, label) {
       if (objectGetPrototypeOf(current) !== datePrototype) {
         throw new TypeError('Unsupported protocol value')
       }
+      assertNoOwnProperties(current)
       continue
     }
     try {
@@ -946,6 +1186,7 @@ function assertSupportedProtocolValue(value, label) {
       if (objectGetPrototypeOf(current) !== regexpPrototype) {
         throw new TypeError('Unsupported protocol value')
       }
+      assertCanonicalRegExpProperties(current)
       continue
     }
 
@@ -957,6 +1198,7 @@ function assertSupportedProtocolValue(value, label) {
       if (objectGetPrototypeOf(current) !== mapPrototype) {
         throw new TypeError('Unsupported protocol value')
       }
+      assertNoOwnProperties(current)
       while (true) {
         const item = reflectApply(mapIteratorNext, iterator, [])
         if (item.done) break
@@ -973,6 +1215,7 @@ function assertSupportedProtocolValue(value, label) {
       if (objectGetPrototypeOf(current) !== setPrototype) {
         throw new TypeError('Unsupported protocol value')
       }
+      assertNoOwnProperties(current)
       while (true) {
         const item = reflectApply(setIteratorNext, iterator, [])
         if (item.done) break
@@ -1279,7 +1522,7 @@ function callHostFunction(name, argumentsList) {
   const id = nextHostCallId++
   const args = cloneValue(argumentsList, 'host function arguments')
   safeV8Serialize(args)
-  return new SafePromise((resolve, reject) => {
+  return createPromise((resolve, reject) => {
     reflectApply(mapSet, pendingHostCalls, [id, { resolve, reject }])
     try {
       postToHost({ type: 'host-call', id, name, arguments: args }, true)
@@ -1436,10 +1679,10 @@ async function initialize() {
       return
     }
 
-    const dispatched = reflectApply(promiseThen, processing, [() => dispatch(envelope)])
-    processing = reflectApply(promiseThen, dispatched, [undefined, (error) => {
+    const dispatched = thenPromise(processing, () => dispatch(envelope))
+    processing = thenPromise(dispatched, undefined, (error) => {
       reportFatal(error)
-    }])
+    })
   })
   // A ref'd MessagePort is exposed by process._getActiveHandles(). Keep the
   // worker alive with a lexical timer instead, and hide the protocol endpoint.
@@ -1471,9 +1714,10 @@ async function initialize() {
       }
       throw error
     }
-    setupResult = workerData.oneShot
-      ? await execute(workerData.input)
-      : await execute(workerData.input, send, onMessage, host)
+    const execution = workerData.oneShot
+      ? execute(workerData.input)
+      : execute(workerData.input, send, onMessage, host)
+    setupResult = await adoptValue(execution)
   } else {
     let component
     try {
@@ -1499,14 +1743,15 @@ async function initialize() {
         ? 'The module default export must be a function'
         : 'The module default export must be a setup function')
     }
-    setupResult = workerData.oneShot
-      ? await component.default(workerData.input)
-      : await component.default(objectFreeze({
+    const execution = workerData.oneShot
+      ? component.default(workerData.input)
+      : component.default(objectFreeze({
           input: workerData.input,
           send,
           onMessage,
           host
         }))
+    setupResult = await adoptValue(execution)
   }
 
   const readyValue = workerData.oneShot
@@ -1515,14 +1760,14 @@ async function initialize() {
   postToHost({ type: 'ready', value: readyValue })
 }
 
-reflectApply(promiseThen, initialize(), [undefined, (error) => {
+thenPromise(initialize(), undefined, (error) => {
   if (port) {
     reportFatal(error)
   } else {
     parentPort.postMessage({ type: 'bootstrap-error', error: cloneError(error) })
     parentPort.close()
   }
-}])
+})
 })()
 `
 
@@ -1643,16 +1888,25 @@ function prepareSessionConfiguration (session, source, rawOptions) {
   validatePositiveInteger(data.maxOutputBytes, 'maxOutputBytes')
 
   const signal = options.signal
-  if (signal !== undefined && !(signal instanceof AbortSignal)) {
-    throw new TypeError('signal must be an AbortSignal')
+  if (signal !== undefined) {
+    try {
+      hostReflectApply(hostAbortSignalAborted, signal, [])
+    } catch {
+      throw new TypeError('signal must be an AbortSignal')
+    }
   }
   if (signal && hostReflectApply(hostAbortSignalAborted, signal, [])) {
     throw abortError(hostReflectApply(hostAbortSignalReason, signal, []))
   }
 
   const startedAt = hostReflectApply(hostDateNow, Date, [])
-  const input = cloneWithoutSharedMemory(options.input, 'input')
-  assertSupportedProtocolValue(input, 'input')
+  const input = cloneWithoutSharedMemory(
+    options.input,
+    'input',
+    data.maxInputBytes,
+    'maxInputBytes'
+  )
+  assertSupportedProtocolValue(input, 'input', data.maxInputBytes, 'maxInputBytes')
   const serializedInput = v8Serialize(input)
   if (hostReflectApply(hostTypedArrayByteLength, serializedInput, []) > data.maxInputBytes) {
     throw new RangeError(`input exceeds maxInputBytes (${data.maxInputBytes})`)
@@ -1775,11 +2029,11 @@ export class UntrustedWorkerSession extends EventEmitter {
         hostReflectApply(hostAbortSignalReason, signal, [])
       )))
 
-      defineSessionPublicPromise(this, 'ready', new SafePromise((resolve, reject) => {
+      defineSessionPublicPromise(this, 'ready', createHostPromise((resolve, reject) => {
         defineSessionData(this, 'resolveReady', resolve)
         defineSessionData(this, 'rejectReady', reject)
       }))
-      defineSessionPublicPromise(this, 'closed', new SafePromise((resolve) => {
+      defineSessionPublicPromise(this, 'closed', createHostPromise((resolve) => {
         defineSessionData(this, 'resolveClosed', resolve)
       }))
 
@@ -1797,8 +2051,11 @@ export class UntrustedWorkerSession extends EventEmitter {
         ? getFileDescriptorQuotaWorkerData(descriptorQuota)
         : undefined
     } catch (error) {
-      if (descriptorQuota) releaseFileDescriptorQuota(descriptorQuota)
-      releaseWorkerSlot()
+      try {
+        if (descriptorQuota) releaseFileDescriptorQuota(descriptorQuota)
+      } finally {
+        releaseWorkerSlot()
+      }
       throw error
     }
     const workerLocalModule = localModule
@@ -1844,8 +2101,11 @@ export class UntrustedWorkerSession extends EventEmitter {
         stderr: true
       })
     } catch (error) {
-      if (descriptorQuota) releaseFileDescriptorQuota(descriptorQuota)
-      releaseWorkerSlot()
+      try {
+        if (descriptorQuota) releaseFileDescriptorQuota(descriptorQuota)
+      } finally {
+        releaseWorkerSlot()
+      }
       getSessionData(this).closedSettled = true
       getSessionData(this).resolveClosed({ code: undefined, error })
       getSessionData(this).state = 'closed'
@@ -1853,42 +2113,71 @@ export class UntrustedWorkerSession extends EventEmitter {
     }
 
     const worker = getSessionSecrets(this).worker
-    hostReflectApply(hostEventEmitterOn, worker, ['exit', (code) => {
-      if (descriptorQuota) releaseFileDescriptorQuota(descriptorQuota)
-      releaseWorkerSlot()
+    let actualExitHandled = false
+    const handleActualExit = (code) => {
+      if (actualExitHandled) return
+      actualExitHandled = true
+      try {
+        if (descriptorQuota) releaseFileDescriptorQuota(descriptorQuota)
+      } finally {
+        releaseWorkerSlot()
+      }
       if (!localModule) {
         this.#handleExit(code)
         return
       }
-      const cleanup = thenHostPromise(attemptLocalModuleCleanup(localModule), (outcome) => {
-        if (outcome.status === 'removed') {
-          preparationSlot?.()
-          this.#handleExit(code)
-          return
-        }
+      try {
+        const cleanup = thenHostPromise(attemptLocalModuleCleanup(localModule), (outcome) => {
+          if (outcome.status === 'removed') {
+            preparationSlot?.()
+            this.#handleExit(code)
+            return
+          }
 
-        const cleanupError = outcome.status === 'failed'
-          ? outcome.error
-          : new Error('Snapshot cleanup did not settle before its deadline')
-        const primaryError = getSessionData(this).failure
+          const cleanupError = outcome.status === 'failed'
+            ? outcome.error
+            : new Error('Snapshot cleanup did not settle before its deadline')
+          const primaryError = getSessionData(this).failure
+          getSessionData(this).failure = sessionError(
+            'The private module snapshot could not be removed promptly',
+            'ERR_UNTRUSTED_WORKER_CLEANUP',
+            primaryError
+              ? new AggregateError([primaryError, cleanupError], 'Worker and cleanup failures')
+              : cleanupError
+          )
+          void thenHostPromise(
+            localModule.cleanupUntilRemoved(),
+            () => preparationSlot?.(),
+            () => {}
+          )
+          this.#handleExit(code)
+        })
+        void catchHostPromise(cleanup, (error) => {
+          hostReflectApply(hostProcessNextTick, process, [() => { throw error }])
+        })
+      } catch (error) {
         getSessionData(this).failure = sessionError(
           'The private module snapshot could not be removed promptly',
           'ERR_UNTRUSTED_WORKER_CLEANUP',
-          primaryError
-            ? new AggregateError([primaryError, cleanupError], 'Worker and cleanup failures')
-            : cleanupError
+          error
         )
-        void thenHostPromise(
-          localModule.cleanupUntilRemoved(),
-          () => preparationSlot?.(),
-          () => {}
-        )
+        try {
+          const cleanupUntilRemoved = localModule.cleanupUntilRemoved()
+          void thenHostPromise(cleanupUntilRemoved, () => preparationSlot?.(), () => {})
+        } catch {}
         this.#handleExit(code)
-      })
-      void catchHostPromise(cleanup, (error) => {
-        hostReflectApply(hostProcessNextTick, process, [() => { throw error }])
-      })
-    }])
+      }
+    }
+    try {
+      hostReflectApply(hostEventEmitterOn, worker, ['exit', handleActualExit])
+    } catch (error) {
+      this.#failWithoutExitListener(sessionError(
+        'The worker exit lifecycle could not be observed',
+        'ERR_UNTRUSTED_WORKER',
+        error
+      ), handleActualExit)
+      return
+    }
 
     try {
       const stdout = hostReflectApply(hostWorkerStdout, worker, [])
@@ -1953,7 +2242,12 @@ export class UntrustedWorkerSession extends EventEmitter {
 
   postMessage (value) {
     this.#assertOpen()
-    const cloned = cloneWithoutSharedMemory(value, 'message')
+    const cloned = cloneWithoutSharedMemory(
+      value,
+      'message',
+      getSessionData(this).maxMessageBytes,
+      'maxMessageBytes'
+    )
     this.#assertOpen()
     const body = { type: 'message', value: cloned }
     const serialized = assertProtocolBody(body, 'message', getSessionData(this).maxMessageBytes)
@@ -1989,7 +2283,12 @@ export class UntrustedWorkerSession extends EventEmitter {
     const timeoutMs = options.timeoutMs ?? getSessionData(this).messageTimeoutMs
     validateTimeout(timeoutMs, 'timeoutMs')
     const deadline = hostReflectApply(hostDateNow, Date, []) + timeoutMs
-    const cloned = cloneWithoutSharedMemory(value, 'message')
+    const cloned = cloneWithoutSharedMemory(
+      value,
+      'message',
+      getSessionData(this).maxMessageBytes,
+      'maxMessageBytes'
+    )
     this.#assertOpen()
     const id = getSessionData(this).nextRequestId++
     const body = { type: 'request', id, value: cloned }
@@ -2004,7 +2303,7 @@ export class UntrustedWorkerSession extends EventEmitter {
       return rejectHostPromise(error)
     }
 
-    return new SafePromise((resolve, reject) => {
+    return createHostPromise((resolve, reject) => {
       const pending = { resolve, reject, timer: undefined, deadline, timeoutMs }
       const expire = () => {
         if (!hostReflectApply(hostMapDelete, getSessionData(this).pending, [id])) return
@@ -2027,6 +2326,80 @@ export class UntrustedWorkerSession extends EventEmitter {
       if (getSessionData(this).state === 'ready') send()
       else hostReflectApply(hostArrayPush, getSessionData(this).outbound, [send])
     })
+  }
+
+  #failWithoutExitListener (error, handleActualExit) {
+    getSessionData(this).failure = error
+    getSessionData(this).state = 'closing'
+    hostReflectApply(
+      hostAbortControllerAbort,
+      getSessionData(this).hostAbortController,
+      [error]
+    )
+    this.#rejectReadyOnce(error)
+    this.#rejectOutstanding(error)
+    let workerTermination
+    try {
+      workerTermination = hostReflectApply(
+        hostWorkerTerminate,
+        getSessionSecrets(this).worker,
+        []
+      )
+    } catch (cause) {
+      this.#settleWithoutWorkerExit(sessionError(
+        'The worker could not be terminated',
+        'ERR_UNTRUSTED_WORKER_TERMINATION',
+        cause
+      ))
+      this.#emitError(error)
+      return
+    }
+    getSessionData(this).termination = createHostPromise((resolve, reject) => {
+      const timer = hostSetTimeout(() => {
+        const timeoutError = sessionError(
+          'The worker did not exit after termination was requested',
+          'ERR_UNTRUSTED_WORKER_TERMINATION_TIMEOUT',
+          error
+        )
+        this.#settleWithoutWorkerExit(timeoutError)
+        reject(timeoutError)
+      }, TERMINATION_SETTLEMENT_TIMEOUT_MS)
+      try {
+        const observation = thenHostPromise(
+          workerTermination,
+          (code) => {
+            hostClearTimeout(timer)
+            try {
+              handleActualExit(code)
+            } finally {
+              resolve(code)
+            }
+          },
+          (cause) => {
+            hostClearTimeout(timer)
+            const terminationError = sessionError(
+              'The worker could not be terminated',
+              'ERR_UNTRUSTED_WORKER_TERMINATION',
+              cause
+            )
+            this.#settleWithoutWorkerExit(terminationError)
+            reject(terminationError)
+          }
+        )
+        catchHostPromise(observation, () => {})
+      } catch (cause) {
+        hostClearTimeout(timer)
+        const terminationError = sessionError(
+          'The worker termination could not be observed',
+          'ERR_UNTRUSTED_WORKER_TERMINATION',
+          cause
+        )
+        this.#settleWithoutWorkerExit(terminationError)
+        reject(terminationError)
+      }
+    })
+    catchHostPromise(getSessionData(this).termination, () => {})
+    this.#emitError(error)
   }
 
   terminate () {
@@ -2053,7 +2426,7 @@ export class UntrustedWorkerSession extends EventEmitter {
     }
 
     const workerTermination = hostReflectApply(hostWorkerTerminate, worker, [])
-    getSessionData(this).termination = new SafePromise((resolve, reject) => {
+    getSessionData(this).termination = createHostPromise((resolve, reject) => {
       const timer = hostSetTimeout(() => {
         const error = sessionError(
           'The worker did not exit after termination was requested',
@@ -2187,7 +2560,12 @@ export class UntrustedWorkerSession extends EventEmitter {
       throw sessionError('Unauthenticated worker protocol message', 'ERR_UNTRUSTED_WORKER_PROTOCOL')
     }
 
-    assertNoSharedMemory(message.payload, 'protocol payload')
+    assertNoSharedMemory(
+      message.payload,
+      'protocol payload',
+      getSessionData(this).maxMessageBytes,
+      'maxMessageBytes'
+    )
     const byteLength = hostReflectApply(hostTypedArrayByteLength, message.payload, [])
     if (byteLength > getSessionData(this).maxMessageBytes) {
       throw sessionError('Worker protocol message is too large', 'ERR_UNTRUSTED_WORKER_PROTOCOL')
@@ -2205,7 +2583,12 @@ export class UntrustedWorkerSession extends EventEmitter {
     let body
     try {
       body = v8Deserialize(message.payload)
-      assertSupportedProtocolValue(body, 'message')
+      assertSupportedProtocolValue(
+        body,
+        'message',
+        getSessionData(this).maxMessageBytes,
+        'maxMessageBytes'
+      )
     } catch {
       throw sessionError('Invalid worker protocol payload', 'ERR_UNTRUSTED_WORKER_PROTOCOL')
     }
@@ -2225,7 +2608,12 @@ export class UntrustedWorkerSession extends EventEmitter {
         'ERR_UNTRUSTED_WORKER_DIAGNOSTIC_PROTOCOL'
       )
     }
-    assertNoSharedMemory(message.payload, 'diagnostic payload')
+    assertNoSharedMemory(
+      message.payload,
+      'diagnostic payload',
+      getSessionData(this).diagnostics.maxRecordBytes,
+      'maxMessageBytes'
+    )
     const byteLength = hostReflectApply(hostTypedArrayByteLength, message.payload, [])
     if (byteLength > getSessionData(this).diagnostics.maxRecordBytes ||
         getSessionData(this).diagnosticRecords >= getSessionData(this).diagnostics.maxRecords ||
@@ -2251,6 +2639,12 @@ export class UntrustedWorkerSession extends EventEmitter {
     let record
     try {
       record = v8Deserialize(message.payload)
+      assertSupportedProtocolValue(
+        record,
+        'diagnostic payload',
+        getSessionData(this).diagnostics.maxRecordBytes,
+        'maxMessageBytes'
+      )
     } catch {
       throw sessionError(
         'Invalid worker diagnostic payload',
@@ -2275,10 +2669,18 @@ export class UntrustedWorkerSession extends EventEmitter {
     if (getSessionData(this).state === 'closing' || getSessionData(this).state === 'closed') return
     const store = { active: true, session: this }
     try {
-      await hostReflectApply(hostAsyncLocalStorageRun, diagnosticContextStorage, [store, async () => {
-        if (getSessionData(this).onDiagnostic) await getSessionData(this).onDiagnostic(record)
-        emitHostEvent(this, 'diagnostic', record)
-      }])
+      const diagnostic = hostReflectApply(
+        hostAsyncLocalStorageRun,
+        diagnosticContextStorage,
+        [store, async () => {
+          if (getSessionData(this).onDiagnostic) {
+            const callback = getSessionData(this).onDiagnostic(record)
+            await adoptHostValue(callback)
+          }
+          emitHostEvent(this, 'diagnostic', record)
+        }]
+      )
+      await adoptHostValue(diagnostic)
     } catch (error) {
       throw sessionError(
         'The diagnostic callback failed',
@@ -2324,7 +2726,14 @@ export class UntrustedWorkerSession extends EventEmitter {
     }
 
     try {
-      if ('value' in envelope) assertNoSharedMemory(envelope.value, 'message')
+      if ('value' in envelope) {
+        assertNoSharedMemory(
+          envelope.value,
+          'message',
+          getSessionData(this).maxMessageBytes,
+          'maxMessageBytes'
+        )
+      }
     } catch (error) {
       this.#fail(error)
       return
@@ -2397,7 +2806,12 @@ export class UntrustedWorkerSession extends EventEmitter {
     }
 
     try {
-      assertNoSharedMemory(envelope.arguments, 'host function arguments')
+      assertNoSharedMemory(
+        envelope.arguments,
+        'host function arguments',
+        getSessionData(this).maxMessageBytes,
+        'maxMessageBytes'
+      )
     } catch (error) {
       this.#sendHostFunctionError(envelope.id, error)
       return
@@ -2441,17 +2855,21 @@ export class UntrustedWorkerSession extends EventEmitter {
 
   async #invokeHostFunction (envelope, hostFunction, requestIndex) {
     try {
-      const value = await invokeHostFunction(hostFunction, envelope.arguments, {
-        abortSignal: hostReflectApply(
-          hostAbortControllerSignal,
-          getSessionData(this).hostAbortController,
-          []
-        ),
-        sessionId: getSessionData(this).sessionId,
-        requestId: `${getSessionData(this).sessionId}:${envelope.id}`,
-        requestIndex,
-        hostFunctionName: envelope.name
-      })
+      const value = await adoptHostValue(invokeHostFunction(
+        hostFunction,
+        envelope.arguments,
+        {
+          abortSignal: hostReflectApply(
+            hostAbortControllerSignal,
+            getSessionData(this).hostAbortController,
+            []
+          ),
+          sessionId: getSessionData(this).sessionId,
+          requestId: `${getSessionData(this).sessionId}:${envelope.id}`,
+          requestIndex,
+          hostFunctionName: envelope.name
+        }
+      ))
       const hostAbortSignal = hostReflectApply(
         hostAbortControllerSignal,
         getSessionData(this).hostAbortController,
@@ -2459,7 +2877,12 @@ export class UntrustedWorkerSession extends EventEmitter {
       )
       if (hostReflectApply(hostAbortSignalAborted, hostAbortSignal, []) ||
           (getSessionData(this).state !== 'starting' && getSessionData(this).state !== 'ready')) return
-      const cloned = cloneWithoutSharedMemory(value, 'host function result')
+      const cloned = cloneWithoutSharedMemory(
+        value,
+        'host function result',
+        getSessionData(this).maxMessageBytes,
+        'maxMessageBytes'
+      )
       assertProtocolSerializable(cloned, 'host function result')
       if (getSessionData(this).state === 'starting' || getSessionData(this).state === 'ready') {
         this.#sendProtocol({ type: 'host-result', id: envelope.id, value: cloned })
@@ -2589,7 +3012,7 @@ function protocolMac (secret, direction, sequence, serialized) {
 function serializeProtocolBody (body, maxMessageBytes) {
   let serialized
   try {
-    assertSupportedProtocolValue(body, 'message')
+    assertSupportedProtocolValue(body, 'message', maxMessageBytes, 'maxMessageBytes')
     serialized = v8Serialize(body)
   } catch {
     throw new TypeError('Message is not supported by the authenticated protocol')
@@ -2619,7 +3042,7 @@ function assertProtocolSerializable (value, label) {
 
 function serializeHostError (error) {
   try {
-    if (error instanceof HostFunctionError) {
+    if (isPublicHostFunctionError(error)) {
       return {
         name: 'HostFunctionError',
         message: typeof error.message === 'string'

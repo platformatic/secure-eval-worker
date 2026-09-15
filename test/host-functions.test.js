@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { AsyncLocalStorage } from 'node:async_hooks'
+import { createRequire, syncBuiltinESMExports } from 'node:module'
 import { test } from 'node:test'
 
 import {
@@ -8,6 +9,8 @@ import {
   HostFunctionError,
   runUntrustedCode
 } from '../src/index.js'
+
+const require = createRequire(import.meta.url)
 
 test('one-shot source calls synchronous and asynchronous host functions as globals', async () => {
   const calls = []
@@ -298,6 +301,275 @@ test('host function context uses captured AsyncLocalStorage operations', async (
   }
 })
 
+test('host-function promise settlement ignores poisoned promise species', async (t) => {
+  const originalConstructor = Object.getOwnPropertyDescriptor(
+    Promise.prototype,
+    'constructor'
+  )
+  const originalSpecies = Object.getOwnPropertyDescriptor(Promise, Symbol.species)
+  const utilTypes = require('node:util/types')
+  const originalIsPromise = Object.getOwnPropertyDescriptor(utilTypes, 'isPromise')
+  let restored = true
+  let utilTypesRestored = true
+  const restore = () => {
+    if (!restored) {
+      restored = true
+      Object.defineProperty(Promise.prototype, 'constructor', originalConstructor)
+      Object.defineProperty(Promise, Symbol.species, originalSpecies)
+    }
+    if (!utilTypesRestored) {
+      utilTypesRestored = true
+      Object.defineProperty(utilTypes, 'isPromise', originalIsPromise)
+      syncBuiltinESMExports()
+    }
+  }
+  t.after(restore)
+  class PoisonPromiseSpecies {
+    constructor () { throw new Error('poisoned promise species') }
+  }
+  Object.defineProperty(PoisonPromiseSpecies, Symbol.species, {
+    configurable: true,
+    value: PoisonPromiseSpecies
+  })
+  let retainedPromise
+  const session = createUntrustedWorker('onMessage(() => tools.value())', {
+    hostFunctions: {
+      tools: {
+        value () {
+          const result = new Promise(resolve => setImmediate(resolve, 42))
+          retainedPromise = result
+          restored = false
+          Object.defineProperty(Promise.prototype, 'constructor', {
+            configurable: true,
+            value: PoisonPromiseSpecies
+          })
+          Object.defineProperty(Promise, Symbol.species, {
+            configurable: true,
+            value: PoisonPromiseSpecies
+          })
+          setImmediate(restore)
+          return result
+        }
+      }
+    },
+    startupTimeoutMs: 5_000,
+    messageTimeoutMs: 5_000,
+    lifetimeTimeoutMs: 5_000
+  })
+  await session.ready
+  utilTypesRestored = false
+  Object.defineProperty(utilTypes, 'isPromise', {
+    ...originalIsPromise,
+    value: () => false
+  })
+  syncBuiltinESMExports()
+  assert.equal(await session.request(null), 42)
+  assert.equal(Object.hasOwn(retainedPromise, 'constructor'), false)
+  restore()
+  await session.terminate()
+})
+
+test('frozen host promises fail closed under constructor poisoning', async (t) => {
+  const originalConstructor = Object.getOwnPropertyDescriptor(
+    Promise.prototype,
+    'constructor'
+  )
+  class PoisonPromiseSpecies {
+    constructor () { throw new Error('poisoned promise species') }
+  }
+  Object.defineProperty(PoisonPromiseSpecies, Symbol.species, {
+    configurable: true,
+    value: PoisonPromiseSpecies
+  })
+  let restored = false
+  const restore = () => {
+    if (restored) return
+    restored = true
+    Object.defineProperty(Promise.prototype, 'constructor', originalConstructor)
+  }
+  t.after(restore)
+  const unhandled = []
+  const onUnhandled = (error) => unhandled.push(error)
+  process.on('unhandledRejection', onUnhandled)
+  t.after(() => process.off('unhandledRejection', onUnhandled))
+
+  const session = createUntrustedWorker('onMessage(() => host.values.value())', {
+    hostFunctions: {
+      values: {
+        value () {
+          const result = Object.freeze(Promise.resolve(42))
+          Object.defineProperty(Promise.prototype, 'constructor', {
+            configurable: true,
+            value: PoisonPromiseSpecies
+          })
+          setImmediate(restore)
+          return result
+        }
+      }
+    },
+    startupTimeoutMs: 5_000,
+    messageTimeoutMs: 5_000,
+    lifetimeTimeoutMs: 5_000
+  })
+  await session.ready
+  await assert.rejects(session.request('value'), /Host function failed/)
+  await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual(unhandled, [])
+  await session.terminate()
+})
+
+test('host functions preserve Promise subclasses and retained promise descriptors', async () => {
+  class ResultPromise extends Promise {}
+  const promises = []
+  const session = createUntrustedWorker('onMessage(value => tools[value]())', {
+    hostFunctions: {
+      tools: {
+        native () {
+          const value = Promise.resolve(41)
+          promises.push(value)
+          return value
+        },
+        frozenNative () {
+          const value = Object.freeze(Promise.resolve(42))
+          promises.push(value)
+          return value
+        },
+        subclass () {
+          const value = new ResultPromise(resolve => resolve(43))
+          promises.push(value)
+          return value
+        }
+      }
+    },
+    startupTimeoutMs: 5_000,
+    messageTimeoutMs: 5_000,
+    lifetimeTimeoutMs: 5_000
+  })
+  await session.ready
+  assert.equal(await session.request('native'), 41)
+  assert.equal(await session.request('frozenNative'), 42)
+  assert.equal(await session.request('subclass'), 43)
+  for (const promise of promises) {
+    assert.equal(Object.hasOwn(promise, 'constructor'), false)
+  }
+  await session.terminate()
+})
+
+test('frozen Promise subclasses fail closed without invoking host species', async (t) => {
+  let speciesReads = 0
+  let speciesConstructions = 0
+  class FrozenResultPromise extends Promise {}
+  Object.defineProperty(FrozenResultPromise, Symbol.species, {
+    configurable: true,
+    get () {
+      speciesReads++
+      return class BlockingPromiseSpecies {
+        constructor (executor) {
+          speciesConstructions++
+          executor(() => {}, () => {})
+        }
+      }
+    }
+  })
+
+  const unexpected = []
+  const onUnhandled = error => unexpected.push(error)
+  const onUncaught = error => unexpected.push(error)
+  process.on('unhandledRejection', onUnhandled)
+  process.on('uncaughtException', onUncaught)
+  t.after(() => {
+    process.off('unhandledRejection', onUnhandled)
+    process.off('uncaughtException', onUncaught)
+  })
+
+  const session = createUntrustedWorker('onMessage(() => tools.value())', {
+    hostFunctions: {
+      tools: {
+        value () {
+          return Object.freeze(new FrozenResultPromise(resolve => resolve(44)))
+        }
+      }
+    },
+    startupTimeoutMs: 5_000,
+    messageTimeoutMs: 1_000,
+    lifetimeTimeoutMs: 5_000
+  })
+  t.after(() => session.terminate().catch(() => {}))
+  await session.ready
+  const startedAt = Date.now()
+  await assert.rejects(session.request(null), /Host function failed/)
+  assert.equal(Date.now() - startedAt < 4_000, true)
+  assert.equal(speciesReads, 0)
+  assert.equal(speciesConstructions, 0)
+  await session.terminate()
+  await session.closed
+  await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual(unexpected, [])
+  assert.equal(await runUntrustedCode('return 45', { timeoutMs: 5_000 }), 45)
+})
+
+test('frozen host promises reject constructor accessors without invoking them', async (t) => {
+  let constructorReads = 0
+  let speciesReads = 0
+  let speciesConstructions = 0
+  class HostilePromise extends Promise {}
+  Object.defineProperty(HostilePromise, Symbol.species, {
+    get () {
+      speciesReads++
+      return class BlockingPromiseSpecies {
+        constructor (executor) {
+          speciesConstructions++
+          executor(() => {}, () => {})
+        }
+      }
+    }
+  })
+
+  const unexpected = []
+  const onUnhandled = error => unexpected.push(error)
+  const onUncaught = error => unexpected.push(error)
+  process.on('unhandledRejection', onUnhandled)
+  process.on('uncaughtException', onUncaught)
+  t.after(() => {
+    process.off('unhandledRejection', onUnhandled)
+    process.off('uncaughtException', onUncaught)
+  })
+
+  const session = createUntrustedWorker('onMessage(() => tools.value())', {
+    hostFunctions: {
+      tools: {
+        value () {
+          const result = Promise.resolve(47)
+          Object.defineProperty(result, 'constructor', {
+            configurable: false,
+            get () {
+              constructorReads++
+              return constructorReads === 1 ? Promise : HostilePromise
+            }
+          })
+          return Object.freeze(result)
+        }
+      }
+    },
+    startupTimeoutMs: 5_000,
+    messageTimeoutMs: 1_000,
+    lifetimeTimeoutMs: 5_000
+  })
+  t.after(() => session.terminate().catch(() => {}))
+  await session.ready
+  const startedAt = Date.now()
+  await assert.rejects(session.request(null), /Host function failed/)
+  assert.equal(Date.now() - startedAt < 4_000, true)
+  assert.equal(constructorReads, 0)
+  assert.equal(speciesReads, 0)
+  assert.equal(speciesConstructions, 0)
+  await session.terminate()
+  await session.closed
+  await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual(unexpected, [])
+  assert.equal(await runUntrustedCode('return 48', { timeoutMs: 5_000 }), 48)
+})
+
 test('host function context provides request metadata and cancellation', async () => {
   const contexts = []
   let observedAbort
@@ -380,6 +652,110 @@ test('host errors are redacted unless explicitly marked public', async () => {
     code: 'NOT_FOUND'
   })
   assert.equal(await session.request('ok'), 'still running')
+  await session.terminate()
+})
+
+test('HostFunctionError disclosure uses an unforgeable private brand', async (t) => {
+  const originalHasInstance = Object.getOwnPropertyDescriptor(
+    HostFunctionError,
+    Symbol.hasInstance
+  )
+  t.after(() => {
+    if (originalHasInstance) {
+      Object.defineProperty(HostFunctionError, Symbol.hasInstance, originalHasInstance)
+    } else {
+      delete HostFunctionError[Symbol.hasInstance]
+    }
+  })
+  Object.defineProperty(HostFunctionError, Symbol.hasInstance, {
+    configurable: true,
+    value: () => true
+  })
+
+  const session = createUntrustedWorker(`
+    onMessage(async value => {
+      try { await tools[value]() } catch (error) {
+        return { message: error.message, code: error.code }
+      }
+    })
+  `, {
+    hostFunctions: {
+      tools: {
+        forged () {
+          const error = new Error('PRIVATE_FORGED_SECRET')
+          error.code = 'PRIVATE_FORGED_CODE'
+          Object.setPrototypeOf(error, HostFunctionError.prototype)
+          throw error
+        },
+        ordinary () {
+          const error = new Error('PRIVATE_HAS_INSTANCE_SECRET')
+          error.code = 'PRIVATE_HAS_INSTANCE_CODE'
+          throw error
+        },
+        public () {
+          throw new HostFunctionError('Public explanation', { code: 'PUBLIC_CODE' })
+        }
+      }
+    },
+    startupTimeoutMs: 5_000,
+    messageTimeoutMs: 5_000,
+    lifetimeTimeoutMs: 5_000
+  })
+  await session.ready
+  for (const name of ['forged', 'ordinary']) {
+    assert.deepEqual(await session.request(name), {
+      message: 'Host function failed',
+      code: 'ERR_UNTRUSTED_WORKER_HOST_FUNCTION'
+    })
+  }
+  assert.deepEqual(await session.request('public'), {
+    message: 'Public explanation',
+    code: 'PUBLIC_CODE'
+  })
+  await session.terminate()
+})
+
+test('decorated branded host-function values fail closed', async () => {
+  let calls = 0
+  let reads = 0
+  const session = createUntrustedWorker(`
+    onMessage(async value => {
+      if (value === 'argument') {
+        const argument = new Date(0)
+        Object.defineProperty(argument, 'authority', {
+          enumerable: true,
+          value: new SharedArrayBuffer(8)
+        })
+        try { await tools.consume(argument) } catch (error) { return error.message }
+      }
+      try { await tools.decorated() } catch (error) { return error.code }
+    })
+  `, {
+    hostFunctions: {
+      tools: {
+        consume () { calls++ },
+        decorated () {
+          const value = new Map([['answer', 42]])
+          Object.defineProperty(value, 'authority', {
+            enumerable: true,
+            get () {
+              reads++
+              return new SharedArrayBuffer(8)
+            }
+          })
+          return value
+        }
+      }
+    },
+    startupTimeoutMs: 5_000,
+    messageTimeoutMs: 5_000,
+    lifetimeTimeoutMs: 5_000
+  })
+  await session.ready
+  assert.match(await session.request('argument'), /(?:protocol|host function)/i)
+  assert.equal(calls, 0)
+  assert.equal(await session.request('result'), 'ERR_UNTRUSTED_WORKER_HOST_FUNCTION')
+  assert.equal(reads, 0)
   await session.terminate()
 })
 
@@ -683,6 +1059,25 @@ test('rejects platform objects whose contents are not authenticated by the codec
   )
   assert.equal(await session.request('result'), 'Host function failed')
   assert.equal(await session.request('result-key'), 'Host function failed')
+  await session.terminate()
+})
+
+test('host function validation uses captured JSON formatting', async () => {
+  const originalStringify = JSON.stringify
+  let session
+  try {
+    JSON.stringify = () => { throw new Error('poisoned JSON.stringify') }
+    session = createUntrustedWorker('onMessage(() => tools.value())', {
+      hostFunctions: { tools: { value: () => 42 } },
+      startupTimeoutMs: 5_000,
+      messageTimeoutMs: 5_000,
+      lifetimeTimeoutMs: 5_000
+    })
+  } finally {
+    JSON.stringify = originalStringify
+  }
+  await session.ready
+  assert.equal(await session.request(null), 42)
   await session.terminate()
 })
 

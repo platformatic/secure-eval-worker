@@ -106,6 +106,50 @@ for (const type of EXECUTION_TYPES) {
     assert.equal(code, 'ERR_ACCESS_DENIED')
   })
 
+  test(`${type} denies WASI and unavailable native capability modules`, async () => {
+    const result = await evaluateInGuest(type, `
+      const Module = await import('node:module')
+      const require = Module.createRequire(process.execPath)
+      const wasiConstructors = [
+        (await import('node:wasi')).WASI,
+        process.getBuiltinModule('node:wasi').WASI,
+        require('node:wasi').WASI,
+        Module.default._load('node:wasi').WASI
+      ]
+      const wasi = wasiConstructors.map(WASI => {
+        try {
+          new WASI({ version: 'preview1' })
+          return 'ALLOWED'
+        } catch (error) {
+          return error.code
+        }
+      })
+      const unavailable = []
+      for (const id of ['node:ffi', 'node:vfs']) {
+        let imported = false
+        let required = false
+        let loaded = false
+        try { await import(id); imported = true } catch {}
+        try { require(id); required = true } catch {}
+        try { Module.default._load(id); loaded = true } catch {}
+        unavailable.push({
+          imported,
+          required,
+          loaded,
+          builtin: process.getBuiltinModule(id) !== undefined
+        })
+      }
+      return { wasi, unavailable }
+    `)
+    assert.deepEqual(result.wasi, Array(4).fill('ERR_ACCESS_DENIED'))
+    assert.deepEqual(result.unavailable, Array.from({ length: 2 }, () => ({
+      imported: false,
+      required: false,
+      loaded: false,
+      builtin: false
+    })))
+  })
+
   test(`${type} cannot use host file descriptors`, async (t) => {
     const path = join(tmpdir(), `secure-eval-worker-${randomUUID()}.txt`)
     fs.writeFileSync(path, 'file-descriptor-secret')

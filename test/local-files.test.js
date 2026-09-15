@@ -22,6 +22,10 @@ import { createUntrustedFileSession } from '../src/session.js'
 const execFileAsync = promisify(execFile)
 const packageUrl = new URL('../src/index.js', import.meta.url).href
 const admissionUrl = new URL('../src/admission.js', import.meta.url).href
+const legacyDescriptorStateUrl = new URL(
+  '../fixtures/security/legacy-descriptor-state-v1.mjs',
+  import.meta.url
+).href
 const repositoryRoot = fileURLToPath(new URL('..', import.meta.url))
 
 const TIMEOUTS = {
@@ -378,35 +382,23 @@ test('a new copy adapts descriptor quota state initialized by a legacy v1 copy',
   ]))
 
   const childSource = `
-    const slotsBuffer = new SharedArrayBuffer(1024)
-    const slots = new Int32Array(slotsBuffer)
-    let nextOwner = 1
-    Object.defineProperty(
-      globalThis,
-      Symbol.for('secure-eval-worker.admission.descriptors.main.v1'),
-      {
-        value: Object.freeze({
-          createWorkerQuota () {
-            const owner = nextOwner++
-            let released = false
-            return Object.freeze({
-              owner,
-              slotsBuffer,
-              release () {
-                if (released) return
-                released = true
-                for (let index = 0; index < slots.length; index++) {
-                  Atomics.compareExchange(slots, index, owner, 0)
-                }
-              }
-            })
-          }
-        })
-      }
+    const { installLegacyDescriptorStateV1 } = await import(
+      ${JSON.stringify(legacyDescriptorStateUrl)}
     )
+    const { slotsBuffer } = installLegacyDescriptorStateV1(['noop', 'throw', 'normal'])
+    const slots = new Int32Array(slotsBuffer)
     const api = await import(${JSON.stringify(packageUrl)})
     const admission = await import(${JSON.stringify(admissionUrl)})
     api.configureWorkerAdmission({ maxConcurrentWorkers: 1 })
+    const uncaught = []
+    process.on('uncaughtException', error => uncaught.push(String(error)))
+    process.on('unhandledRejection', error => uncaught.push(String(error)))
+    const typedArrayPrototype = Object.getPrototypeOf(Int32Array.prototype)
+    const originalLength = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'length')
+    Object.defineProperty(typedArrayPrototype, 'length', {
+      configurable: true,
+      get () { return 0 }
+    })
     const runFile = input => api.runUntrustedFile(${JSON.stringify(files.path('entry.mjs'))}, {
       rootDirectory: ${JSON.stringify(files.directory)},
       input,
@@ -426,6 +418,7 @@ test('a new copy adapts descriptor quota state initialized by a legacy v1 copy',
     const response = await session.request(42)
     await session.terminate()
     const closed = await session.closed
+    Object.defineProperty(typedArrayPrototype, 'length', originalLength)
     const sourceResult = await api.runUntrustedCode('return 43', { timeoutMs: 5000 })
     const snapshots = await (await import('node:fs/promises')).readdir(
       ${JSON.stringify(canonicalStagingBase)}
@@ -441,7 +434,8 @@ test('a new copy adapts descriptor quota state initialized by a legacy v1 copy',
       closedError: closed.error?.code ?? null,
       activeWorkers: admission.getWorkerAdmissionStatus().activeWorkers,
       descriptorSlotsInUse,
-      snapshots
+      snapshots,
+      uncaught
     }))
   `
   const { stdout } = await execFileAsync(process.execPath, [
@@ -464,7 +458,8 @@ test('a new copy adapts descriptor quota state initialized by a legacy v1 copy',
     closedError: null,
     activeWorkers: 0,
     descriptorSlotsInUse: 0,
-    snapshots: []
+    snapshots: [],
+    uncaught: []
   })
 })
 
@@ -796,16 +791,18 @@ test('hostile path errors cannot forge snapshot cleanup ownership', async (t) =>
   const files = await fixture({ 'entry.mjs': 'export default () => 42' })
   t.after(() => files.cleanup())
 
-  const forgedError = Object.defineProperty({}, 'cleanupUntilRemoved', {
-    get () { throw new Error('forged cleanup metadata') }
-  })
+  let prototypeReads = 0
   const modulePath = new Proxy({}, {
-    getPrototypeOf () { throw forgedError }
+    getPrototypeOf () {
+      prototypeReads++
+      throw new Error('forged cleanup metadata')
+    }
   })
   await assert.rejects(
     runUntrustedFile(modulePath, { timeoutMs: 5_000 }),
-    (error) => error === forgedError
+    (error) => error instanceof TypeError && /path string or file URL/.test(error.message)
   )
+  assert.equal(prototypeReads, 0)
   assert.equal(await runUntrustedFile(files.path('entry.mjs'), {
     rootDirectory: files.directory,
     timeoutMs: 5_000
@@ -847,6 +844,154 @@ test('snapshot cleanup uses captured promise operations', async (t) => {
   }), 42)
 })
 
+test('promise species poisoning cannot strand local preparation or admission', async (t) => {
+  const files = await fixture({
+    'entry.mjs': 'export default input => input',
+    'extra.txt': 'x'.repeat(1024)
+  })
+  const stagingBase = await mkdtemp(join(tmpdir(), 'secure-eval-worker-species-'))
+  const canonicalStagingBase = await realpath(stagingBase)
+  t.after(async () => Promise.all([
+    files.cleanup(),
+    rm(stagingBase, { force: true, recursive: true })
+  ]))
+  const childSource = `
+    const api = await import(${JSON.stringify(packageUrl)})
+    const admission = await import(${JSON.stringify(admissionUrl)})
+    api.configureWorkerAdmission({ maxConcurrentWorkers: 1 })
+    const unhandled = []
+    process.on('unhandledRejection', error => {
+      console.error(error?.stack ?? String(error))
+      process.exit(70)
+    })
+    process.on('uncaughtException', error => {
+      console.error(error?.stack ?? String(error))
+      process.exit(71)
+    })
+    const originalConstructor = Object.getOwnPropertyDescriptor(
+      Promise.prototype,
+      'constructor'
+    )
+    const originalSpecies = Object.getOwnPropertyDescriptor(Promise, Symbol.species)
+    class PoisonPromiseSpecies {
+      constructor () { throw new Error('poisoned promise species') }
+    }
+    const poison = () => {
+      Object.defineProperty(PoisonPromiseSpecies, Symbol.species, {
+        configurable: true,
+        value: PoisonPromiseSpecies
+      })
+      Object.defineProperty(Promise.prototype, 'constructor', {
+        configurable: true,
+        value: PoisonPromiseSpecies
+      })
+      Object.defineProperty(Promise, Symbol.species, {
+        configurable: true,
+        value: PoisonPromiseSpecies
+      })
+    }
+    const restore = () => {
+      Object.defineProperty(Promise.prototype, 'constructor', originalConstructor)
+      Object.defineProperty(Promise, Symbol.species, originalSpecies)
+    }
+    let success
+    let successHardened
+    let persistentHardened
+    let failure
+    let cancellation
+    try {
+      poison()
+      success = api.runUntrustedFile(${JSON.stringify(files.path('entry.mjs'))}, {
+        rootDirectory: ${JSON.stringify(files.directory)},
+        input: 42,
+        timeoutMs: 5000
+      })
+      const constructorDescriptor = Object.getOwnPropertyDescriptor(success, 'constructor')
+      successHardened = constructorDescriptor?.value === undefined &&
+        constructorDescriptor?.writable === false &&
+        constructorDescriptor?.configurable === false
+    } finally { restore() }
+    success = await success
+    let persistent
+    try {
+      poison()
+      persistent = api.createUntrustedWorkerFromFile(${JSON.stringify(files.path('entry.mjs'))}, {
+        rootDirectory: ${JSON.stringify(files.directory)},
+        startupTimeoutMs: 5000,
+        lifetimeTimeoutMs: 5000
+      })
+      const constructorDescriptor = Object.getOwnPropertyDescriptor(persistent, 'constructor')
+      persistentHardened = constructorDescriptor?.value === undefined &&
+        constructorDescriptor?.writable === false &&
+        constructorDescriptor?.configurable === false
+    } finally { restore() }
+    const session = await persistent
+    await session.ready
+    await session.terminate()
+    await session.closed
+    try {
+      poison()
+      failure = api.runUntrustedFile(${JSON.stringify(files.path('missing.mjs'))}, {
+        rootDirectory: ${JSON.stringify(files.directory)},
+        timeoutMs: 5000
+      })
+    } finally { restore() }
+    try { await failure } catch (error) { failure = error.code }
+    const controller = new AbortController()
+    try {
+      poison()
+      cancellation = api.runUntrustedFile(${JSON.stringify(files.path('entry.mjs'))}, {
+        rootDirectory: ${JSON.stringify(files.directory)},
+        signal: controller.signal,
+        timeoutMs: 5000
+      })
+    } finally { restore() }
+    controller.abort('test')
+    try { await cancellation } catch (error) { cancellation = error.name }
+    await new Promise(resolve => setTimeout(resolve, 100))
+    const sourceResult = await api.runUntrustedCode('return 43', { timeoutMs: 5000 })
+    const snapshots = await (await import('node:fs/promises')).readdir(
+      ${JSON.stringify(canonicalStagingBase)}
+    )
+    console.log(JSON.stringify({
+      success,
+      successHardened,
+      persistentHardened,
+      failure,
+      cancellation,
+      sourceResult,
+      activeWorkers: admission.getWorkerAdmissionStatus().activeWorkers,
+      snapshots,
+      unhandled
+    }))
+  `
+  const { stdout, stderr } = await execFileAsync(process.execPath, [
+    '--input-type=module',
+    '--eval',
+    childSource
+  ], {
+    env: {
+      ...process.env,
+      TEMP: canonicalStagingBase,
+      TMP: canonicalStagingBase,
+      TMPDIR: canonicalStagingBase
+    },
+    timeout: 20_000
+  })
+  assert.notEqual(stdout.trim(), '', stderr)
+  assert.deepEqual(JSON.parse(stdout), {
+    success: 42,
+    successHardened: true,
+    persistentHardened: true,
+    failure: 'ERR_UNTRUSTED_MODULE_PATH',
+    cancellation: 'AbortError',
+    sourceResult: 43,
+    activeWorkers: 0,
+    snapshots: [],
+    unhandled: []
+  })
+})
+
 test('local-file preparation ignores poisoned array iteration', async (t) => {
   configureWorkerAdmission({ maxConcurrentWorkers: 1 })
   t.after(() => configureWorkerAdmission({ maxConcurrentWorkers: 4 }))
@@ -869,6 +1014,30 @@ test('local-file preparation ignores poisoned array iteration', async (t) => {
     rootDirectory: files.directory,
     timeoutMs: 5_000
   }), 42)
+})
+
+test('local path staging uses captured URL and Set intrinsics', async (t) => {
+  const files = await fixture({ 'entry.mjs': 'export default () => 42' })
+  t.after(() => files.cleanup())
+  const OriginalURL = globalThis.URL
+  const OriginalSet = globalThis.Set
+  let execution
+  try {
+    globalThis.URL = class PoisonedURL {
+      static [Symbol.hasInstance] () { throw new Error('poisoned URL') }
+    }
+    globalThis.Set = class PoisonedSet {
+      constructor () { throw new Error('poisoned Set') }
+    }
+    execution = runUntrustedFile(pathToFileURL(files.path('entry.mjs')), {
+      rootDirectory: pathToFileURL(files.directory + '/'),
+      timeoutMs: 5_000
+    })
+    assert.equal(await execution, 42)
+  } finally {
+    globalThis.URL = OriginalURL
+    globalThis.Set = OriginalSet
+  }
 })
 
 test('staging uses captured descriptor operations', async (t) => {

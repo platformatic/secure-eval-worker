@@ -1,3 +1,7 @@
+import { isProxy } from 'node:util/types'
+
+const safeIsProxy = isProxy
+
 export const DEFAULT_MAX_SOURCE_BYTES = 64 * 1024
 export const MAX_TIMEOUT_MS = 2_147_483_647
 const MINIMUM_NODE_VERSION = [26, 5, 1]
@@ -77,12 +81,13 @@ const numberToString = Number.prototype.toString
 const objectPrototype = Object.prototype
 const arrayPrototype = Array.prototype
 const arrayBufferPrototype = ArrayBuffer.prototype
+const dataViewPrototype = DataView.prototype
 const datePrototype = Date.prototype
 const regexpPrototype = RegExp.prototype
 const mapPrototype = Map.prototype
 const setPrototype = Set.prototype
 const allowedViewPrototypes = new Set([
-  DataView.prototype,
+  dataViewPrototype,
   Int8Array.prototype,
   Uint8Array.prototype,
   Uint8ClampedArray.prototype,
@@ -103,8 +108,18 @@ const typedArrayBuffer = Object.getOwnPropertyDescriptor(
   Object.getPrototypeOf(Uint8Array.prototype),
   'buffer'
 ).get
-const dataViewBuffer = Object.getOwnPropertyDescriptor(DataView.prototype, 'buffer').get
+const dataViewBuffer = Object.getOwnPropertyDescriptor(dataViewPrototype, 'buffer').get
+const dataViewByteLength = Object.getOwnPropertyDescriptor(dataViewPrototype, 'byteLength').get
+const typedArrayByteLength = Object.getOwnPropertyDescriptor(
+  Object.getPrototypeOf(Uint8Array.prototype),
+  'byteLength'
+).get
+const typedArrayLength = Object.getOwnPropertyDescriptor(
+  Object.getPrototypeOf(Uint8Array.prototype),
+  'length'
+).get
 const wasmMemoryBuffer = Object.getOwnPropertyDescriptor(WebAssembly.Memory.prototype, 'buffer').get
+const SafeString = String
 
 function isSharedArrayBuffer (value) {
   if (!sharedByteLength || value === null || typeof value !== 'object') return false
@@ -130,6 +145,75 @@ function getWasmMemoryBuffer (value) {
   } catch {
     return undefined
   }
+}
+
+function unsupportedProtocolValue (label) {
+  throw new TypeError(`${label} contains an unsupported value`)
+}
+
+function assertNoOwnProperties (value, label) {
+  if (reflectOwnKeys(value).length !== 0) unsupportedProtocolValue(label)
+}
+
+function assertCanonicalRegExpProperties (value, label) {
+  const descriptors = reflectApply(objectGetOwnPropertyDescriptors, Object, [value])
+  const keys = reflectOwnKeys(value)
+  if (keys.length !== 1 || keys[0] !== 'lastIndex') unsupportedProtocolValue(label)
+  const descriptor = descriptors.lastIndex
+  if (!descriptor || !('value' in descriptor) ||
+      typeof descriptor.value !== 'number' ||
+      !reflectApply(numberIsSafeInteger, Number, [descriptor.value]) ||
+      descriptor.value < 0 || descriptor.enumerable || descriptor.configurable ||
+      descriptor.writable !== true) {
+    unsupportedProtocolValue(label)
+  }
+}
+
+function traversalLimitError (label, maxBytes, budgetName) {
+  throw new RangeError(`${label} exceeds ${budgetName} (${maxBytes})`)
+}
+
+function assertArrayBufferWithinBudget (buffer, label, maxBytes, budgetName) {
+  if (maxBytes !== undefined &&
+      reflectApply(arrayBufferByteLength, buffer, []) > maxBytes) {
+    traversalLimitError(label, maxBytes, budgetName)
+  }
+}
+
+function assertViewWithinBudget (value, label, maxBytes, budgetName) {
+  if (maxBytes === undefined) return
+  const byteLength = objectGetPrototypeOf(value) === dataViewPrototype
+    ? reflectApply(dataViewByteLength, value, [])
+    : reflectApply(typedArrayByteLength, value, [])
+  if (byteLength > maxBytes) traversalLimitError(label, maxBytes, budgetName)
+  const buffer = getViewBuffer(value)
+  if (!isSharedArrayBuffer(buffer)) {
+    assertArrayBufferWithinBudget(buffer, label, maxBytes, budgetName)
+  }
+}
+
+function assertCanonicalViewProperties (value, label) {
+  const prototype = objectGetPrototypeOf(value)
+  if (prototype === dataViewPrototype) {
+    assertNoOwnProperties(value, label)
+    return
+  }
+  const length = reflectApply(typedArrayLength, value, [])
+  const descriptors = reflectApply(objectGetOwnPropertyDescriptors, Object, [value])
+  const keys = reflectOwnKeys(value)
+  for (let index = 0; index < keys.length; index++) {
+    const key = keys[index]
+    if (typeof key !== 'string') unsupportedProtocolValue(label)
+    const numeric = +key
+    const descriptor = descriptors[key]
+    if (!reflectApply(numberIsSafeInteger, Number, [numeric]) || numeric < 0 ||
+        numeric >= length || SafeString(numeric) !== key || !descriptor ||
+        !('value' in descriptor) || descriptor.writable !== true ||
+        descriptor.enumerable !== true || descriptor.configurable !== true) {
+      unsupportedProtocolValue(label)
+    }
+  }
+  if (keys.length !== length) unsupportedProtocolValue(label)
 }
 
 export class UntrustedCodeError extends SafeError {
@@ -175,14 +259,24 @@ export function sanitizeEnvironment (environment = {}) {
   return sanitized
 }
 
-export function cloneWithoutSharedMemory (value, label) {
-  assertSupportedProtocolSource(value, label)
+export function cloneWithoutSharedMemory (
+  value,
+  label,
+  maxBytes,
+  budgetName = 'maxMessageBytes'
+) {
+  assertSupportedProtocolSource(value, label, maxBytes, budgetName)
   const cloned = safeStructuredClone(value)
-  assertNoSharedMemory(cloned, label)
+  assertSupportedProtocolSource(cloned, label, maxBytes, budgetName)
   return cloned
 }
 
-export function assertSupportedProtocolSource (value, label) {
+export function assertSupportedProtocolSource (
+  value,
+  label,
+  maxBytes,
+  budgetName = 'maxMessageBytes'
+) {
   const pending = [value]
   const seen = new SafeWeakSet()
   while (pending.length > 0) {
@@ -191,7 +285,9 @@ export function assertSupportedProtocolSource (value, label) {
     const kind = typeof current
     if (kind === 'string' || kind === 'boolean' || kind === 'number' ||
         kind === 'bigint' || kind === 'undefined') continue
-    if (kind !== 'object') throw new TypeError(`${label} contains an unsupported value`)
+    if (kind !== 'object' || safeIsProxy(current)) {
+      throw new TypeError(`${label} contains an unsupported value`)
+    }
     if (reflectApply(weakSetHas, seen, [current])) continue
     reflectApply(weakSetAdd, seen, [current])
 
@@ -214,6 +310,8 @@ export function assertSupportedProtocolSource (value, label) {
       if (objectGetPrototypeOf(current) !== arrayBufferPrototype) {
         throw new TypeError(`${label} contains an unsupported value`)
       }
+      assertArrayBufferWithinBudget(current, label, maxBytes, budgetName)
+      assertNoOwnProperties(current, label)
       continue
     }
     if (reflectApply(arrayBufferIsView, ArrayBuffer, [current])) {
@@ -223,6 +321,8 @@ export function assertSupportedProtocolSource (value, label) {
       if (!reflectApply(setHas, allowedViewPrototypes, [objectGetPrototypeOf(current)])) {
         throw new TypeError(`${label} contains an unsupported value`)
       }
+      assertViewWithinBudget(current, label, maxBytes, budgetName)
+      assertCanonicalViewProperties(current, label)
       continue
     }
     try {
@@ -235,6 +335,7 @@ export function assertSupportedProtocolSource (value, label) {
       if (objectGetPrototypeOf(current) !== datePrototype) {
         throw new TypeError(`${label} contains an unsupported value`)
       }
+      assertNoOwnProperties(current, label)
       continue
     }
     try {
@@ -247,6 +348,7 @@ export function assertSupportedProtocolSource (value, label) {
       if (objectGetPrototypeOf(current) !== regexpPrototype) {
         throw new TypeError(`${label} contains an unsupported value`)
       }
+      assertCanonicalRegExpProperties(current, label)
       continue
     }
 
@@ -258,6 +360,7 @@ export function assertSupportedProtocolSource (value, label) {
       if (objectGetPrototypeOf(current) !== mapPrototype) {
         throw new TypeError(`${label} contains an unsupported value`)
       }
+      assertNoOwnProperties(current, label)
       while (true) {
         const item = reflectApply(mapIteratorNext, iterator, [])
         if (item.done) break
@@ -274,6 +377,7 @@ export function assertSupportedProtocolSource (value, label) {
       if (objectGetPrototypeOf(current) !== setPrototype) {
         throw new TypeError(`${label} contains an unsupported value`)
       }
+      assertNoOwnProperties(current, label)
       while (true) {
         const item = reflectApply(setIteratorNext, iterator, [])
         if (item.done) break
@@ -303,131 +407,22 @@ export function assertSupportedProtocolSource (value, label) {
   }
 }
 
-export function assertNoSharedMemory (value, label) {
-  if (value === null || typeof value !== 'object') return
-
-  const pending = [value]
-  const seen = new SafeWeakSet()
-  while (pending.length > 0) {
-    const current = reflectApply(arrayPop, pending, [])
-    if (current === null || typeof current !== 'object') continue
-    if (reflectApply(weakSetHas, seen, [current])) continue
-    reflectApply(weakSetAdd, seen, [current])
-
-    if (isSharedArrayBuffer(current)) {
-      throw new TypeError(`${label} must not contain shared memory`)
-    }
-
-    const memoryBuffer = getWasmMemoryBuffer(current)
-    if (memoryBuffer !== undefined) {
-      reflectApply(arrayPush, pending, [memoryBuffer])
-      continue
-    }
-    if (reflectApply(arrayBufferIsView, ArrayBuffer, [current])) {
-      reflectApply(arrayPush, pending, [getViewBuffer(current)])
-      continue
-    }
-
-    let iterator
-    try {
-      iterator = reflectApply(mapEntries, current, [])
-    } catch {}
-    if (iterator) {
-      while (true) {
-        const item = reflectApply(mapIteratorNext, iterator, [])
-        if (item.done) break
-        reflectApply(arrayPush, pending, [item.value[0], item.value[1]])
-      }
-      continue
-    }
-
-    try {
-      iterator = reflectApply(setValues, current, [])
-    } catch {
-      iterator = undefined
-    }
-    if (iterator) {
-      while (true) {
-        const item = reflectApply(setIteratorNext, iterator, [])
-        if (item.done) break
-        reflectApply(arrayPush, pending, [item.value])
-      }
-      continue
-    }
-
-    const keys = reflectOwnKeys(current)
-    for (let index = 0; index < keys.length; index++) {
-      reflectApply(arrayPush, pending, [current[keys[index]]])
-    }
-  }
+export function assertNoSharedMemory (
+  value,
+  label,
+  maxBytes,
+  budgetName = 'maxMessageBytes'
+) {
+  assertSupportedProtocolSource(value, label, maxBytes, budgetName)
 }
 
-export function assertSupportedProtocolValue (value, label) {
-  const pending = [value]
-  const seen = new SafeWeakSet()
-  while (pending.length > 0) {
-    const current = reflectApply(arrayPop, pending, [])
-    if (current === null) continue
-    const kind = typeof current
-    if (kind === 'string' || kind === 'boolean' || kind === 'number' ||
-        kind === 'bigint' || kind === 'undefined') continue
-    if (kind !== 'object') throw new TypeError(`${label} contains an unsupported value`)
-    if (reflectApply(weakSetHas, seen, [current])) continue
-    reflectApply(weakSetAdd, seen, [current])
-
-    if (isSharedArrayBuffer(current)) throw new TypeError(`${label} contains an unsupported value`)
-    try {
-      reflectApply(arrayBufferByteLength, current, [])
-      continue
-    } catch {}
-    if (reflectApply(arrayBufferIsView, ArrayBuffer, [current])) continue
-    try {
-      reflectApply(dateTime, current, [])
-      continue
-    } catch {}
-    try {
-      reflectApply(regexpSource, current, [])
-      continue
-    } catch {}
-
-    let iterator
-    try {
-      iterator = reflectApply(mapEntries, current, [])
-    } catch {}
-    if (iterator) {
-      while (true) {
-        const item = reflectApply(mapIteratorNext, iterator, [])
-        if (item.done) break
-        reflectApply(arrayPush, pending, [item.value[0], item.value[1]])
-      }
-      continue
-    }
-    try {
-      iterator = reflectApply(setValues, current, [])
-    } catch {
-      iterator = undefined
-    }
-    if (iterator) {
-      while (true) {
-        const item = reflectApply(setIteratorNext, iterator, [])
-        if (item.done) break
-        reflectApply(arrayPush, pending, [item.value])
-      }
-      continue
-    }
-
-    const prototype = objectGetPrototypeOf(current)
-    if (!reflectApply(arrayIsArray, Array, [current]) &&
-        prototype !== objectPrototype && prototype !== null) {
-      throw new TypeError(`${label} contains an unsupported value`)
-    }
-    const keys = reflectOwnKeys(current)
-    for (let index = 0; index < keys.length; index++) {
-      const key = keys[index]
-      if (typeof key === 'symbol') throw new TypeError(`${label} contains an unsupported value`)
-      reflectApply(arrayPush, pending, [current[key]])
-    }
-  }
+export function assertSupportedProtocolValue (
+  value,
+  label,
+  maxBytes,
+  budgetName = 'maxMessageBytes'
+) {
+  assertSupportedProtocolSource(value, label, maxBytes, budgetName)
 }
 
 export function validatePositiveInteger (value, name) {

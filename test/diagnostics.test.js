@@ -63,6 +63,172 @@ test('async one-shot diagnostic callbacks settle before the result', async () =>
   )
 })
 
+test('persistent diagnostic chaining ignores poisoned promise species', async (t) => {
+  const originalConstructor = Object.getOwnPropertyDescriptor(
+    Promise.prototype,
+    'constructor'
+  )
+  const originalSpecies = Object.getOwnPropertyDescriptor(Promise, Symbol.species)
+  let restored = false
+  const restore = () => {
+    if (restored) return
+    restored = true
+    Object.defineProperty(Promise.prototype, 'constructor', originalConstructor)
+    Object.defineProperty(Promise, Symbol.species, originalSpecies)
+  }
+  t.after(restore)
+  const records = []
+  let retainedPromise
+  const session = createUntrustedWorker(`
+    onMessage(value => { console.log('diagnostic', value); return value })
+  `, {
+    ...SESSION_OPTIONS,
+    diagnostics: true,
+    onDiagnostic (record) {
+      records.push(record)
+      retainedPromise = new Promise(resolve => {
+        setImmediate(() => {
+          restore()
+          resolve()
+        })
+      })
+      return retainedPromise
+    }
+  })
+  await session.ready
+  class PoisonPromiseSpecies {
+    constructor () { throw new Error('poisoned promise species') }
+  }
+  Object.defineProperty(PoisonPromiseSpecies, Symbol.species, {
+    configurable: true,
+    value: PoisonPromiseSpecies
+  })
+  Object.defineProperty(Promise.prototype, 'constructor', {
+    configurable: true,
+    value: PoisonPromiseSpecies
+  })
+  Object.defineProperty(Promise, Symbol.species, {
+    configurable: true,
+    value: PoisonPromiseSpecies
+  })
+  assert.equal(await session.request(42), 42)
+  restore()
+  assert.equal(Object.hasOwn(retainedPromise, 'constructor'), false)
+  assert.deepEqual(records, [{ level: 'log', text: 'diagnostic 42' }])
+  await session.terminate()
+  await session.closed
+})
+
+test('frozen diagnostic Promise subclasses fail closed without invoking species', async (t) => {
+  let speciesReads = 0
+  let speciesConstructions = 0
+  class FrozenDiagnosticPromise extends Promise {}
+  Object.defineProperty(FrozenDiagnosticPromise, Symbol.species, {
+    configurable: true,
+    get () {
+      speciesReads++
+      return class BlockingPromiseSpecies {
+        constructor (executor) {
+          speciesConstructions++
+          executor(() => {}, () => {})
+        }
+      }
+    }
+  })
+  const unexpected = []
+  const onUnhandled = error => unexpected.push(error)
+  const onUncaught = error => unexpected.push(error)
+  process.on('unhandledRejection', onUnhandled)
+  process.on('uncaughtException', onUncaught)
+  t.after(() => {
+    process.off('unhandledRejection', onUnhandled)
+    process.off('uncaughtException', onUncaught)
+  })
+
+  const session = createUntrustedWorker(`
+    onMessage(value => { console.log('diagnostic', value); return value })
+  `, {
+    ...SESSION_OPTIONS,
+    messageTimeoutMs: 1_000,
+    diagnostics: true,
+    onDiagnostic () {
+      return Object.freeze(new FrozenDiagnosticPromise(resolve => resolve()))
+    }
+  })
+  session.on('error', () => {})
+  t.after(() => session.terminate().catch(() => {}))
+  await session.ready
+  const startedAt = Date.now()
+  await assert.rejects(session.request(42), /diagnostic callback/i)
+  assert.equal(Date.now() - startedAt < 4_000, true)
+  await session.closed
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(speciesReads, 0)
+  assert.equal(speciesConstructions, 0)
+  assert.deepEqual(unexpected, [])
+  assert.equal(await runUntrustedCode('return 46', { timeoutMs: 5_000 }), 46)
+})
+
+test('frozen diagnostic promises reject constructor accessors without invoking them', async (t) => {
+  let constructorReads = 0
+  let speciesReads = 0
+  let speciesConstructions = 0
+  class HostilePromise extends Promise {}
+  Object.defineProperty(HostilePromise, Symbol.species, {
+    get () {
+      speciesReads++
+      return class BlockingPromiseSpecies {
+        constructor (executor) {
+          speciesConstructions++
+          executor(() => {}, () => {})
+        }
+      }
+    }
+  })
+
+  const unexpected = []
+  const onUnhandled = error => unexpected.push(error)
+  const onUncaught = error => unexpected.push(error)
+  process.on('unhandledRejection', onUnhandled)
+  process.on('uncaughtException', onUncaught)
+  t.after(() => {
+    process.off('unhandledRejection', onUnhandled)
+    process.off('uncaughtException', onUncaught)
+  })
+
+  const session = createUntrustedWorker(`
+    onMessage(value => { console.log('diagnostic', value); return value })
+  `, {
+    ...SESSION_OPTIONS,
+    messageTimeoutMs: 1_000,
+    diagnostics: true,
+    onDiagnostic () {
+      const result = Promise.resolve()
+      Object.defineProperty(result, 'constructor', {
+        configurable: false,
+        get () {
+          constructorReads++
+          return constructorReads === 1 ? Promise : HostilePromise
+        }
+      })
+      return Object.freeze(result)
+    }
+  })
+  session.on('error', () => {})
+  t.after(() => session.terminate().catch(() => {}))
+  await session.ready
+  const startedAt = Date.now()
+  await assert.rejects(session.request(49), /diagnostic callback/i)
+  assert.equal(Date.now() - startedAt < 4_000, true)
+  await session.closed
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(constructorReads, 0)
+  assert.equal(speciesReads, 0)
+  assert.equal(speciesConstructions, 0)
+  assert.deepEqual(unexpected, [])
+  assert.equal(await runUntrustedCode('return 50', { timeoutMs: 5_000 }), 50)
+})
+
 test('diagnostic formatting does not invoke object properties', async () => {
   const records = []
   const value = await runUntrustedCode(`

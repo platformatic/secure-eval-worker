@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict'
 import { createHook } from 'node:async_hooks'
+import { execFile } from 'node:child_process'
 import { cp, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { pathToFileURL } from 'node:url'
+import { promisify } from 'node:util'
 import { Worker } from 'node:worker_threads'
 
 import {
@@ -14,6 +16,13 @@ import {
   runUntrustedCode,
   UntrustedWorkerSession
 } from '../src/index.js'
+
+const execFileAsync = promisify(execFile)
+const packageUrl = new URL('../src/index.js', import.meta.url).href
+const legacyAdmissionStateUrl = new URL(
+  '../fixtures/security/legacy-admission-state-v1.mjs',
+  import.meta.url
+).href
 
 const SESSION_OPTIONS = {
   startupTimeoutMs: 5_000,
@@ -215,6 +224,98 @@ test('post-spawn setup resists poisoned worker lifecycle methods', async () => {
   await replacement.closed
 })
 
+test('first post-spawn listener failure is bounded and failure-atomic', async () => {
+  const childSource = `
+    const fs = await import('node:fs/promises')
+    const { tmpdir } = await import('node:os')
+    const { join } = await import('node:path')
+    const root = await fs.mkdtemp(join(tmpdir(), 'secure-eval-listener-root-'))
+    const staging = await fs.mkdtemp(join(tmpdir(), 'secure-eval-listener-stage-'))
+    process.env.TEMP = staging
+    process.env.TMP = staging
+    process.env.TMPDIR = staging
+    await fs.writeFile(join(root, 'entry.mjs'), 'export default () => 42')
+    const unhandled = []
+    process.on('uncaughtException', error => unhandled.push(String(error)))
+    process.on('unhandledRejection', error => unhandled.push(String(error)))
+    const { EventEmitter } = await import('node:events')
+    const originalOn = EventEmitter.prototype.on
+    EventEmitter.prototype.on = function (...args) {
+      const stack = new Error().stack ?? ''
+      if (args[0] === 'exit' && !stack.includes('trustedWorkerOn')) {
+        throw new Error('listener setup failure')
+      }
+      return Reflect.apply(originalOn, this, args)
+    }
+    const api = await import(${JSON.stringify(packageUrl)})
+    const admission = await import(${JSON.stringify(new URL('../src/admission.js', import.meta.url).href)})
+    EventEmitter.prototype.on = originalOn
+    api.configureWorkerAdmission({ maxConcurrentWorkers: 1 })
+    const codes = []
+    let lifecycleMessage
+    let lifecycleCause
+    const session = api.createUntrustedWorker('', {
+      startupTimeoutMs: 5000,
+      messageTimeoutMs: 5000,
+      lifetimeTimeoutMs: 5000
+    })
+    session.on('exit', () => { throw new Error('throwing fallback exit listener') })
+    try {
+      await session.ready
+    } catch (error) {
+      codes.push(error.code ?? error.name)
+      lifecycleMessage = error.message
+      lifecycleCause = error.cause?.message
+    }
+    const termination = await session.terminate().then(
+      () => 'resolved',
+      error => error.code ?? error.name
+    )
+    const closedCode = (await session.closed).error?.code ?? null
+    try {
+      await api.runUntrustedCode('return 42', { timeoutMs: 5000 })
+    } catch (error) { codes.push(error.code ?? error.name) }
+    try {
+      await api.runUntrustedFile(join(root, 'entry.mjs'), {
+        rootDirectory: root,
+        timeoutMs: 5000
+      })
+    } catch (error) { codes.push(error.code ?? error.name) }
+    await new Promise(resolve => setTimeout(resolve, 100))
+    const snapshots = await fs.readdir(staging)
+    console.log(JSON.stringify({
+      codes,
+      termination,
+      closedCode,
+      lifecycleMessage,
+      lifecycleCause,
+      activeWorkers: admission.getWorkerAdmissionStatus().activeWorkers,
+      snapshots,
+      unhandled
+    }))
+    await fs.rm(root, { force: true, recursive: true })
+    await fs.rm(staging, { force: true, recursive: true })
+  `
+  const { stdout } = await execFileAsync(process.execPath, [
+    '--input-type=module',
+    '--eval',
+    childSource
+  ], { timeout: 20_000 })
+  const result = JSON.parse(stdout)
+  assert.deepEqual(result.codes, [
+    'ERR_UNTRUSTED_WORKER',
+    'ERR_UNTRUSTED_CODE_WORKER',
+    'ERR_UNTRUSTED_CODE_WORKER'
+  ])
+  assert.equal(result.termination, 'resolved')
+  assert.equal(result.closedCode, 'ERR_UNTRUSTED_WORKER')
+  assert.equal(result.lifecycleMessage, 'The worker exit lifecycle could not be observed')
+  assert.equal(result.lifecycleCause, 'listener setup failure')
+  assert.equal(result.activeWorkers, 0)
+  assert.deepEqual(result.snapshots, [])
+  assert.deepEqual(result.unhandled, [])
+})
+
 test('worker constructor failures release admission', async () => {
   configureWorkerAdmission({ maxConcurrentWorkers: 1 })
   let hook
@@ -266,6 +367,142 @@ test('physical package copies share process-wide admission', async (t) => {
   )
   await holder.terminate()
   assert.equal(await copy.runUntrustedCode('return 42', { timeoutMs: 5_000 }), 42)
+})
+
+test('legacy-first worker and preparation controllers preserve repeated lifecycle settlement', async () => {
+  const childSource = `
+    const { installLegacyAdmissionStateV1 } = await import(
+      ${JSON.stringify(legacyAdmissionStateUrl)}
+    )
+    installLegacyAdmissionStateV1()
+    const fs = await import('node:fs/promises')
+    const { tmpdir } = await import('node:os')
+    const { join } = await import('node:path')
+    const root = await fs.mkdtemp(join(tmpdir(), 'secure-eval-legacy-controller-root-'))
+    const staging = await fs.mkdtemp(join(tmpdir(), 'secure-eval-legacy-controller-stage-'))
+    process.env.TEMP = staging
+    process.env.TMP = staging
+    process.env.TMPDIR = staging
+    await fs.writeFile(join(root, 'entry.mjs'), 'export default input => input')
+    const api = await import(${JSON.stringify(packageUrl)})
+    const admission = await import(${JSON.stringify(new URL('../src/admission.js', import.meta.url).href)})
+    api.configureWorkerAdmission({ maxConcurrentWorkers: 1 })
+    const source = [
+      await api.runUntrustedCode('return input', { input: 40, timeoutMs: 5000 }),
+      await api.runUntrustedCode('return input', { input: 41, timeoutMs: 5000 })
+    ]
+    const local = [
+      await api.runUntrustedFile(join(root, 'entry.mjs'), {
+        rootDirectory: root,
+        input: 42,
+        timeoutMs: 5000
+      }),
+      await api.runUntrustedFile(join(root, 'entry.mjs'), {
+        rootDirectory: root,
+        input: 43,
+        timeoutMs: 5000
+      })
+    ]
+    const snapshots = await fs.readdir(staging)
+    console.log(JSON.stringify({
+      source,
+      local,
+      status: admission.getWorkerAdmissionStatus(),
+      snapshots
+    }))
+    await fs.rm(root, { force: true, recursive: true })
+    await fs.rm(staging, { force: true, recursive: true })
+  `
+  const { stdout } = await execFileAsync(process.execPath, [
+    '--input-type=module',
+    '--eval',
+    childSource
+  ], { timeout: 20_000 })
+  assert.deepEqual(JSON.parse(stdout), {
+    source: [40, 41],
+    local: [42, 43],
+    status: { maxConcurrentWorkers: 1, activeWorkers: 0 },
+    snapshots: []
+  })
+})
+
+test('malformed process-global admission controllers fail closed before caller metadata', async () => {
+  const validWorkerState = `Object.freeze({
+    acquire () { return () => {} },
+    configure (maxConcurrentWorkers) {
+      return Object.freeze({ maxConcurrentWorkers, activeWorkers: 0 })
+    },
+    status () { return Object.freeze({ maxConcurrentWorkers: 1, activeWorkers: 0 }) }
+  })`
+  const validPreparationState = `Object.freeze({
+    acquire () { return () => {} },
+    configure () {}
+  })`
+  const cases = [
+    {
+      worker: `Object.freeze({
+        acquire () { return undefined },
+        configure (maxConcurrentWorkers) {
+          return Object.freeze({ maxConcurrentWorkers, activeWorkers: 0 })
+        },
+        status () { return Object.freeze({ maxConcurrentWorkers: 1, activeWorkers: 0 }) }
+      })`,
+      preparation: validPreparationState
+    },
+    {
+      worker: `({
+        acquire () { return () => {} },
+        configure () {},
+        status () { return { maxConcurrentWorkers: 1, activeWorkers: 0 } }
+      })`,
+      preparation: validPreparationState
+    },
+    {
+      worker: validWorkerState,
+      preparation: `({ acquire () { return () => {} }, configure () {} })`
+    }
+  ]
+
+  for (const entry of cases) {
+    const childSource = `
+      Object.defineProperty(
+        globalThis,
+        Symbol.for('secure-eval-worker.admission.main.v1'),
+        { value: ${entry.worker} }
+      )
+      Object.defineProperty(
+        globalThis,
+        Symbol.for('secure-eval-worker.admission.preparation.main.v1'),
+        { value: ${entry.preparation} }
+      )
+      const api = await import(${JSON.stringify(packageUrl)})
+      let sourceCode
+      let fileCode
+      let reads = 0
+      try {
+        await api.runUntrustedCode('return 42', { timeoutMs: 100 })
+      } catch (error) { sourceCode = error.code }
+      const options = { timeoutMs: 100 }
+      Object.defineProperty(options, 'rootDirectory', {
+        enumerable: true,
+        get () { reads++; return '/unreachable' }
+      })
+      try {
+        await api.runUntrustedFile('/unreachable/entry.mjs', options)
+      } catch (error) { fileCode = error.code }
+      console.log(JSON.stringify({ sourceCode, fileCode, reads }))
+    `
+    const { stdout } = await execFileAsync(process.execPath, [
+      '--input-type=module',
+      '--eval',
+      childSource
+    ], { timeout: 10_000 })
+    assert.deepEqual(JSON.parse(stdout), {
+      sourceCode: 'ERR_UNTRUSTED_CODE_ADMISSION_UNAVAILABLE',
+      fileCode: 'ERR_UNTRUSTED_CODE_ADMISSION_UNAVAILABLE',
+      reads: 0
+    })
+  }
 })
 
 test('host worker threads fail closed instead of orphaning admission slots', async () => {

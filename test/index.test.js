@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
+import { createRequire, syncBuiltinESMExports } from 'node:module'
 import { test } from 'node:test'
 
 import {
@@ -12,6 +13,7 @@ import {
 import { assertSupportedRuntime } from '../src/internal.js'
 
 const packageUrl = new URL('../src/index.js', import.meta.url).href
+const require = createRequire(import.meta.url)
 
 test('rejects unsupported Node.js runtime versions', () => {
   assert.doesNotThrow(() => assertSupportedRuntime('26.5.1'))
@@ -37,6 +39,18 @@ test('one-shot settlement uses captured Promise chaining', async (t) => {
   configureWorkerAdmission({ maxConcurrentWorkers: 1 })
   t.after(() => configureWorkerAdmission({ maxConcurrentWorkers: 4 }))
   const originalThen = Promise.prototype.then
+  const originalConstructor = Object.getOwnPropertyDescriptor(
+    Promise.prototype,
+    'constructor'
+  )
+  const originalSpecies = Object.getOwnPropertyDescriptor(Promise, Symbol.species)
+  class PoisonPromiseSpecies {
+    constructor () { throw new Error('poisoned promise species') }
+  }
+  Object.defineProperty(PoisonPromiseSpecies, Symbol.species, {
+    configurable: true,
+    value: PoisonPromiseSpecies
+  })
   const never = new Promise(() => {})
   const unhandled = []
   const onUnhandled = (error) => unhandled.push(error)
@@ -46,25 +60,88 @@ test('one-shot settlement uses captured Promise chaining', async (t) => {
   let result
   try {
     Promise.prototype.then = () => never
+    Object.defineProperty(Promise.prototype, 'constructor', {
+      configurable: true,
+      value: PoisonPromiseSpecies
+    })
+    Object.defineProperty(Promise, Symbol.species, {
+      configurable: true,
+      value: PoisonPromiseSpecies
+    })
     result = runUntrustedCode('return 42', { timeoutMs: 5_000 })
   } finally {
     Promise.prototype.then = originalThen
+    Object.defineProperty(Promise.prototype, 'constructor', originalConstructor)
+    Object.defineProperty(Promise, Symbol.species, originalSpecies)
   }
   assert.equal(await result, 42)
 
   let rejection
   try {
     Promise.prototype.then = () => never
+    Object.defineProperty(Promise.prototype, 'constructor', {
+      configurable: true,
+      value: PoisonPromiseSpecies
+    })
+    Object.defineProperty(Promise, Symbol.species, {
+      configurable: true,
+      value: PoisonPromiseSpecies
+    })
     rejection = runUntrustedCode('throw new Error("expected startup failure")', {
       timeoutMs: 5_000
     })
   } finally {
     Promise.prototype.then = originalThen
+    Object.defineProperty(Promise.prototype, 'constructor', originalConstructor)
+    Object.defineProperty(Promise, Symbol.species, originalSpecies)
   }
   await assert.rejects(rejection, /expected startup failure/)
   await new Promise((resolve) => setImmediate(resolve))
   assert.deepEqual(unhandled, [])
   assert.equal(await runUntrustedCode('return 43', { timeoutMs: 5_000 }), 43)
+})
+
+test('guest result adoption preserves frozen promises and Promise subclasses', async () => {
+  const result = await runUntrustedCode(`
+    class ResultPromise extends Promise {}
+    const ordinary = (async () => {})()
+    let retained
+    retained = Object.freeze(new ResultPromise(resolve => {
+      setImmediate(() => resolve({
+        ordinaryInstanceOfPromise: ordinary instanceof Promise,
+        ordinaryConstructorMatches: ordinary.constructor === Promise,
+        ownConstructor: Object.hasOwn(retained, 'constructor'),
+        instanceOfPromise: retained instanceof Promise,
+        constructorMatches: retained.constructor === ResultPromise
+      }))
+    }))
+    return retained
+  `, { timeoutMs: 5_000 })
+  assert.deepEqual(result, {
+    ordinaryInstanceOfPromise: true,
+    ordinaryConstructorMatches: true,
+    ownConstructor: false,
+    instanceOfPromise: true,
+    constructorMatches: true
+  })
+})
+
+test('signal validation uses the captured AbortSignal brand', async () => {
+  const controller = new AbortController()
+  const OriginalAbortSignal = globalThis.AbortSignal
+  let execution
+  try {
+    globalThis.AbortSignal = class PoisonedAbortSignal {
+      static [Symbol.hasInstance] () { throw new Error('poisoned AbortSignal') }
+    }
+    execution = runUntrustedCode('return 42', {
+      signal: controller.signal,
+      timeoutMs: 5_000
+    })
+  } finally {
+    globalThis.AbortSignal = OriginalAbortSignal
+  }
+  assert.equal(await execution, 42)
 })
 
 test('createRunner snapshots reusable defaults and applies per-run overrides', async () => {
@@ -124,6 +201,202 @@ test('createRunner validates defaults and keeps input and signals per-run', asyn
   await assert.rejects(
     run('return input', { input: 42, signal: controller.signal }),
     (error) => error.name === 'AbortError' && error.cause === 'test'
+  )
+})
+
+test('rejects decorated branded protocol values without invoking accessors', async () => {
+  const factories = [
+    () => new ArrayBuffer(8),
+    () => new DataView(new ArrayBuffer(8)),
+    () => new Uint8Array(2),
+    () => Buffer.from([1, 2]),
+    () => new Date(0),
+    () => /value/gu,
+    () => new Map([['value', 1]]),
+    () => new Set([1])
+  ]
+  for (const factory of factories) {
+    let reads = 0
+    const value = factory()
+    Object.defineProperty(value, 'authority', {
+      enumerable: true,
+      get () {
+        reads++
+        return new SharedArrayBuffer(8)
+      }
+    })
+    await assert.rejects(
+      Promise.resolve().then(() => runUntrustedCode('return input', {
+        input: value,
+        timeoutMs: 5_000
+      })),
+      /unsupported value/
+    )
+    assert.equal(reads, 0)
+  }
+
+  const decoratedRegExp = /value/g
+  decoratedRegExp.lastIndex = new SharedArrayBuffer(8)
+  await assert.rejects(
+    Promise.resolve().then(() => runUntrustedCode('return input', {
+      input: decoratedRegExp,
+      timeoutMs: 5_000
+    })),
+    /unsupported value/
+  )
+
+  const constructors = [
+    'new ArrayBuffer(8)',
+    'new DataView(new ArrayBuffer(8))',
+    'new Uint8Array(2)',
+    'Buffer.from([1, 2])',
+    'new Date(0)',
+    '/value/gu',
+    "new Map([['value', 1]])",
+    'new Set([1])'
+  ]
+  for (const expression of constructors) {
+    await assert.rejects(
+      runUntrustedCode(`
+        const value = ${expression}
+        Object.defineProperty(value, 'authority', {
+          enumerable: true,
+          value: new SharedArrayBuffer(8)
+        })
+        return value
+      `, { timeoutMs: 5_000 }),
+      /(?:unsupported|not supported)/i
+    )
+  }
+})
+
+test('accepts genuine stateful RegExp values in both directions', async () => {
+  const input = /value/gy
+  input.lastIndex = 3
+  const result = await runUntrustedCode(`
+    const output = /answer/gy
+    output.lastIndex = 4
+    return {
+      input: { source: input.source, flags: input.flags, lastIndex: input.lastIndex },
+      output
+    }
+  `, { input, timeoutMs: 5_000 })
+  assert.equal(input.lastIndex, 3)
+  assert.deepEqual(result.input, { source: 'value', flags: 'gy', lastIndex: 0 })
+  assert.equal(result.output.source, 'answer')
+  assert.equal(result.output.flags, 'gy')
+  assert.equal(result.output.lastIndex, 0)
+})
+
+test('rejects protocol proxies before reflective traps run', async () => {
+  let prototypeReads = 0
+  let ownKeyReads = 0
+  const input = new Proxy({}, {
+    getPrototypeOf () { prototypeReads++; throw new Error('prototype trap') },
+    ownKeys () { ownKeyReads++; throw new Error('ownKeys trap') }
+  })
+  await assert.rejects(
+    Promise.resolve().then(() => runUntrustedCode('return input', {
+      input,
+      timeoutMs: 5_000
+    })),
+    /unsupported value/
+  )
+  assert.equal(prototypeReads, 0)
+  assert.equal(ownKeyReads, 0)
+  const workerResult = await runUntrustedCode(`
+    let prototypeReads = 0
+    let ownKeyReads = 0
+    const value = new Proxy({}, {
+      getPrototypeOf () { prototypeReads++; throw new Error('prototype trap') },
+      ownKeys () { ownKeyReads++; throw new Error('ownKeys trap') }
+    })
+    try { return value } catch {}
+  `, { timeoutMs: 5_000 }).then(
+    () => ({ accepted: true }),
+    error => ({ message: error.message })
+  )
+  assert.match(workerResult.message, /unsupported/i)
+})
+
+test('proxy rejection uses the captured util.types detector', async () => {
+  const utilTypes = require('node:util/types')
+  const original = Object.getOwnPropertyDescriptor(utilTypes, 'isProxy')
+  let prototypeReads = 0
+  let ownKeyReads = 0
+  const input = new Proxy({}, {
+    getPrototypeOf () { prototypeReads++; throw new Error('prototype trap') },
+    ownKeys () { ownKeyReads++; throw new Error('ownKeys trap') }
+  })
+  try {
+    Object.defineProperty(utilTypes, 'isProxy', {
+      ...original,
+      value: () => false
+    })
+    syncBuiltinESMExports()
+    await assert.rejects(
+      Promise.resolve().then(() => runUntrustedCode('return input', {
+        input,
+        timeoutMs: 5_000
+      })),
+      /unsupported value/
+    )
+  } finally {
+    Object.defineProperty(utilTypes, 'isProxy', original)
+    syncBuiltinESMExports()
+  }
+  assert.equal(prototypeReads, 0)
+  assert.equal(ownKeyReads, 0)
+})
+
+test('DataView validation uses captured host and worker prototypes', async () => {
+  const NativeDataView = globalThis.DataView
+  const input = new NativeDataView(Uint8Array.from([42]).buffer)
+  let execution
+  try {
+    globalThis.DataView = class PoisonedDataView {}
+    execution = runUntrustedCode('return input.getUint8(0)', {
+      input,
+      timeoutMs: 5_000
+    })
+  } finally {
+    globalThis.DataView = NativeDataView
+  }
+  assert.equal(await execution, 42)
+
+  const output = await runUntrustedCode(`
+    const NativeDataView = DataView
+    const value = new NativeDataView(Uint8Array.from([43]).buffer)
+    globalThis.DataView = class PoisonedDataView {}
+    return value
+  `, { timeoutMs: 5_000 })
+  assert.equal(output instanceof NativeDataView, true)
+  assert.equal(output.getUint8(0), 43)
+})
+
+test('rejects oversized views before enumerating indexed descriptors', async () => {
+  const value = new Uint8Array(1024 * 1024)
+  let getterReads = 0
+  Object.defineProperty(value, 'authority', {
+    enumerable: true,
+    get () { getterReads++; throw new Error('authority getter') }
+  })
+  await assert.rejects(
+    Promise.resolve().then(() => runUntrustedCode('return input', {
+      input: value,
+      maxInputBytes: 128,
+      timeoutMs: 5_000
+    })),
+    /maxInputBytes/
+  )
+  assert.equal(getterReads, 0)
+
+  await assert.rejects(
+    runUntrustedCode('return new Uint8Array(1024 * 1024)', {
+      maxMessageBytes: 1_000,
+      timeoutMs: 5_000
+    }),
+    /maxMessageBytes/
   )
 })
 
