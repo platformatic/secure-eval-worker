@@ -479,7 +479,14 @@ function toPath (value, name) {
 }
 
 function encodeFileUrlSegment (segment) {
-  return safeReflectApply(safeEncodeURIComponent, undefined, [segment])
+  const encoded = safeReflectApply(safeEncodeURIComponent, undefined, [segment])
+  // Node's pathToFileURL() additionally escapes literal tildes. Matching that
+  // canonical spelling keeps loader-generated stack URLs deterministic.
+  return safeReflectApply(
+    safeArrayJoin,
+    safeReflectApply(safeStringSplit, encoded, ['~']),
+    ['%7E']
+  )
 }
 
 function fileUrlHrefForPath (path) {

@@ -51,8 +51,8 @@ async function waitForFilePreparation (entryPath, rootDirectory) {
   }
 }
 
-async function fixture (files) {
-  const directory = await mkdtemp(join(tmpdir(), 'secure-eval-worker-files-'))
+async function fixture (files, prefix = 'secure-eval-worker-files-') {
+  const directory = await mkdtemp(join(tmpdir(), prefix))
   for (const [name, source] of Object.entries(files)) {
     const path = join(directory, name)
     await mkdir(new URL('.', pathToFileURL(path)), { recursive: true })
@@ -1616,7 +1616,7 @@ test('local module errors use virtual paths', async (t) => {
   const files = await fixture({
     'entry.mjs': "import './nested/failure.mjs'; export default () => 1",
     'nested/failure.mjs': "throw new Error('failure')"
-  })
+  }, 'secure-eval-worker~files-')
   t.after(() => files.cleanup())
 
   await assert.rejects(
