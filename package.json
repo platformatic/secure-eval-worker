@@ -27,6 +27,10 @@
     "measure:workers": "node --expose-gc scripts/measure-worker-overhead.js"
   },
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/platformatic/secure-eval-worker.git"
+  },
   "devDependencies": {
     "@types/node": "26.4.1",
     "typescript": "7.0.2"
