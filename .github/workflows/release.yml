@@ -1,0 +1,70 @@
+name: Publish release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'The version number to tag and release'
+        required: true
+        type: string
+      prerelease:
+        description: 'Release as pre-release'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  release-npm:
+    runs-on: ubuntu-latest
+    environment: main
+    permissions:
+      id-token: write
+      contents: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version-file: .nvmrc
+          registry-url: 'https://registry.npmjs.org'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Test
+        run: npm test
+
+      - name: Verify published TypeScript declarations
+        run: npm run test:types
+
+      - name: Verify package contents
+        run: npm run test:package
+
+      - name: Bump version
+        id: bump
+        run: node scripts/bump-version.js "$RELEASE_VERSION" "$GITHUB_ACTOR"
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+
+      - name: Update npm
+        run: npm install --global npm@11.16.0
+
+      - name: Publish to npm
+        run: npm publish --access public --tag ${{ inputs.prerelease == true && 'next' || 'latest' }} --provenance
+
+      - name: Push changes
+        run: git push origin HEAD:${{ github.ref }}
+
+      - name: Create release notes
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          npx --yes @matteo.collina/release-notes
+          -t v${{ steps.bump.outputs.version }}
+          -r secure-eval-worker
+          -o platformatic
+          ${{ inputs.prerelease == true && '-p' || '' }}
+          -c ${{ github.ref }}

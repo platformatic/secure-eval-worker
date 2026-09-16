@@ -12,6 +12,12 @@ Each worker starts with Node's Permission Model enabled. Source-string workers r
 - Node.js 26.5.1 through the current Node.js 26.x release (`process.permission.drop()` and security fixes in 26.5.1 are required). Unsupported runtimes fail closed during module initialization with `ERR_SECURE_EVAL_UNSUPPORTED_RUNTIME`. Future major releases require a new hardening review before support is declared.
 - No permission flags are required when the host uses Node's default mode. If the host itself runs with `--permission`, it must include `--allow-worker`. Path-based execution additionally requires host read permission for the entry/root and read/write permission for the operating-system temporary directory used to create and remove the private snapshot. Each sandbox worker is started with its own reviewed `execArgv`.
 
+## Installation
+
+```sh
+npm install secure-eval-worker
+```
+
 ## Usage
 
 ```js
@@ -296,3 +302,7 @@ npm run test:coverage
 npm run test:types
 npm run test:package
 ```
+
+## License
+
+[MIT](LICENSE)
