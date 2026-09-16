@@ -104,7 +104,7 @@ const safeStringSplit = String.prototype.split
 const safeStringPadStart = String.prototype.padStart
 const safeStringCharCodeAt = String.prototype.charCodeAt
 const safeNumberToString = Number.prototype.toString
-const safeEncodeURIComponent = globalThis.encodeURIComponent
+const safeEncodeURI = globalThis.encodeURI
 const safeTypedArrayByteLength = Object.getOwnPropertyDescriptor(
   Object.getPrototypeOf(Uint8Array.prototype),
   'byteLength'
@@ -479,9 +479,20 @@ function toPath (value, name) {
 }
 
 function encodeFileUrlSegment (segment) {
-  const encoded = safeReflectApply(safeEncodeURIComponent, undefined, [segment])
-  // Node's pathToFileURL() additionally escapes literal tildes. Matching that
-  // canonical spelling keeps loader-generated stack URLs deterministic.
+  // encodeURI preserves the URL path characters that Node's loader leaves
+  // literal. File URLs additionally require fragment/query delimiters and
+  // tildes to use the canonical pathToFileURL() spelling.
+  let encoded = safeReflectApply(safeEncodeURI, undefined, [segment])
+  encoded = safeReflectApply(
+    safeArrayJoin,
+    safeReflectApply(safeStringSplit, encoded, ['#']),
+    ['%23']
+  )
+  encoded = safeReflectApply(
+    safeArrayJoin,
+    safeReflectApply(safeStringSplit, encoded, ['?']),
+    ['%3F']
+  )
   return safeReflectApply(
     safeArrayJoin,
     safeReflectApply(safeStringSplit, encoded, ['~']),

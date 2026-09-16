@@ -984,12 +984,22 @@ test('handshake branding ignores poisoned MessagePort identity without uncaught 
   await replacement.terminate()
 })
 
-test('persistent runtime errors use stable guest filenames without bootstrap frames', async () => {
-  for (const [type, source, expected] of [
-    ['script', `const value = 1
-throw new Error('script location')`, /secure-eval-worker-component\.js:2:7/],
-    ['module', `const value = 1
-throw new Error('module location')`, /secure-eval-worker-component\.mjs:2:7/]
+test('persistent runtime errors preserve complete stacks with stable guest filenames', async () => {
+  for (const [type, source, expected, preservedFrame] of [
+    [
+      'script',
+      `const value = 1
+throw new Error('script location')`,
+      /secure-eval-worker-component\.js:2:7/,
+      /at trustedBootstrap \(\[worker eval\]:\d+:\d+\)/
+    ],
+    [
+      'module',
+      `const value = 1
+throw new Error('module location')`,
+      /secure-eval-worker-component\.mjs:2:7/,
+      /at ModuleJob\.run \(node:internal\/modules\/esm\/module_job:\d+:\d+\)/
+    ]
   ]) {
     const session = createUntrustedWorker(source, {
       type,
@@ -998,7 +1008,9 @@ throw new Error('module location')`, /secure-eval-worker-component\.mjs:2:7/]
     })
     await assert.rejects(session.ready, (error) => {
       assert.match(error.remoteStack, expected)
-      assert.doesNotMatch(error.remoteStack, /worker eval|trustedBootstrap|data:text/)
+      assert.match(error.remoteStack, preservedFrame)
+      assert.match(error.remoteStack, /node:internal\//)
+      assert.doesNotMatch(error.remoteStack, /data:text/)
       return true
     })
     await session.closed

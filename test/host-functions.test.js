@@ -764,6 +764,71 @@ test('host errors are redacted unless explicitly marked public', async () => {
   await session.terminate()
 })
 
+test('HostFunctionError serialization rejects accessor-backed disclosure without invoking it', async (t) => {
+  configureWorkerAdmission({ maxConcurrentWorkers: 1 })
+  t.after(() => configureWorkerAdmission({ maxConcurrentWorkers: 4 }))
+  const unhandled = []
+  const onUnhandled = (error) => { unhandled.push(error) }
+  process.on('unhandledRejection', onUnhandled)
+  t.after(() => process.off('unhandledRejection', onUnhandled))
+
+  let reads = 0
+  let session
+  const hostile = new HostFunctionError('Safe text', { code: 'SAFE_CODE' })
+  for (const name of ['message', 'code']) {
+    Object.defineProperty(hostile, name, {
+      configurable: true,
+      get () {
+        reads++
+        void session.request('ok').catch(() => {})
+        return `ACCESSOR_${name}`
+      }
+    })
+  }
+
+  session = createUntrustedWorker(`
+    onMessage(async value => {
+      if (value === 'fail') {
+        try { await tools.fail() } catch (error) {
+          return { message: error.message, code: error.code }
+        }
+      }
+      return tools.ok()
+    })
+  `, {
+    hostFunctions: {
+      tools: {
+        fail () { throw hostile },
+        ok () { return 'still running' }
+      }
+    },
+    startupTimeoutMs: 5_000,
+    messageTimeoutMs: 5_000,
+    lifetimeTimeoutMs: 5_000
+  })
+  await session.ready
+  assert.deepEqual(await session.request('fail'), {
+    message: 'Host function failed',
+    code: 'ERR_UNTRUSTED_WORKER_HOST_FUNCTION'
+  })
+  assert.equal(reads, 0)
+  assert.equal(await session.request('ok'), 'still running')
+  await session.terminate()
+  await session.closed
+
+  const replacement = createUntrustedWorker('onMessage(value => value)', {
+    startupTimeoutMs: 5_000,
+    messageTimeoutMs: 5_000,
+    lifetimeTimeoutMs: 5_000
+  })
+  await replacement.ready
+  assert.equal(await replacement.request(42), 42)
+  await replacement.terminate()
+  await replacement.closed
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.deepEqual(unhandled, [])
+})
+
 test('HostFunctionError validates canonical own options without invoking accessors', () => {
   const cause = new Error('trusted cause')
   const valid = new HostFunctionError('public', { code: 'PUBLIC', cause })

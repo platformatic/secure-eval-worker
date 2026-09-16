@@ -401,6 +401,7 @@ const SESSION_BOOTSTRAP = String.raw`
 const cryptoBuiltin = require('node:crypto')
 const { createHmac, randomBytes } = cryptoBuiltin
 const asyncHooksBuiltin = require('node:async_hooks')
+const childProcessBuiltin = require('node:child_process')
 const eventEmitterPrototype = require('node:events').EventEmitter.prototype
 const fsBuiltin = require('node:fs')
 const fsPromisesBuiltin = require('node:fs/promises')
@@ -415,6 +416,8 @@ const httpsGlobalAgent = httpsBuiltin.globalAgent
 const moduleBuiltin = require('node:module')
 const netBuiltin = require('node:net')
 const osBuiltin = require('node:os')
+const perfHooksBuiltin = require('node:perf_hooks')
+const performanceBuiltin = perfHooksBuiltin.performance
 const processBuiltin = require('node:process')
 const seaBuiltin = require('node:sea')
 const sqliteBuiltin = require('node:sqlite')
@@ -450,6 +453,8 @@ const safeV8Deserialize = v8Deserialize
 const safeV8Serialize = v8Serialize
 const reflectApply = Reflect.apply
 const reflectDeleteProperty = Reflect.deleteProperty
+const performanceNow = performanceBuiltin.now
+const performanceBaseline = reflectApply(performanceNow, performanceBuiltin, [])
 const safeAtomics = Atomics
 const hostAtomicsCompareExchange = Atomics.compareExchange
 const SafePromise = Promise
@@ -525,6 +530,59 @@ const objectGetOwnPropertyDescriptors = Object.getOwnPropertyDescriptors
 const objectHasOwn = Object.hasOwn
 const objectIsExtensible = Object.isExtensible
 const objectPrototype = Object.prototype
+const eventConstructorDescriptor = objectGetOwnPropertyDescriptor(globalThis, 'Event')
+if (!eventConstructorDescriptor ||
+    !reflectApply(objectHasOwn, undefined, [eventConstructorDescriptor, 'value']) ||
+    typeof eventConstructorDescriptor.value !== 'function') {
+  throw new SafeError('Failed to capture global Event constructor')
+}
+const eventConstructor = eventConstructorDescriptor.value
+const eventPrototypeDescriptor = objectGetOwnPropertyDescriptor(eventConstructor, 'prototype')
+if (!eventPrototypeDescriptor ||
+    !reflectApply(objectHasOwn, undefined, [eventPrototypeDescriptor, 'value']) ||
+    eventPrototypeDescriptor.value === null ||
+    typeof eventPrototypeDescriptor.value !== 'object' ||
+    eventPrototypeDescriptor.writable !== false ||
+    eventPrototypeDescriptor.configurable !== false ||
+    objectGetPrototypeOf(eventPrototypeDescriptor.value) !== objectPrototype) {
+  throw new SafeError('Failed to capture canonical Event prototype')
+}
+const eventPrototype = eventPrototypeDescriptor.value
+const eventTimeStampDescriptor = objectGetOwnPropertyDescriptor(eventPrototype, 'timeStamp')
+if (!eventTimeStampDescriptor ||
+    !reflectApply(objectHasOwn, undefined, [eventTimeStampDescriptor, 'get']) ||
+    typeof eventTimeStampDescriptor.get !== 'function' ||
+    eventTimeStampDescriptor.set !== undefined ||
+    eventTimeStampDescriptor.configurable !== true ||
+    eventTimeStampDescriptor.enumerable !== true) {
+  throw new SafeError('Failed to capture canonical Event timestamp getter')
+}
+const eventTimeStampGet = eventTimeStampDescriptor.get
+const performanceConstructorNames = objectFreeze([
+  'Performance',
+  'PerformanceEntry',
+  'PerformanceMark',
+  'PerformanceMeasure',
+  'PerformanceObserver',
+  'PerformanceObserverEntryList',
+  'PerformanceResourceTiming'
+])
+const originalPerformanceConstructors = objectCreate(null)
+for (let index = 0; index < performanceConstructorNames.length; index++) {
+  const name = performanceConstructorNames[index]
+  const descriptor = objectGetOwnPropertyDescriptor(globalThis, name)
+  if (!descriptor || !reflectApply(objectHasOwn, undefined, [descriptor, 'value']) ||
+      typeof descriptor.value !== 'function' || descriptor.value !== perfHooksBuiltin[name]) {
+    throw new SafeError('Failed to capture global performance constructor ' + name)
+  }
+  objectDefineProperty(originalPerformanceConstructors, name, {
+    configurable: false,
+    enumerable: true,
+    value: descriptor.value,
+    writable: false
+  })
+}
+objectFreeze(originalPerformanceConstructors)
 const moduleLocationReplacements = workerData.localModule
   ? workerData.localModule.locationReplacements
   : undefined
@@ -1194,6 +1252,7 @@ function hardenDangerousBuiltins() {
   // surface. File-module workers retain only path-based synchronous readers
   // needed by Node's loader; the permission root confines those reads.
   denyFunctions(asyncHooksBuiltin, 'node:async_hooks')
+  denyFunctions(childProcessBuiltin, 'node:child_process')
   if (workerData.localModule) hardenFileSystemForModuleLoading()
   else {
     denyFunctions(fsBuiltin, 'node:fs')
@@ -1213,6 +1272,8 @@ function hardenDangerousBuiltins() {
   if (traceEventsBuiltin) denyFunctions(traceEventsBuiltin, 'node:trace_events')
   if (quicBuiltin) denyFunctions(quicBuiltin, 'node:quic')
   replaceProperty(cryptoBuiltin, 'setEngine', () => sandboxDenied('node:crypto.setEngine'))
+  replaceProperty(cryptoBuiltin, 'setFips', () => sandboxDenied('node:crypto.setFips'))
+  replaceProperty(cryptoBuiltin, 'secureHeapUsed', () => sandboxDenied('node:crypto.secureHeapUsed'))
   for (const builtin of networkAliasBuiltins) {
     denyFunctions(builtin, 'internal network builtin')
   }
@@ -1317,6 +1378,7 @@ function hardenDangerousBuiltins() {
   for (const name of ['binding', '_linkedBinding', 'dlopen']) {
     replaceProperty(processBuiltin, name, () => sandboxDenied('process.' + name))
   }
+  replaceProperty(processBuiltin, 'hrtime', () => sandboxDenied('process.hrtime'))
   replaceProperty(processBuiltin, 'kill', () => sandboxDenied('process.kill'))
   replaceProperty(processBuiltin, '_kill', () => sandboxDenied('process._kill'))
   replaceProperty(processBuiltin, '_debugProcess', () => sandboxDenied('process._debugProcess'))
@@ -1330,6 +1392,72 @@ function hardenDangerousBuiltins() {
   replaceProperty(processBuiltin, 'report', objectFreeze(deniedReport))
 
   denyFunctions(osBuiltin, 'node:os')
+
+  const virtualPerformance = objectCreate(null)
+  objectDefineProperty(virtualPerformance, 'now', {
+    configurable: false,
+    enumerable: true,
+    value: () => reflectApply(performanceNow, performanceBuiltin, []) - performanceBaseline,
+    writable: false
+  })
+  objectDefineProperty(virtualPerformance, 'timeOrigin', {
+    configurable: false,
+    enumerable: true,
+    value: 0,
+    writable: false
+  })
+  objectDefineProperty(virtualPerformance, 'nodeTiming', {
+    configurable: false,
+    enumerable: true,
+    value: null,
+    writable: false
+  })
+  objectFreeze(virtualPerformance)
+  replaceAndVerifyDataProperty(perfHooksBuiltin, 'performance', virtualPerformance)
+  replaceAndVerifyDataProperty(globalThis, 'performance', virtualPerformance)
+
+  const workerRelativeEventTimeStamp = function workerRelativeEventTimeStamp () {
+    const originalTimeStamp = reflectApply(eventTimeStampGet, this, [])
+    const relativeTimeStamp = originalTimeStamp - performanceBaseline
+    return relativeTimeStamp >= 0 ? relativeTimeStamp : 0
+  }
+  objectDefineProperty(eventPrototype, 'timeStamp', {
+    configurable: false,
+    enumerable: true,
+    get: workerRelativeEventTimeStamp,
+    set: undefined
+  })
+  const hardenedEventTimeStampDescriptor = objectGetOwnPropertyDescriptor(
+    eventPrototype,
+    'timeStamp'
+  )
+  if (!hardenedEventTimeStampDescriptor ||
+      hardenedEventTimeStampDescriptor.get !== workerRelativeEventTimeStamp ||
+      hardenedEventTimeStampDescriptor.set !== undefined ||
+      hardenedEventTimeStampDescriptor.configurable !== false ||
+      hardenedEventTimeStampDescriptor.enumerable !== true) {
+    throw new SafeError('Failed to virtualize Event timestamps')
+  }
+
+  denyFunctions(perfHooksBuiltin, 'node:perf_hooks')
+  for (let index = 0; index < performanceConstructorNames.length; index++) {
+    const name = performanceConstructorNames[index]
+    const replacement = perfHooksBuiltin[name]
+    if (typeof replacement !== 'function' ||
+        replacement === originalPerformanceConstructors[name]) {
+      throw new SafeError('Failed to deny performance constructor ' + name)
+    }
+    const prototypeDescriptor = objectGetOwnPropertyDescriptor(replacement, 'prototype')
+    if (!prototypeDescriptor ||
+        !reflectApply(objectHasOwn, undefined, [prototypeDescriptor, 'value']) ||
+        prototypeDescriptor.value === null || typeof prototypeDescriptor.value !== 'object') {
+      throw new SafeError('Failed to isolate performance constructor ' + name)
+    }
+    objectFreeze(prototypeDescriptor.value)
+    objectFreeze(replacement)
+    replaceAndVerifyDataProperty(globalThis, name, replacement)
+  }
+
   // Keep the protocol's previously captured serializer functions private and
   // deny the complete guest-facing V8 module so new profiling, snapshot, or
   // object-query APIs cannot bypass an incomplete name list. V8 also exposes
@@ -1696,9 +1824,28 @@ function virtualizeModuleLocations(value) {
   return result
 }
 
-function normalizedGuestStack(stack, name, message) {
+function normalizedGuestStack(stack) {
   if (typeof stack !== 'string') return undefined
-  const lines = reflectApply(stringSplit, reflectApply(stringSlice, stack, [0, 8_192]), ['\n'])
+  let boundedStack = reflectApply(stringSlice, stack, [0, 8_192])
+  if (workerData.localModule && stack.length > boundedStack.length) {
+    // Never cut through a private staging location before replacing it. A
+    // partial prefix would not match virtualizeModuleLocations() and could
+    // disclose the randomized snapshot path at the diagnostic size boundary.
+    for (let index = 0; index < moduleLocationReplacements.length; index++) {
+      const location = moduleLocationReplacements[index][0]
+      const maximumOverlap = location.length - 1 < boundedStack.length
+        ? location.length - 1
+        : boundedStack.length
+      for (let overlap = maximumOverlap; overlap > 0; overlap--) {
+        if (reflectApply(stringSlice, boundedStack, [-overlap]) ===
+            reflectApply(stringSlice, location, [0, overlap])) {
+          boundedStack = reflectApply(stringSlice, boundedStack, [0, -overlap])
+          break
+        }
+      }
+    }
+  }
+  const lines = reflectApply(stringSplit, boundedStack, ['\n'])
   const markers = [
     ['secure-eval-worker-one-shot.js:', 3],
     ['secure-eval-worker-component.js:', 3],
@@ -1710,7 +1857,7 @@ function normalizedGuestStack(stack, name, message) {
     ['secure-eval-worker-component.syntax.js:', 1],
     ['secure-eval-worker-component.syntax.mjs:', 0]
   ]
-  let result = sanitizeDiagnosticText(name) + ': ' + sanitizeDiagnosticText(message)
+  let result = ''
   for (let index = 0; index < lines.length; index++) {
     let line = virtualizeModuleLocations(lines[index])
     let selectedMarker
@@ -1729,20 +1876,22 @@ function normalizedGuestStack(stack, name, message) {
         break
       }
     }
-    if (!selectedMarker) continue
-    const lineStart = markerIndex + selectedMarker[0].length
-    const separatorIndex = reflectApply(stringIndexOf, line, [':', lineStart])
-    const lineEnd = separatorIndex < 0 ? line.length : separatorIndex
-    if (selectedMarker[1] > 0 && lineEnd > lineStart) {
-      const sourceLine = SafeNumber(reflectApply(stringSlice, line, [lineStart, lineEnd]))
-      if (reflectApply(numberIsSafeInteger, SafeNumber, [sourceLine]) &&
-          sourceLine > selectedMarker[1]) {
-        line = reflectApply(stringSlice, line, [0, lineStart]) +
-          SafeString(sourceLine - selectedMarker[1]) +
-          reflectApply(stringSlice, line, [lineEnd])
+    if (selectedMarker) {
+      const lineStart = markerIndex + selectedMarker[0].length
+      const separatorIndex = reflectApply(stringIndexOf, line, [':', lineStart])
+      const lineEnd = separatorIndex < 0 ? line.length : separatorIndex
+      if (selectedMarker[1] > 0 && lineEnd > lineStart) {
+        const sourceLine = SafeNumber(reflectApply(stringSlice, line, [lineStart, lineEnd]))
+        if (reflectApply(numberIsSafeInteger, SafeNumber, [sourceLine]) &&
+            sourceLine > selectedMarker[1]) {
+          line = reflectApply(stringSlice, line, [0, lineStart]) +
+            SafeString(sourceLine - selectedMarker[1]) +
+            reflectApply(stringSlice, line, [lineEnd])
+        }
       }
     }
-    result += '\n' + sanitizeDiagnosticText(line)
+    if (index > 0) result += '\n'
+    result += sanitizeDiagnosticText(line)
   }
   return result
 }
@@ -1769,7 +1918,7 @@ function cloneError(error) {
       return {
         name,
         message,
-        stack: normalizedGuestStack(error.stack, name, message),
+        stack: normalizedGuestStack(error.stack),
         code: code === undefined ? undefined : sanitizeDiagnosticText(code)
       }
     }
@@ -3494,14 +3643,26 @@ function assertProtocolSerializable (value, label) {
 function serializeHostError (error) {
   try {
     if (isPublicHostFunctionError(error)) {
-      return {
-        name: 'HostFunctionError',
-        message: typeof error.message === 'string'
-          ? hostReflectApply(hostStringSlice, error.message, [0, 8_192])
-          : 'Host function failed',
-        code: typeof error.code === 'string'
-          ? hostReflectApply(hostStringSlice, error.code, [0, 8_192])
-          : 'ERR_HOST_FUNCTION'
+      const messageDescriptor = hostReflectApply(
+        hostObjectGetOwnPropertyDescriptor,
+        undefined,
+        [error, 'message']
+      )
+      const codeDescriptor = hostReflectApply(
+        hostObjectGetOwnPropertyDescriptor,
+        undefined,
+        [error, 'code']
+      )
+      if (messageDescriptor && codeDescriptor &&
+          hostReflectApply(hostObjectHasOwn, undefined, [messageDescriptor, 'value']) &&
+          hostReflectApply(hostObjectHasOwn, undefined, [codeDescriptor, 'value']) &&
+          typeof messageDescriptor.value === 'string' &&
+          typeof codeDescriptor.value === 'string') {
+        return {
+          name: 'HostFunctionError',
+          message: hostReflectApply(hostStringSlice, messageDescriptor.value, [0, 8_192]),
+          code: hostReflectApply(hostStringSlice, codeDescriptor.value, [0, 8_192])
+        }
       }
     }
   } catch {}

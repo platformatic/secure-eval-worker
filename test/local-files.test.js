@@ -51,8 +51,8 @@ async function waitForFilePreparation (entryPath, rootDirectory) {
   }
 }
 
-async function fixture (files, prefix = 'secure-eval-worker-files-') {
-  const directory = await mkdtemp(join(tmpdir(), prefix))
+async function fixture (files) {
+  const directory = await mkdtemp(join(tmpdir(), 'secure-eval-worker-files-'))
   for (const [name, source] of Object.entries(files)) {
     const path = join(directory, name)
     await mkdir(new URL('.', pathToFileURL(path)), { recursive: true })
@@ -95,6 +95,83 @@ test('local file URLs preserve encoded path bytes and trailing root separators',
     rootDirectory: files.directory + sep,
     timeoutMs: 5_000
   }), 42)
+})
+
+test('staging file URLs remain canonical under special-character temporary roots', async (t) => {
+  const files = await fixture({
+    'entry.mjs': "import './nested/failure.mjs'; export default () => 1",
+    'missing.mjs': "import './nested/absent.mjs'; export default () => 1",
+    'nested/failure.mjs': "throw new Error('failure')"
+  })
+  const specialSegment = platform() === 'win32'
+    ? "secure-eval-worker $&'+,;=@[]^{}~#%-"
+    : "secure-eval-worker $&'+,:;=@[]^{}~#?%-"
+  const temporaryParent = await mkdtemp(join(tmpdir(), 'secure-eval-worker-special-root-'))
+  const stagingBase = join(temporaryParent, specialSegment)
+  t.after(async () => {
+    await files.cleanup()
+    await rm(temporaryParent, { force: true, recursive: true })
+  })
+  await mkdir(stagingBase, { recursive: true })
+  const localFilesUrl = new URL('../src/local-files.js', import.meta.url).href
+  const packageUrl = new URL('../src/index.js', import.meta.url).href
+  const childSource = `
+    import assert from 'node:assert/strict'
+    import { fileURLToPath, pathToFileURL } from 'node:url'
+    import { resolveLocalModule } from ${JSON.stringify(localFilesUrl)}
+    import { runUntrustedFile } from ${JSON.stringify(packageUrl)}
+    const stagingBase = ${JSON.stringify(stagingBase)}
+    const entry = ${JSON.stringify(files.path('entry.mjs'))}
+    const missing = ${JSON.stringify(files.path('missing.mjs'))}
+    const root = ${JSON.stringify(files.directory)}
+    const localModule = (await resolveLocalModule(entry, root, {
+      maxRootEntries: 16,
+      maxFileBytes: 1024,
+      maxTotalFileBytes: 4096
+    })).value
+    try {
+      assert.equal(localModule.rootPath.startsWith(stagingBase), true)
+      assert.equal(localModule.entryUrl, pathToFileURL(fileURLToPath(localModule.entryUrl)).href)
+      assert.equal(localModule.rootUrlPrefix, pathToFileURL(fileURLToPath(localModule.rootUrlPrefix)).href)
+    } finally {
+      await localModule.cleanup()
+    }
+    await assert.rejects(
+      runUntrustedFile(entry, { rootDirectory: root, timeoutMs: 5_000 }),
+      (error) => {
+        assert.match(error.remoteStack, /secure-eval-worker-files[\\\\/]nested[\\\\/]failure\\.mjs:1/)
+        assert.equal(error.message.includes(stagingBase), false)
+        assert.equal(error.remoteStack.includes(stagingBase), false)
+        assert.equal(error.remoteStack.includes('secure-eval-worker-modules-'), false)
+        return true
+      }
+    )
+    await assert.rejects(
+      runUntrustedFile(missing, { rootDirectory: root, timeoutMs: 5_000 }),
+      (error) => {
+        assert.match(error.message, /secure-eval-worker-files[\\\\/]nested[\\\\/]absent\\.mjs/)
+        assert.equal(error.message.includes(stagingBase), false)
+        assert.equal(error.remoteStack.includes(stagingBase), false)
+        assert.equal(error.remoteStack.includes('secure-eval-worker-modules-'), false)
+        return true
+      }
+    )
+    console.log('ok')
+  `
+  const environment = { ...process.env }
+  if (platform() === 'win32') {
+    environment.TEMP = stagingBase
+    environment.TMP = stagingBase
+  } else {
+    environment.TMPDIR = stagingBase
+  }
+  const { stdout, stderr } = await execFileAsync(
+    process.execPath,
+    ['--input-type=module', '--eval', childSource],
+    { encoding: 'utf8', env: environment, timeout: 30_000 }
+  )
+  assert.equal(stderr, '')
+  assert.equal(stdout.trim(), 'ok')
 })
 
 test('local file URLs preserve literal backslashes in any POSIX entry segment', async (t) => {
@@ -1616,7 +1693,7 @@ test('local module errors use virtual paths', async (t) => {
   const files = await fixture({
     'entry.mjs': "import './nested/failure.mjs'; export default () => 1",
     'nested/failure.mjs': "throw new Error('failure')"
-  }, 'secure-eval-worker~files-')
+  })
   t.after(() => files.cleanup())
 
   await assert.rejects(
@@ -1627,6 +1704,36 @@ test('local module errors use virtual paths', async (t) => {
     (error) => {
       assert.equal(error.remoteStack.includes(files.directory), false)
       assert.match(error.remoteStack, /secure-eval-worker-files\/nested\/failure\.mjs:1/)
+      return true
+    }
+  )
+})
+
+test('stack bounds cannot expose a partial private staging path', async (t) => {
+  const files = await fixture({
+    'entry.mjs': `
+      export default () => {
+        const privateRoot = new URL('.', import.meta.url).href
+        const retainedPrefixLength = Math.max(1, Math.floor(privateRoot.length / 2))
+        const fillerLength = 8192 - retainedPrefixLength
+        const error = new Error('boundary')
+        error.stack = 'x\\n'.repeat(Math.floor(fillerLength / 2)) +
+          (fillerLength % 2 === 0 ? '' : 'x') + privateRoot
+        throw error
+      }
+    `
+  })
+  t.after(() => files.cleanup())
+
+  await assert.rejects(
+    runUntrustedFile(files.path('entry.mjs'), {
+      rootDirectory: files.directory,
+      timeoutMs: 5_000
+    }),
+    (error) => {
+      assert.equal(error.remoteStack.includes(files.directory), false)
+      assert.equal(error.remoteStack.includes('secure-eval-worker-modules-'), false)
+      assert.equal(error.remoteStack.length < 8_192, true)
       return true
     }
   )

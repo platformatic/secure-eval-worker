@@ -222,6 +222,301 @@ for (const type of EXECUTION_TYPES) {
     ])
   })
 
+  test(`${type} denies child-process descriptor adoption through every alias`, async () => {
+    const result = await evaluateInGuest(type, `
+      const nodeNamespace = await import('node:child_process')
+      const nodeNamed = nodeNamespace._forkChild
+      const bareNamespace = await import('child_process')
+      const bareNamed = bareNamespace._forkChild
+      const module = await import('node:module')
+      const require = module.createRequire(process.execPath)
+      const commonJs = require('node:child_process')
+      const original = commonJs._forkChild
+      const replacement = () => 'REPLACED'
+      try { commonJs._forkChild = replacement } catch {}
+      const assignmentRejected = commonJs._forkChild === original
+      const deletionRejected = !Reflect.deleteProperty(commonJs, '_forkChild') &&
+        commonJs._forkChild === original
+      const definitionRejected = !Reflect.defineProperty(commonJs, '_forkChild', {
+        configurable: true,
+        value: replacement,
+        writable: true
+      }) && commonJs._forkChild === original
+      module.syncBuiltinESMExports()
+      const calls = [
+        nodeNamed,
+        nodeNamespace._forkChild,
+        nodeNamespace.default._forkChild,
+        bareNamed,
+        bareNamespace._forkChild,
+        bareNamespace.default._forkChild,
+        require('node:child_process')._forkChild,
+        require('child_process')._forkChild,
+        module.Module._load('node:child_process')._forkChild,
+        module.Module._load('child_process')._forkChild,
+        module.default._load('node:child_process')._forkChild,
+        module.default._load('child_process')._forkChild,
+        process.getBuiltinModule('node:child_process')._forkChild,
+        process.getBuiltinModule('child_process')._forkChild
+      ]
+      const before = [typeof process.send, typeof process.channel, typeof process.disconnect]
+      const codes = calls.map((call) => {
+        try {
+          call(0, 'advanced')
+          return 'ALLOWED'
+        } catch (error) {
+          return error.code
+        }
+      })
+      const descriptor = Object.getOwnPropertyDescriptor(commonJs, '_forkChild')
+      return {
+        before,
+        after: [typeof process.send, typeof process.channel, typeof process.disconnect],
+        codes,
+        immutable: assignmentRejected && deletionRejected && definitionRejected &&
+          descriptor.value === original && !descriptor.writable && !descriptor.configurable
+      }
+    `)
+    assert.deepEqual(result.before, Array(3).fill('undefined'))
+    assert.deepEqual(result.after, result.before)
+    assert.equal(result.immutable, true)
+    assert.deepEqual(result.codes, Array(14).fill('ERR_ACCESS_DENIED'))
+  })
+
+  test(`${type} exposes only a worker-relative virtual clock and denies performance constructors`, async () => {
+    const result = await evaluateInGuest(type, `
+      const perfNode = await import('node:perf_hooks')
+      const perfBare = await import('perf_hooks')
+      const cryptoNode = await import('node:crypto')
+      const cryptoBare = await import('crypto')
+      const processNode = await import('node:process')
+      const module = await import('node:module')
+      const require = module.createRequire(process.execPath)
+      const commonJsPerformance = require('node:perf_hooks')
+      const constructorNames = [
+        'Performance',
+        'PerformanceEntry',
+        'PerformanceMark',
+        'PerformanceMeasure',
+        'PerformanceObserver',
+        'PerformanceObserverEntryList',
+        'PerformanceResourceTiming'
+      ]
+      const replacement = function replacementPerformanceConstructor () {}
+      const constructorImmutability = []
+      for (const name of constructorNames) {
+        for (const target of [globalThis, commonJsPerformance]) {
+          const original = target[name]
+          try { target[name] = replacement } catch {}
+          const assignmentRejected = target[name] === original
+          const deletionRejected = !Reflect.deleteProperty(target, name) && target[name] === original
+          const definitionRejected = !Reflect.defineProperty(target, name, {
+            configurable: true,
+            value: replacement,
+            writable: true
+          }) && target[name] === original
+          const descriptor = Object.getOwnPropertyDescriptor(target, name)
+          constructorImmutability.push(
+            assignmentRejected && deletionRejected && definitionRejected &&
+            descriptor.value === original && !descriptor.writable && !descriptor.configurable
+          )
+        }
+      }
+      module.syncBuiltinESMExports()
+      const performanceAliases = [
+        perfNode,
+        perfNode.default,
+        perfBare,
+        perfBare.default,
+        require('node:perf_hooks'),
+        require('perf_hooks'),
+        module.Module._load('node:perf_hooks'),
+        module.Module._load('perf_hooks'),
+        module.default._load('node:perf_hooks'),
+        module.default._load('perf_hooks'),
+        process.getBuiltinModule('node:perf_hooks'),
+        process.getBuiltinModule('perf_hooks')
+      ]
+      const performanceObjects = [
+        globalThis.performance,
+        ...performanceAliases.map((alias) => alias.performance)
+      ]
+      const clocks = performanceObjects.map((clock) => ({
+        now: clock.now(),
+        timeOrigin: clock.timeOrigin,
+        nodeTiming: clock.nodeTiming
+      }))
+      const clock = globalThis.performance
+      const originalNow = clock.now
+      try { clock.now = replacement } catch {}
+      const clockAssignmentRejected = clock.now === originalNow
+      const clockDeletionRejected = !Reflect.deleteProperty(clock, 'now') && clock.now === originalNow
+      const clockDefinitionRejected = !Reflect.defineProperty(clock, 'now', {
+        configurable: true,
+        value: replacement,
+        writable: true
+      }) && clock.now === originalNow
+      const constructorCodes = []
+      const aliasesShareDeniedConstructors = []
+      const prototypesAreDetached = []
+      const dangerousPrototypeNames = [
+        'now', 'timeOrigin', 'nodeTiming', 'startTime', 'duration', 'detail',
+        'observe', 'disconnect', 'takeRecords', 'getEntries', 'getEntriesByName',
+        'getEntriesByType'
+      ]
+      for (const name of constructorNames) {
+        const constructors = [globalThis[name], ...performanceAliases.map((alias) => alias[name])]
+        aliasesShareDeniedConstructors.push(constructors.every((value) => value === constructors[0]))
+        prototypesAreDetached.push(constructors.every((Constructor) =>
+          Object.isFrozen(Constructor) && Object.isFrozen(Constructor.prototype) &&
+          Object.getPrototypeOf(Constructor.prototype) === Object.prototype &&
+          dangerousPrototypeNames.every((property) => !(property in Constructor.prototype))
+        ))
+        for (const Constructor of constructors) {
+          try {
+            Reflect.construct(Constructor, name === 'PerformanceObserver' ? [() => {}] : ['entry'])
+            constructorCodes.push('ALLOWED')
+          } catch (error) {
+            constructorCodes.push(error.code)
+          }
+        }
+      }
+      const calls = [
+        perfNode.monitorEventLoopDelay,
+        perfNode.default.monitorEventLoopDelay,
+        perfBare.monitorEventLoopDelay,
+        perfBare.default.monitorEventLoopDelay,
+        require('node:perf_hooks').monitorEventLoopDelay,
+        require('perf_hooks').monitorEventLoopDelay,
+        module.Module._load('node:perf_hooks').monitorEventLoopDelay,
+        module.Module._load('perf_hooks').monitorEventLoopDelay,
+        module.default._load('node:perf_hooks').monitorEventLoopDelay,
+        module.default._load('perf_hooks').monitorEventLoopDelay,
+        process.getBuiltinModule('node:perf_hooks').monitorEventLoopDelay,
+        process.getBuiltinModule('perf_hooks').monitorEventLoopDelay,
+        cryptoNode.secureHeapUsed,
+        cryptoNode.default.secureHeapUsed,
+        cryptoBare.secureHeapUsed,
+        cryptoBare.default.secureHeapUsed,
+        require('node:crypto').secureHeapUsed,
+        require('crypto').secureHeapUsed,
+        module.Module._load('node:crypto').secureHeapUsed,
+        module.Module._load('crypto').secureHeapUsed,
+        process.getBuiltinModule('node:crypto').secureHeapUsed,
+        process.getBuiltinModule('crypto').secureHeapUsed,
+        process.hrtime,
+        processNode.hrtime,
+        processNode.default.hrtime,
+        require('node:process').hrtime,
+        module.Module._load('process').hrtime,
+        process.getBuiltinModule('node:process').hrtime
+      ]
+      const codes = calls.map((call) => {
+        try {
+          call()
+          return 'ALLOWED'
+        } catch (error) {
+          return error.code
+        }
+      })
+      const setFipsCodes = [
+        cryptoNode.setFips,
+        cryptoNode.default.setFips,
+        require('node:crypto').setFips,
+        module.Module._load('crypto').setFips,
+        process.getBuiltinModule('node:crypto').setFips
+      ].map((call) => {
+        try { call(1); return 'ALLOWED' } catch (error) { return error.code }
+      })
+      const eventPrototype = Event.prototype
+      const eventTimeStampDescriptor = Object.getOwnPropertyDescriptor(
+        eventPrototype,
+        'timeStamp'
+      )
+      const relativeEventTimeStampGet = eventTimeStampDescriptor.get
+      try {
+        Object.defineProperty(eventPrototype, 'timeStamp', {
+          configurable: true,
+          get: () => 123,
+          enumerable: true
+        })
+      } catch {}
+      const eventDefinitionRejected = Object.getOwnPropertyDescriptor(
+        eventPrototype,
+        'timeStamp'
+      ).get === relativeEventTimeStampGet
+      const eventDeletionRejected = !Reflect.deleteProperty(eventPrototype, 'timeStamp') &&
+        Object.getOwnPropertyDescriptor(eventPrototype, 'timeStamp').get ===
+          relativeEventTimeStampGet
+      try { eventPrototype.timeStamp = 123 } catch {}
+      const eventAssignmentRejected = Object.getOwnPropertyDescriptor(
+        eventPrototype,
+        'timeStamp'
+      ).get === relativeEventTimeStampGet
+      const eventConstructorNames = [
+        'Event',
+        'CustomEvent',
+        'MessageEvent',
+        'ErrorEvent',
+        'CloseEvent',
+        'ProgressEvent'
+      ].filter((name) => typeof globalThis[name] === 'function')
+      const eventTimeStamps = eventConstructorNames.map((name) => {
+        const event = new globalThis[name]('secure-eval-worker-event')
+        return {
+          direct: Reflect.apply(relativeEventTimeStampGet, event, []),
+          inherited: event.timeStamp,
+          name
+        }
+      })
+      return {
+        aliasesShareDeniedConstructors,
+        clockImmutable: Object.isFrozen(clock) && Object.getPrototypeOf(clock) === null &&
+          clockAssignmentRejected && clockDeletionRejected && clockDefinitionRejected,
+        clocks,
+        codes,
+        constructorCodes,
+        constructorImmutability,
+        eventTimeStampImmutable: eventAssignmentRejected && eventDeletionRejected &&
+          eventDefinitionRejected && eventTimeStampDescriptor.configurable === false &&
+          eventTimeStampDescriptor.enumerable === true &&
+          eventTimeStampDescriptor.set === undefined,
+        eventTimeStamps,
+        observerPathsAbsent: globalThis.PerformanceObserver.supportedEntryTypes === undefined &&
+          !('observe' in globalThis.PerformanceObserver.prototype),
+        performanceObjectsAreShared: performanceObjects.every((value) => value === clock),
+        prototypesAreDetached,
+        setFipsCodes
+      }
+    `)
+    assert.equal(result.performanceObjectsAreShared, true)
+    assert.equal(result.clockImmutable, true)
+    assert.equal(result.clocks.length, 13)
+    for (const clock of result.clocks) {
+      assert.equal(clock.timeOrigin, 0)
+      assert.equal(clock.nodeTiming, null)
+      assert.equal(Number.isFinite(clock.now), true)
+      assert.equal(clock.now >= 0 && clock.now < 5_000, true)
+    }
+    assert.deepEqual(result.aliasesShareDeniedConstructors, Array(7).fill(true))
+    assert.deepEqual(result.prototypesAreDetached, Array(7).fill(true))
+    assert.deepEqual(result.constructorImmutability, Array(14).fill(true))
+    assert.equal(result.eventTimeStampImmutable, true)
+    assert.deepEqual(
+      result.eventTimeStamps.slice(0, 3).map(({ name }) => name),
+      ['Event', 'CustomEvent', 'MessageEvent']
+    )
+    for (const { direct, inherited } of result.eventTimeStamps) {
+      assert.equal(direct, inherited)
+      assert.equal(Number.isFinite(inherited), true)
+      assert.equal(inherited >= 0 && inherited < 5_000, true)
+    }
+    assert.equal(result.observerPathsAbsent, true)
+    assert.deepEqual(result.constructorCodes, Array(91).fill('ERR_ACCESS_DENIED'))
+    assert.deepEqual(result.codes, Array(28).fill('ERR_ACCESS_DENIED'))
+    assert.deepEqual(result.setFipsCodes, Array(5).fill('ERR_ACCESS_DENIED'))
+  })
+
   test(`${type} cannot read host secrets from diagnostic reports`, async () => {
     const secretName = `SECURE_EVAL_REPORT_${randomUUID().replaceAll('-', '_')}`
     process.env[secretName] = 'diagnostic-report-secret'
@@ -461,6 +756,74 @@ for (const type of EXECUTION_TYPES) {
       (outcome.length > 0 && outcome.every(code => code === 'ERR_ACCESS_DENIED'))), true)
   })
 }
+
+test('denied child-process adoption leaves a known host descriptor intact', () => {
+  const moduleUrl = new URL('../src/index.js', import.meta.url).href
+  const childSource = `
+    import fs from 'node:fs'
+    import { runUntrustedCode } from ${JSON.stringify(moduleUrl)}
+    const before = [typeof process.send, typeof process.channel, typeof process.disconnect]
+    const result = await runUntrustedCode(\`
+      const nodeNamespace = await import('node:child_process')
+      const bareNamespace = await import('child_process')
+      const module = await import('node:module')
+      const require = module.createRequire(process.execPath)
+      const commonJs = require('node:child_process')
+      const original = commonJs._forkChild
+      const replacement = () => 'REPLACED'
+      try { commonJs._forkChild = replacement } catch {}
+      const assignmentRejected = commonJs._forkChild === original
+      const deletionRejected = !Reflect.deleteProperty(commonJs, '_forkChild') &&
+        commonJs._forkChild === original
+      const definitionRejected = !Reflect.defineProperty(commonJs, '_forkChild', {
+        configurable: true,
+        value: replacement,
+        writable: true
+      }) && commonJs._forkChild === original
+      module.syncBuiltinESMExports()
+      const calls = [
+        nodeNamespace._forkChild,
+        nodeNamespace.default._forkChild,
+        bareNamespace._forkChild,
+        bareNamespace.default._forkChild,
+        require('node:child_process')._forkChild,
+        require('child_process')._forkChild,
+        module.Module._load('node:child_process')._forkChild,
+        module.Module._load('child_process')._forkChild,
+        module.default._load('node:child_process')._forkChild,
+        module.default._load('child_process')._forkChild,
+        process.getBuiltinModule('node:child_process')._forkChild,
+        process.getBuiltinModule('child_process')._forkChild
+      ]
+      const codes = calls.map((call) => {
+        try { call(3, 'advanced'); return 'ALLOWED' }
+        catch (error) { return error.code }
+      })
+      return {
+        codes,
+        immutable: assignmentRejected && deletionRejected && definitionRejected
+      }
+    \`, { timeoutMs: 5_000 })
+    const after = [typeof process.send, typeof process.channel, typeof process.disconnect]
+    if (!result.immutable || result.codes.length !== 12 ||
+        result.codes.some(code => code !== 'ERR_ACCESS_DENIED') ||
+        before.some(value => value !== 'undefined') ||
+        after.some(value => value !== 'undefined')) process.exitCode = 2
+    fs.writeSync(3, 'descriptor-intact')
+  `
+  const result = spawnSync(
+    process.execPath,
+    ['--input-type=module', '--eval', childSource],
+    {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe', 'pipe'],
+      timeout: 30_000
+    }
+  )
+  assert.equal(result.signal, null, result.stderr)
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.output[3], 'descriptor-intact')
+})
 
 test('pre-existing HTTP agents cannot open loopback connections in any execution mode', async (t) => {
   let accepted = 0

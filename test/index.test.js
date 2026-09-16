@@ -1211,17 +1211,17 @@ test('rejects every supported shared-memory representation in input and output',
   }
 })
 
-test('one-shot runtime errors use stable source coordinates without bootstrap frames', async () => {
+test('one-shot runtime errors preserve complete stacks with stable source coordinates', async () => {
   await assert.rejects(
     runUntrustedCode(`const value = 1
 //# sourceURL=hostile.js
 throw new Error('located')`, { timeoutMs: 5_000 }),
     (error) => {
-      assert.equal(error.remoteStack, [
-        'Error: located',
-        '    at eval (secure-eval-worker-one-shot.js:3:7)'
-      ].join('\n'))
-      assert.doesNotMatch(error.remoteStack, /worker eval|trustedBootstrap|hostile\.js/)
+      assert.match(error.remoteStack, /^Error: located\n/)
+      assert.match(error.remoteStack, /at eval \(secure-eval-worker-one-shot\.js:3:7\)/)
+      assert.match(error.remoteStack, /at trustedBootstrap \(\[worker eval\]:\d+:\d+\)/)
+      assert.match(error.remoteStack, /node:internal\/process\/execution/)
+      assert.doesNotMatch(error.remoteStack, /hostile\.js/)
       return true
     }
   )
@@ -1256,8 +1256,10 @@ test('remote stacks remain bounded sanitized untrusted diagnostics', async () =>
       throw error
     `, { timeoutMs: 5_000 }),
     (error) => {
-      assert.match(error.remoteStack, /secure-eval-worker-one-shot\.js:97:1/)
-      assert.equal(error.remoteStack.includes('\\u001b[31m'), true)
+      assert.equal(error.remoteStack, [
+        'Error: forged',
+        '    at fake (secure-eval-worker-one-shot.js:97:1)\\u001b[31m'
+      ].join('\n'))
       assert.doesNotMatch(error.remoteStack, /\u001b/)
       return true
     }

@@ -3,8 +3,8 @@
 `Error` and `AggregateError` remain unsupported as ordinary protocol values.
 Thrown guest errors and host-function failures continue to use their dedicated,
 bounded error channels. Guest-controlled error names, messages, codes, and
-stacks have control characters escaped before reaching host logs or error
-objects.
+complete stacks have control characters escaped and are size-bounded before
+reaching host logs or error objects; stack frames are otherwise preserved.
 
 Node's native structured clone and V8 serializer copy implementation-dependent
 error state, including stacks and causes. On the supported Node 26 endpoints,
