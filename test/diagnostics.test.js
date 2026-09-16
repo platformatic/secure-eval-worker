@@ -21,6 +21,9 @@ test('one-shot diagnostics are bounded, sanitized records', async () => {
   const value = await runUntrustedCode(`
     console.log('hello', 42, { secret: 'not inspected' })
     console.warn('line\\nnext\\u001b[31m')
+    const error = new Error('guest diagnostic error')
+    error.stack = 'GUEST_DIAGNOSTIC_STACK_MARKER'
+    console.error(error)
     return 'done'
   `, {
     diagnostics: true,
@@ -31,7 +34,8 @@ test('one-shot diagnostics are bounded, sanitized records', async () => {
   assert.equal(value, 'done')
   assert.deepEqual(records, [
     { level: 'log', text: 'hello 42 [Object]' },
-    { level: 'warn', text: 'line\\u000anext\\u001b[31m' }
+    { level: 'warn', text: 'line\\u000anext\\u001b[31m' },
+    { level: 'error', text: '[Object]' }
   ])
   assert.equal(Object.isFrozen(records[0]), true)
 })

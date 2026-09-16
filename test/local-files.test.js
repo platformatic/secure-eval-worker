@@ -107,12 +107,17 @@ test('staging file URLs remain canonical under special-character temporary roots
     ? "secure-eval-worker $&'+,;=@[]^{}~#%-"
     : "secure-eval-worker $&'+,:;=@[]^{}~#?%-"
   const temporaryParent = await mkdtemp(join(tmpdir(), 'secure-eval-worker-special-root-'))
-  const stagingBase = join(temporaryParent, specialSegment)
+  const stagingBasePath = join(temporaryParent, specialSegment)
   t.after(async () => {
     await files.cleanup()
     await rm(temporaryParent, { force: true, recursive: true })
   })
-  await mkdir(stagingBase, { recursive: true })
+  await mkdir(stagingBasePath, { recursive: true })
+  // macOS exposes /var through a /private/var symlink. Node's temporary-file
+  // APIs may return the canonical spelling even when TMPDIR uses the alias.
+  const stagingBase = platform() === 'darwin'
+    ? await realpath(stagingBasePath)
+    : stagingBasePath
   const localFilesUrl = new URL('../src/local-files.js', import.meta.url).href
   const packageUrl = new URL('../src/index.js', import.meta.url).href
   const childSource = `
@@ -160,10 +165,10 @@ test('staging file URLs remain canonical under special-character temporary roots
   `
   const environment = { ...process.env }
   if (platform() === 'win32') {
-    environment.TEMP = stagingBase
-    environment.TMP = stagingBase
+    environment.TEMP = stagingBasePath
+    environment.TMP = stagingBasePath
   } else {
-    environment.TMPDIR = stagingBase
+    environment.TMPDIR = stagingBasePath
   }
   const { stdout, stderr } = await execFileAsync(
     process.execPath,

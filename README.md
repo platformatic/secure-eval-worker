@@ -280,7 +280,7 @@ Validates an explicit environment and returns a null-prototype copy. Values must
 
 ### `UntrustedCodeError`
 
-Errors originating from execution use this class and have a machine-readable `code`. A complete remote stack, when available, is exposed as `remoteStack` rather than replacing the trusted caller's local stack. The stack is size-bounded, has control characters escaped, and uses stable virtual filenames with wrapper-adjusted coordinates; frames are otherwise preserved. `remoteStack` remains guest-influenced, untrusted diagnostic text and must never be used for authorization or provenance. Argument validation and structured-clone failures are thrown synchronously; execution failures reject the returned promise.
+Errors originating from execution use this class and have a machine-readable `code`. A complete remote stack, when available, is exposed as `remoteStack` rather than replacing the trusted caller's local stack. The stack is size-bounded, has control characters escaped, and uses stable virtual filenames with wrapper-adjusted coordinates; frames are otherwise preserved. `remoteStack` remains guest-influenced, untrusted diagnostic text and must never be used for authorization or provenance. Argument validation and structured-clone failures are thrown synchronously; execution failures reject the returned promise. See [Error and stack-trace policy](docs/error-values.md) for the guest-to-host, host-to-guest, and diagnostics policies and the comparison with SES error taming.
 
 ## Security notes
 
