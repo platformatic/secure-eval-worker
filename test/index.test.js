@@ -14,12 +14,51 @@ import {
 } from '../src/index.js'
 import {
   assertSupportedProtocolSource,
-  assertSupportedRuntime
+  assertSupportedRuntime,
+  remoteError
 } from '../src/internal.js'
 
 const packageUrl = new URL('../src/index.js', import.meta.url).href
 const require = createRequire(import.meta.url)
 const execFileAsync = promisify(execFile)
+
+test('remote error metadata ignores own and inherited accessors', () => {
+  let reads = 0
+  let proxyTraps = 0
+  const inherited = Object.create(null)
+  for (const key of ['name', 'code']) {
+    Object.defineProperty(inherited, key, {
+      get () {
+        reads++
+        return 'disclosed'
+      }
+    })
+  }
+  const detail = Object.create(inherited)
+  for (const key of ['message', 'stack']) {
+    Object.defineProperty(detail, key, {
+      get () {
+        reads++
+        return 'disclosed'
+      }
+    })
+  }
+
+  const error = remoteError(detail)
+  assert.equal(error.message, 'Error: Untrusted code failed')
+  assert.equal(error.remoteStack, undefined)
+  assert.equal(error.remoteCode, undefined)
+  assert.equal(reads, 0)
+
+  const proxied = new Proxy({}, {
+    getOwnPropertyDescriptor () {
+      proxyTraps++
+      throw new Error('proxy trap must not run')
+    }
+  })
+  assert.equal(remoteError(proxied).message, 'Error: Untrusted code failed')
+  assert.equal(proxyTraps, 0)
+})
 
 test('rejects unsupported Node.js runtime versions', () => {
   assert.doesNotThrow(() => assertSupportedRuntime('26.5.1'))

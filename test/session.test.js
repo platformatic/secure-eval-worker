@@ -374,9 +374,10 @@ for (const type of ['script', 'module']) {
     await session.closed
   })
 
-  test(`${type} authenticated traffic uses captured numeric validation`, async () => {
+  test(`${type} authenticated traffic uses captured numeric and string operations`, async () => {
     const poison = `
       Number.isSafeInteger = () => { throw new Error('poisoned Number.isSafeInteger') }
+      globalThis.String = () => { throw new Error('poisoned String') }
     `
     const source = type === 'script'
       ? `${poison}\nonMessage(value => value)`
@@ -516,6 +517,134 @@ test('guest descriptor validation ignores polluted Object.prototype.value', asyn
   })
   await replacement.ready
   assert.equal(await replacement.request(42), 42)
+  await replacement.terminate()
+  await replacement.closed
+})
+
+test('guest error serialization never invokes metadata accessors', async (t) => {
+  configureWorkerAdmission({ maxConcurrentWorkers: 1 })
+  t.after(() => configureWorkerAdmission({ maxConcurrentWorkers: 4 }))
+  const session = createUntrustedWorker(`
+    let reads = 0
+    onMessage(async kind => {
+      if (kind === 'counts') return reads
+      if (kind === 'guest-prepare-stack') {
+        Error.prepareStackTrace = () => {
+          reads++
+          return 'guest formatted stack'
+        }
+        const stack = new Error('guest formatted').stack
+        Reflect.deleteProperty(Error, 'prepareStackTrace')
+        const observedReads = reads
+        reads = 0
+        return { stack, reads: observedReads }
+      }
+      if (kind === 'node-code' || kind === 'node-inherited-code' ||
+          kind === 'node-object-code') {
+        try {
+          await import('secure-eval-worker-definitely-missing-package')
+        } catch (error) {
+          const target = kind === 'node-code'
+            ? error
+            : (kind === 'node-inherited-code' ? Object.getPrototypeOf(error) : Object.prototype)
+          if (kind !== 'node-code') Reflect.deleteProperty(error, 'code')
+          Object.defineProperty(target, 'code', {
+            configurable: true,
+            get () { reads++; return 'LEAK' }
+          })
+          throw error
+        }
+      }
+      const error = new TypeError('visible message')
+      if (kind === 'prepare-stack') {
+        Reflect.defineProperty(Error, 'prepareStackTrace', {
+          value () { reads++; return 'disclosed stack' }
+        })
+      } else if (kind === 'own-code') {
+        Object.defineProperty(error, 'code', {
+          configurable: true,
+          get () { reads++; return 'LEAK' }
+        })
+      } else if (kind === 'inherited-code') {
+        Object.defineProperty(TypeError.prototype, 'code', {
+          configurable: true,
+          get () { reads++; return 'LEAK' }
+        })
+      } else if (kind === 'global-error') {
+        const ReplacementError = class ReplacementError {}
+        ReplacementError.prepareStackTrace = () => {
+          reads++
+          return 'disclosed replacement stack'
+        }
+        globalThis.Error = ReplacementError
+      } else if (kind === 'own') {
+        for (const key of ['name', 'message', 'code', 'stack']) {
+          Object.defineProperty(error, key, {
+            configurable: true,
+            get () { reads++; return 'disclosed:' + key }
+          })
+        }
+      } else {
+        Reflect.deleteProperty(error, 'message')
+        const prototype = Object.create(TypeError.prototype)
+        for (const key of ['name', 'message', 'code', 'stack']) {
+          Object.defineProperty(prototype, key, {
+            configurable: true,
+            get () { reads++; return 'disclosed:' + key }
+          })
+        }
+        Object.setPrototypeOf(error, prototype)
+      }
+      throw error
+    })
+  `, {
+    startupTimeoutMs: 5_000,
+    messageTimeoutMs: 1_000,
+    lifetimeTimeoutMs: 5_000
+  })
+  session.on('error', () => {})
+  t.after(() => session.terminate().catch(() => {}))
+  await session.ready
+
+  assert.deepEqual(await session.request('guest-prepare-stack'), {
+    stack: 'guest formatted stack',
+    reads: 1
+  })
+  await assert.rejects(session.request('prepare-stack'), error =>
+    error.message === 'TypeError: visible message' && error.remoteStack === undefined)
+  assert.equal(await session.request('counts'), 0)
+  for (const kind of ['node-code', 'node-object-code', 'node-inherited-code']) {
+    await assert.rejects(session.request(kind), error =>
+      error.remoteStack === undefined && error.remoteCode === undefined)
+    assert.equal(await session.request('counts'), 0)
+  }
+  for (const kind of ['own-code', 'inherited-code']) {
+    await assert.rejects(session.request(kind), error =>
+      error.message === 'TypeError: visible message' &&
+      error.remoteStack === undefined && error.remoteCode === undefined)
+    assert.equal(await session.request('counts'), 0)
+  }
+  await assert.rejects(session.request('own'), error =>
+    error.message === 'TypeError: Untrusted component failed' &&
+    error.remoteStack === undefined && error.remoteCode === undefined)
+  assert.equal(await session.request('counts'), 0)
+  await assert.rejects(session.request('inherited'), error =>
+    error.message === 'Error: Untrusted component failed' &&
+    error.remoteStack === undefined && error.remoteCode === undefined)
+  assert.equal(await session.request('counts'), 0)
+  await assert.rejects(session.request('global-error'), error =>
+    error.message === 'TypeError: visible message' && error.remoteStack === undefined)
+  assert.equal(await session.request('counts'), 0)
+  await session.terminate()
+  await session.closed
+
+  const replacement = createUntrustedWorker('onMessage(value => value)', {
+    startupTimeoutMs: 5_000,
+    messageTimeoutMs: 5_000,
+    lifetimeTimeoutMs: 5_000
+  })
+  await replacement.ready
+  assert.equal(await replacement.request(44), 44)
   await replacement.terminate()
   await replacement.closed
 })
@@ -918,6 +1047,53 @@ test('protocol serialization uses the captured typed-array byteLength getter', a
   Object.defineProperty(typedArrayPrototype, 'byteLength', descriptor)
   await session.terminate()
   await session.closed
+})
+
+test('handshake validation ignores inherited diagnostic accessors', async (t) => {
+  configureWorkerAdmission({ maxConcurrentWorkers: 1 })
+  t.after(() => configureWorkerAdmission({ maxConcurrentWorkers: 4 }))
+  const originals = new Map()
+  let reads = 0
+  const restore = () => {
+    for (const [key, descriptor] of originals) {
+      if (descriptor) Object.defineProperty(Object.prototype, key, descriptor)
+      else delete Object.prototype[key]
+    }
+  }
+  t.after(restore)
+  for (const key of ['diagnosticPort', 'diagnosticSecret']) {
+    originals.set(key, Object.getOwnPropertyDescriptor(Object.prototype, key))
+    Object.defineProperty(Object.prototype, key, {
+      configurable: true,
+      get () {
+        reads++
+        throw new Error(`inherited ${key} accessor must not run`)
+      }
+    })
+  }
+
+  const session = createUntrustedWorker('onMessage(value => value)', {
+    startupTimeoutMs: 5_000,
+    messageTimeoutMs: 5_000,
+    lifetimeTimeoutMs: 5_000
+  })
+  t.after(() => session.terminate().catch(() => {}))
+  await session.ready
+  assert.equal(await session.request(42), 42)
+  assert.equal(reads, 0)
+  restore()
+  await session.terminate()
+  await session.closed
+
+  const replacement = createUntrustedWorker('onMessage(value => value)', {
+    startupTimeoutMs: 5_000,
+    messageTimeoutMs: 5_000,
+    lifetimeTimeoutMs: 5_000
+  })
+  await replacement.ready
+  assert.equal(await replacement.request(43), 43)
+  await replacement.terminate()
+  await replacement.closed
 })
 
 test('handshake branding ignores poisoned MessagePort identity without uncaught exceptions', async (t) => {

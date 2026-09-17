@@ -682,6 +682,18 @@ export function isAbortError (error) {
   return reflectApply(weakSetHas, abortErrors, [error])
 }
 
+function ownDataValue (object, key) {
+  if (object === null || (typeof object !== 'object' && typeof object !== 'function') ||
+      safeIsProxy(object)) {
+    return undefined
+  }
+  const descriptor = reflectApply(objectGetOwnPropertyDescriptor, undefined, [object, key])
+  if (!descriptor || !reflectApply(objectHasOwn, undefined, [descriptor, 'value'])) {
+    return undefined
+  }
+  return descriptor.value
+}
+
 function sanitizeRemoteText (value, fallback, maxLength = 8_192) {
   if (typeof value !== 'string') return fallback
   const source = reflectApply(stringSlice, value, [0, maxLength])
@@ -702,11 +714,15 @@ function sanitizeRemoteText (value, fallback, maxLength = 8_192) {
 }
 
 export function remoteError (detail, code = 'ERR_UNTRUSTED_CODE') {
-  const name = sanitizeRemoteText(detail?.name, 'Error', 256)
-  const message = sanitizeRemoteText(detail?.message, 'Untrusted code failed')
+  const name = sanitizeRemoteText(ownDataValue(detail, 'name'), 'Error', 256)
+  const message = sanitizeRemoteText(
+    ownDataValue(detail, 'message'),
+    'Untrusted code failed'
+  )
+  const stack = ownDataValue(detail, 'stack')
   return new UntrustedCodeError(`${name}: ${message}`, {
     code,
-    remoteStack: detail && typeof detail.stack === 'string' ? detail.stack : undefined,
-    remoteCode: sanitizeRemoteText(detail?.code, undefined, 256)
+    remoteStack: typeof stack === 'string' ? stack : undefined,
+    remoteCode: sanitizeRemoteText(ownDataValue(detail, 'code'), undefined, 256)
   })
 }

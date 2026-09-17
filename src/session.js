@@ -136,6 +136,41 @@ const hostBufferFrom = Buffer.from
 const hostNumberIsSafeInteger = Number.isSafeInteger
 const hostProcessNextTick = process.nextTick
 const hostStringSlice = String.prototype.slice
+
+function hostOwnDataDescriptor (value, key) {
+  if (value === null || (typeof value !== 'object' && typeof value !== 'function') ||
+      safeHostIsProxy(value)) {
+    return undefined
+  }
+  const descriptor = hostReflectApply(hostObjectGetOwnPropertyDescriptor, undefined, [value, key])
+  if (!descriptor || !hostReflectApply(hostObjectHasOwn, undefined, [descriptor, 'value'])) {
+    return undefined
+  }
+  return descriptor
+}
+
+function hostOwnDataValue (value, key) {
+  const descriptor = hostOwnDataDescriptor(value, key)
+  return descriptor?.value
+}
+
+function createDeferredProtocolEnvelope (envelope, type, diagnosticSequence) {
+  const deferred = hostObjectCreate(null)
+  hostReflectApply(hostObjectDefineProperty, undefined, [deferred, 'envelope', {
+    enumerable: true,
+    value: envelope
+  }])
+  hostReflectApply(hostObjectDefineProperty, undefined, [deferred, 'type', {
+    enumerable: true,
+    value: type
+  }])
+  hostReflectApply(hostObjectDefineProperty, undefined, [deferred, 'diagnosticSequence', {
+    enumerable: true,
+    value: diagnosticSequence
+  }])
+  return hostObjectFreeze(deferred)
+}
+
 const sessionSecrets = new WeakMap()
 const sessionData = new WeakMap()
 const internalSessionOptions = new WeakMap()
@@ -459,9 +494,13 @@ const safeAtomics = Atomics
 const hostAtomicsCompareExchange = Atomics.compareExchange
 const SafePromise = Promise
 const SafeError = globalThis.Error
+const SafeAggregateError = globalThis.AggregateError
+const SafeEvalError = globalThis.EvalError
+const SafeReferenceError = globalThis.ReferenceError
 const SafeTypeError = globalThis.TypeError
 const SafeRangeError = globalThis.RangeError
 const SafeSyntaxError = globalThis.SyntaxError
+const SafeURIError = globalThis.URIError
 const Error = SafeError
 const TypeError = SafeTypeError
 const RangeError = SafeRangeError
@@ -530,6 +569,24 @@ const objectGetOwnPropertyDescriptors = Object.getOwnPropertyDescriptors
 const objectHasOwn = Object.hasOwn
 const objectIsExtensible = Object.isExtensible
 const objectPrototype = Object.prototype
+const nativeErrorStackDescriptor = objectGetOwnPropertyDescriptor(new SafeError(), 'stack')
+if (!nativeErrorStackDescriptor ||
+    typeof nativeErrorStackDescriptor.get !== 'function' ||
+    typeof nativeErrorStackDescriptor.set !== 'function' ||
+    nativeErrorStackDescriptor.enumerable !== false ||
+    nativeErrorStackDescriptor.configurable !== true) {
+  throw new SafeError('Failed to capture native Error stack accessors')
+}
+const nativeErrorStackGet = nativeErrorStackDescriptor.get
+const nativeErrorStackSet = nativeErrorStackDescriptor.set
+const nativePrepareStackTraceDescriptor = objectGetOwnPropertyDescriptor(
+  SafeError,
+  'prepareStackTrace'
+)
+if (nativePrepareStackTraceDescriptor) objectFreeze(nativePrepareStackTraceDescriptor)
+const ERROR_DESCRIPTOR_FIELDS = objectFreeze([
+  'configurable', 'enumerable', 'writable', 'value', 'get', 'set'
+])
 const eventConstructorDescriptor = objectGetOwnPropertyDescriptor(globalThis, 'Event')
 if (!eventConstructorDescriptor ||
     !reflectApply(objectHasOwn, undefined, [eventConstructorDescriptor, 'value']) ||
@@ -601,6 +658,14 @@ if (moduleLocationReplacements) {
   objectFreeze(moduleLocationReplacements)
   objectFreeze(workerData.localModule)
 }
+for (let index = 0; index < workerData.hostFunctionManifest.length; index++) {
+  const entry = workerData.hostFunctionManifest[index]
+  objectFreeze(entry.names)
+  objectFreeze(entry)
+}
+objectFreeze(workerData.hostFunctionManifest)
+objectFreeze(workerData.diagnostics)
+objectFreeze(workerData)
 const promisePrototype = SafePromise.prototype
 const promisePrototypeConstructorDescriptor = objectFreeze(
   objectGetOwnPropertyDescriptor(promisePrototype, 'constructor')
@@ -627,7 +692,21 @@ const arrayPrototype = Array.prototype
 const arrayBufferPrototype = ArrayBuffer.prototype
 const datePrototype = Date.prototype
 const regexpPrototype = RegExp.prototype
+const errorPrototype = SafeError.prototype
 const syntaxErrorPrototype = SafeSyntaxError.prototype
+const nativeErrorPrototypeNames = new Map([
+  [errorPrototype, 'Error'],
+  [SafeAggregateError.prototype, 'AggregateError'],
+  [SafeEvalError.prototype, 'EvalError'],
+  [SafeReferenceError.prototype, 'ReferenceError'],
+  [SafeTypeError.prototype, 'TypeError'],
+  [SafeRangeError.prototype, 'RangeError'],
+  [SafeSyntaxError.prototype, 'SyntaxError'],
+  [SafeURIError.prototype, 'URIError'],
+  [WebAssembly.CompileError.prototype, 'CompileError'],
+  [WebAssembly.LinkError.prototype, 'LinkError'],
+  [WebAssembly.RuntimeError.prototype, 'RuntimeError']
+])
 const mapPrototype = Map.prototype
 const setPrototype = Set.prototype
 const allowedViewPrototypes = new Set([
@@ -664,6 +743,46 @@ moduleFileDescriptors.count = 0
 const processFileDescriptorSlots = workerData.localModule
   ? new Int32Array(workerData.localModule.globalDescriptorSlots)
   : undefined
+const processFileDescriptorSlotCount = processFileDescriptorSlots === undefined
+  ? 0
+  : reflectApply(typedArrayLength, processFileDescriptorSlots, [])
+
+function ownPropertyDescriptor(value, key) {
+  if (value === null || (typeof value !== 'object' && typeof value !== 'function') ||
+      reflectApply(isProxy, utilTypesBuiltin, [value])) {
+    return undefined
+  }
+  return reflectApply(objectGetOwnPropertyDescriptor, undefined, [value, key])
+}
+
+function ownDataDescriptor(value, key) {
+  const descriptor = ownPropertyDescriptor(value, key)
+  if (!descriptor || !reflectApply(objectHasOwn, undefined, [descriptor, 'value'])) {
+    return undefined
+  }
+  return descriptor
+}
+
+function ownDataValue(value, key) {
+  const descriptor = ownDataDescriptor(value, key)
+  return descriptor?.value
+}
+
+function hasOriginalOwnDescriptor(value, key, originalDescriptor) {
+  const descriptor = ownPropertyDescriptor(value, key)
+  if (descriptor === undefined || originalDescriptor === undefined) {
+    return descriptor === originalDescriptor
+  }
+  for (let index = 0; index < ERROR_DESCRIPTOR_FIELDS.length; index++) {
+    const field = ERROR_DESCRIPTOR_FIELDS[index]
+    const hasField = reflectApply(objectHasOwn, undefined, [descriptor, field])
+    if (hasField !== reflectApply(objectHasOwn, undefined, [originalDescriptor, field]) ||
+        (hasField && descriptor[field] !== originalDescriptor[field])) {
+      return false
+    }
+  }
+  return true
+}
 
 let port
 let rawPostToHost
@@ -1154,9 +1273,9 @@ function postDiagnostic(level, values) {
 
 function reserveProcessFileDescriptor() {
   const owner = workerData.localModule.descriptorOwner
-  const start = owner % processFileDescriptorSlots.length
-  for (let offset = 0; offset < processFileDescriptorSlots.length; offset++) {
-    const index = (start + offset) % processFileDescriptorSlots.length
+  const start = owner % processFileDescriptorSlotCount
+  for (let offset = 0; offset < processFileDescriptorSlotCount; offset++) {
+    const index = (start + offset) % processFileDescriptorSlotCount
     if (reflectApply(hostAtomicsCompareExchange, safeAtomics, [
       processFileDescriptorSlots,
       index,
@@ -1756,7 +1875,7 @@ function reportFatal(error) {
 
 function protocolMac(direction, sequence, serialized, secret = protocolSecret) {
   const hmac = createHmac('sha256', secret)
-  reflectApply(hmacUpdate, hmac, [direction + '\0' + String(sequence) + '\0'])
+  reflectApply(hmacUpdate, hmac, [direction + '\0' + SafeString(sequence) + '\0'])
   reflectApply(hmacUpdate, hmac, [serialized])
   return reflectApply(hmacDigest, hmac, ['base64'])
 }
@@ -1789,21 +1908,23 @@ function postToHost(body, countAgainstOutput = false) {
 function authenticateHostMessage(envelope) {
   let authenticated = false
   let serialized
-  if (envelope !== null && typeof envelope === 'object' &&
-      reflectApply(numberIsSafeInteger, SafeNumber, [envelope.sequence]) &&
-      envelope.sequence === inboundSequence + 1 &&
-      envelope.payload !== null && typeof envelope.payload === 'object' &&
-      reflectApply(arrayBufferIsView, undefined, [envelope.payload]) &&
-      typeof envelope.mac === 'string') {
-    serialized = envelope.payload
+  const sequence = ownDataValue(envelope, 'sequence')
+  const payload = ownDataValue(envelope, 'payload')
+  const mac = ownDataValue(envelope, 'mac')
+  if (reflectApply(numberIsSafeInteger, SafeNumber, [sequence]) &&
+      sequence === inboundSequence + 1 &&
+      payload !== null && typeof payload === 'object' &&
+      reflectApply(arrayBufferIsView, undefined, [payload]) &&
+      typeof mac === 'string') {
+    serialized = payload
     const byteLength = reflectApply(typedArrayByteLength, serialized, [])
     authenticated = byteLength <= workerData.maxMessageBytes &&
-      envelope.mac === protocolMac('host-to-worker', envelope.sequence, serialized)
+      mac === protocolMac('host-to-worker', sequence, serialized)
   }
   if (!authenticated) throw new Error('Unauthenticated host protocol message')
   const body = safeV8Deserialize(serialized)
   assertSupportedProtocolValue(body, 'message')
-  inboundSequence = envelope.sequence
+  inboundSequence = sequence
   return body
 }
 
@@ -1906,19 +2027,142 @@ function isSyntaxError(value) {
   }
 }
 
+function dataDescriptorValue(descriptor) {
+  if (!descriptor || !reflectApply(objectHasOwn, undefined, [descriptor, 'value'])) {
+    return undefined
+  }
+  return descriptor.value
+}
+
+function safeErrorTextDescriptor(descriptor) {
+  if (descriptor === undefined) return true
+  if (!reflectApply(objectHasOwn, undefined, [descriptor, 'value'])) return false
+  return descriptor.value === undefined || typeof descriptor.value === 'string'
+}
+
+function safeNativeErrorStack(
+  error,
+  prototype,
+  nameDescriptor,
+  messageDescriptor,
+  codeDescriptor,
+  prototypeNameDescriptor,
+  prototypeMessageDescriptor,
+  prototypeCodeDescriptor,
+  stackDescriptor
+) {
+  if (!stackDescriptor) return undefined
+  if (reflectApply(objectHasOwn, undefined, [stackDescriptor, 'value'])) {
+    return typeof stackDescriptor.value === 'string' ? stackDescriptor.value : undefined
+  }
+  if (!reflectApply(objectHasOwn, undefined, [stackDescriptor, 'get']) ||
+      !reflectApply(objectHasOwn, undefined, [stackDescriptor, 'set']) ||
+      stackDescriptor.get !== nativeErrorStackGet ||
+      stackDescriptor.set !== nativeErrorStackSet ||
+      stackDescriptor.enumerable !== false || stackDescriptor.configurable !== true ||
+      !safeErrorTextDescriptor(nameDescriptor) ||
+      !safeErrorTextDescriptor(messageDescriptor) ||
+      !safeErrorTextDescriptor(codeDescriptor) ||
+      dataDescriptorValue(ownPropertyDescriptor(globalThis, 'Error')) !== SafeError ||
+      !hasOriginalOwnDescriptor(
+        SafeError,
+        'prepareStackTrace',
+        nativePrepareStackTraceDescriptor
+      ) ||
+      reflectApply(isProxy, utilTypesBuiltin, [prototype])) {
+    return undefined
+  }
+  const prototypeParent = objectGetPrototypeOf(prototype)
+  let intrinsicPrototype = prototype
+  const directIntrinsic = reflectApply(mapGet, nativeErrorPrototypeNames, [intrinsicPrototype])
+  if (!directIntrinsic) intrinsicPrototype = prototypeParent
+  if (!reflectApply(mapGet, nativeErrorPrototypeNames, [intrinsicPrototype])) return undefined
+  const intrinsicNameDescriptor = directIntrinsic
+    ? prototypeNameDescriptor
+    : ownPropertyDescriptor(intrinsicPrototype, 'name')
+  const intrinsicMessageDescriptor = directIntrinsic
+    ? prototypeMessageDescriptor
+    : ownPropertyDescriptor(intrinsicPrototype, 'message')
+  const intrinsicCodeDescriptor = directIntrinsic
+    ? prototypeCodeDescriptor
+    : ownPropertyDescriptor(intrinsicPrototype, 'code')
+  const errorNameDescriptor = intrinsicPrototype === errorPrototype
+    ? intrinsicNameDescriptor
+    : ownPropertyDescriptor(errorPrototype, 'name')
+  const errorMessageDescriptor = intrinsicPrototype === errorPrototype
+    ? intrinsicMessageDescriptor
+    : ownPropertyDescriptor(errorPrototype, 'message')
+  const errorCodeDescriptor = intrinsicPrototype === errorPrototype
+    ? intrinsicCodeDescriptor
+    : ownPropertyDescriptor(errorPrototype, 'code')
+  const intrinsicParent = directIntrinsic
+    ? prototypeParent
+    : objectGetPrototypeOf(intrinsicPrototype)
+  const errorParent = intrinsicPrototype === errorPrototype
+    ? intrinsicParent
+    : objectGetPrototypeOf(errorPrototype)
+  const objectNameDescriptor = ownPropertyDescriptor(objectPrototype, 'name')
+  const objectMessageDescriptor = ownPropertyDescriptor(objectPrototype, 'message')
+  const objectCodeDescriptor = ownPropertyDescriptor(objectPrototype, 'code')
+  if (!safeErrorTextDescriptor(prototypeNameDescriptor) ||
+      !safeErrorTextDescriptor(prototypeMessageDescriptor) ||
+      !safeErrorTextDescriptor(prototypeCodeDescriptor) ||
+      !safeErrorTextDescriptor(intrinsicNameDescriptor) ||
+      !safeErrorTextDescriptor(intrinsicMessageDescriptor) ||
+      !safeErrorTextDescriptor(intrinsicCodeDescriptor) ||
+      !safeErrorTextDescriptor(errorNameDescriptor) ||
+      !safeErrorTextDescriptor(errorMessageDescriptor) ||
+      !safeErrorTextDescriptor(errorCodeDescriptor) ||
+      !safeErrorTextDescriptor(objectNameDescriptor) ||
+      !safeErrorTextDescriptor(objectMessageDescriptor) ||
+      !safeErrorTextDescriptor(objectCodeDescriptor) ||
+      errorParent !== objectPrototype || objectGetPrototypeOf(objectPrototype) !== null ||
+      (intrinsicPrototype !== errorPrototype && intrinsicParent !== errorPrototype)) {
+    return undefined
+  }
+  return reflectApply(nativeErrorStackGet, error, [])
+}
+
 function cloneError(error) {
   try {
     if (error !== null && typeof error === 'object' &&
+        !reflectApply(isProxy, utilTypesBuiltin, [error]) &&
         reflectApply(isNativeError, utilTypesBuiltin, [error])) {
-      const name = sanitizeDiagnosticText(limitedString(error.name, 'Error'))
-      const message = sanitizeDiagnosticText(virtualizeModuleLocations(
-        limitedString(error.message, 'Untrusted component failed')
+      const prototype = objectGetPrototypeOf(error)
+      const nameDescriptor = ownPropertyDescriptor(error, 'name')
+      const messageDescriptor = ownPropertyDescriptor(error, 'message')
+      const codeDescriptor = ownPropertyDescriptor(error, 'code')
+      const stackDescriptor = ownPropertyDescriptor(error, 'stack')
+      const intrinsicName = reflectApply(mapGet, nativeErrorPrototypeNames, [prototype])
+      const prototypeNameDescriptor = ownPropertyDescriptor(prototype, 'name')
+      const prototypeMessageDescriptor = ownPropertyDescriptor(prototype, 'message')
+      const prototypeCodeDescriptor = ownPropertyDescriptor(prototype, 'code')
+      const prototypeName = dataDescriptorValue(prototypeNameDescriptor)
+      const code = limitedString(dataDescriptorValue(codeDescriptor), undefined)
+      const classifiedName = code === 'ERR_INVALID_TYPESCRIPT_SYNTAX'
+        ? 'SyntaxError'
+        : (intrinsicName === undefined ? 'Error' : intrinsicName)
+      const name = sanitizeDiagnosticText(limitedString(
+        dataDescriptorValue(nameDescriptor),
+        typeof prototypeName === 'string' ? prototypeName : classifiedName
       ))
-      const code = limitedString(error.code, undefined)
+      const message = sanitizeDiagnosticText(virtualizeModuleLocations(
+        limitedString(dataDescriptorValue(messageDescriptor), 'Untrusted component failed')
+      ))
       return {
         name,
         message,
-        stack: normalizedGuestStack(error.stack),
+        stack: normalizedGuestStack(safeNativeErrorStack(
+          error,
+          prototype,
+          nameDescriptor,
+          messageDescriptor,
+          codeDescriptor,
+          prototypeNameDescriptor,
+          prototypeMessageDescriptor,
+          prototypeCodeDescriptor,
+          stackDescriptor
+        )),
         code: code === undefined ? undefined : sanitizeDiagnosticText(code)
       }
     }
@@ -1933,13 +2177,50 @@ function cloneError(error) {
   }
 }
 
+function snapshotTrustedSyntaxError(error) {
+  const message = limitedString(
+    dataDescriptorValue(ownPropertyDescriptor(error, 'message')),
+    'Invalid JavaScript syntax'
+  )
+  const stackDescriptor = ownPropertyDescriptor(error, 'stack')
+  let stack = dataDescriptorValue(stackDescriptor)
+  if (stack === undefined && stackDescriptor &&
+      reflectApply(objectHasOwn, undefined, [stackDescriptor, 'get']) &&
+      typeof stackDescriptor.get === 'function') {
+    // This helper is called only for parser errors created synchronously by
+    // captured Node APIs before any guest code can execute.
+    stack = reflectApply(stackDescriptor.get, error, [])
+  }
+  const replacement = new SafeSyntaxError(message)
+  if (typeof stack === 'string') {
+    objectDefineProperty(replacement, 'stack', {
+      configurable: true,
+      value: limitedString(stack, undefined)
+    })
+  }
+  const code = dataDescriptorValue(ownPropertyDescriptor(error, 'code'))
+  if (typeof code === 'string') {
+    objectDefineProperty(replacement, 'code', {
+      configurable: true,
+      enumerable: true,
+      value: code,
+      writable: true
+    })
+  }
+  return replacement
+}
+
 function stripGuestTypeScript(source, sourceUrl) {
   try {
     return stripTypeScriptTypes(source, { mode: 'strip' })
   } catch {
     // Reparse only failing input with a trusted virtual name so Node includes
     // useful source coordinates in the thrown parser error.
-    return stripTypeScriptTypes(source, { mode: 'strip', sourceUrl })
+    try {
+      return stripTypeScriptTypes(source, { mode: 'strip', sourceUrl })
+    } catch (error) {
+      throw snapshotTrustedSyntaxError(error)
+    }
   }
 }
 
@@ -1961,7 +2242,11 @@ function locateJavaScriptSyntaxError(source, originalError) {
   } catch {
     // Reparse only failing input with a trusted virtual name so Node includes
     // useful source coordinates in the thrown parser error.
-    stripTypeScriptTypes(candidate, { mode: 'strip', sourceUrl })
+    try {
+      stripTypeScriptTypes(candidate, { mode: 'strip', sourceUrl })
+    } catch (error) {
+      throw snapshotTrustedSyntaxError(error)
+    }
   }
 
   let difference = -1
@@ -1986,9 +2271,10 @@ function locateJavaScriptSyntaxError(source, originalError) {
     }
   }
   objectDefineProperty(originalError, 'stack', {
-    value: limitedString(originalError.name, 'SyntaxError') + ': ' +
-      limitedString(originalError.message, 'Invalid JavaScript syntax') + '\n' +
-      '    at ' + sourceUrl + ':' + line + ':' + column,
+    value: 'SyntaxError: ' + limitedString(
+      dataDescriptorValue(ownPropertyDescriptor(originalError, 'message')),
+      'Invalid JavaScript syntax'
+    ) + '\n' + '    at ' + sourceUrl + ':' + line + ':' + column,
     configurable: true
   })
 }
@@ -2069,35 +2355,39 @@ function createHostFunctions() {
   return objectFreeze(host)
 }
 
-function handleHostFunctionResult(envelope) {
-  const pending = reflectApply(mapGet, pendingHostCalls, [envelope.id])
+function handleHostFunctionResult(envelope, type) {
+  const id = ownDataValue(envelope, 'id')
+  const pending = reflectApply(mapGet, pendingHostCalls, [id])
   if (!pending) throw new Error('Unknown host function response')
-  reflectApply(mapDelete, pendingHostCalls, [envelope.id])
+  reflectApply(mapDelete, pendingHostCalls, [id])
 
-  if (envelope.type === 'host-result') {
+  if (type === 'host-result') {
     settleOwnedValue(
       pending.resolve,
       pending.reject,
-      cloneValue(envelope.value, 'host function result')
+      cloneValue(ownDataValue(envelope, 'value'), 'host function result')
     )
   } else {
-    const detail = envelope.error
+    const detail = ownDataValue(envelope, 'error')
+    const message = ownDataValue(detail, 'message')
+    const name = ownDataValue(detail, 'name')
+    const code = ownDataValue(detail, 'code')
     const error = new SafeError(
-      detail && typeof detail.message === 'string' ? detail.message : 'Host function failed'
+      typeof message === 'string' ? message : 'Host function failed'
     )
-    if (detail && typeof detail.name === 'string') {
+    if (typeof name === 'string') {
       objectDefineProperty(error, 'name', {
         configurable: true,
         enumerable: false,
-        value: detail.name,
+        value: name,
         writable: true
       })
     }
-    if (detail && typeof detail.code === 'string') {
+    if (typeof code === 'string') {
       objectDefineProperty(error, 'code', {
         configurable: true,
         enumerable: true,
-        value: detail.code,
+        value: code,
         writable: true
       })
     }
@@ -2105,43 +2395,42 @@ function handleHostFunctionResult(envelope) {
   }
 }
 
-async function dispatch(envelope) {
-  if (envelope === null || typeof envelope !== 'object' || typeof envelope.type !== 'string') {
-    throw new Error('Invalid host protocol message')
-  }
-  if (envelope.type === 'terminate') {
+async function dispatch(envelope, type) {
+  if (typeof type !== 'string') throw new Error('Invalid host protocol message')
+  if (type === 'terminate') {
     safeClearInterval(keepAlive)
     closePort()
     if (closeDiagnosticPort) closeDiagnosticPort()
     return
   }
-  if (envelope.type !== 'message' && envelope.type !== 'request') {
+  if (type !== 'message' && type !== 'request') {
     throw new Error('Unknown host protocol message')
   }
+  const id = ownDataValue(envelope, 'id')
   if (!handler) {
     const error = { name: 'Error', message: 'The component did not register an onMessage handler' }
-    if (envelope.type === 'request') {
-      postToHost({ type: 'request-error', id: envelope.id, error })
+    if (type === 'request') {
+      postToHost({ type: 'request-error', id, error })
     } else {
       postToHost({ type: 'runtime-error', error })
     }
     return
   }
 
-  const value = cloneValue(envelope.value, 'message')
+  const value = cloneValue(ownDataValue(envelope, 'value'), 'message')
   try {
     const outcome = await adoptValue(handler(value))
     const result = outcome.value
-    if (envelope.type === 'request') {
+    if (type === 'request') {
       postToHost({
         type: 'response',
-        id: envelope.id,
+        id,
         value: cloneValue(result, 'response')
       })
     }
   } catch (error) {
-    if (envelope.type === 'request') {
-      postToHost({ type: 'request-error', id: envelope.id, error: cloneError(error) })
+    if (type === 'request') {
+      postToHost({ type: 'request-error', id, error: cloneError(error) })
     } else {
       postToHost({ type: 'runtime-error', error: cloneError(error) })
     }
@@ -2171,7 +2460,9 @@ async function initialize() {
   const handshake = {
     type: 'session-port',
     port: channel.port2,
-    protocolSecret
+    protocolSecret,
+    diagnosticPort: undefined,
+    diagnosticSecret: undefined
   }
   const transferList = [channel.port2]
   if (workerData.diagnostics.enabled) {
@@ -2201,16 +2492,17 @@ async function initialize() {
       return
     }
 
-    if (envelope.type === 'host-result' || envelope.type === 'host-error') {
+    const type = ownDataValue(envelope, 'type')
+    if (type === 'host-result' || type === 'host-error') {
       try {
-        handleHostFunctionResult(envelope)
+        handleHostFunctionResult(envelope, type)
       } catch (error) {
         reportFatal(error)
       }
       return
     }
 
-    const dispatched = thenPromise(processing, () => dispatch(envelope))
+    const dispatched = thenPromise(processing, () => dispatch(envelope, type))
     processing = thenPromise(dispatched, undefined, (error) => {
       reportFatal(error)
     })
@@ -3072,31 +3364,43 @@ export class UntrustedWorkerSession extends EventEmitter {
       this.#fail(sessionError('Unexpected parent-port message', 'ERR_UNTRUSTED_WORKER_PROTOCOL'))
       return
     }
-    if (message?.type === 'bootstrap-error') {
-      this.#fail(remoteError(message.error, 'ERR_UNTRUSTED_WORKER_BOOTSTRAP'))
+    const type = hostOwnDataValue(message, 'type')
+    if (type === 'bootstrap-error') {
+      this.#fail(remoteError(
+        hostOwnDataValue(message, 'error'),
+        'ERR_UNTRUSTED_WORKER_BOOTSTRAP'
+      ))
       return
     }
-    const validDiagnosticHandshake = getSessionData(this).diagnostics.enabled
-      ? isHostMessagePort(message?.diagnosticPort) &&
-        typeof message.diagnosticSecret === 'string' && message.diagnosticSecret.length >= 32
-      : message?.diagnosticPort === undefined && message?.diagnosticSecret === undefined
-    if (message?.type !== 'session-port' || !isHostMessagePort(message.port) ||
-        typeof message.protocolSecret !== 'string' || message.protocolSecret.length < 32 ||
+    const port = hostOwnDataValue(message, 'port')
+    const protocolSecret = hostOwnDataValue(message, 'protocolSecret')
+    const diagnosticPortDescriptor = hostOwnDataDescriptor(message, 'diagnosticPort')
+    const diagnosticSecretDescriptor = hostOwnDataDescriptor(message, 'diagnosticSecret')
+    const diagnosticPort = diagnosticPortDescriptor?.value
+    const diagnosticSecret = diagnosticSecretDescriptor?.value
+    const validDiagnosticHandshake = diagnosticPortDescriptor !== undefined &&
+      diagnosticSecretDescriptor !== undefined &&
+      (getSessionData(this).diagnostics.enabled
+        ? isHostMessagePort(diagnosticPort) &&
+          typeof diagnosticSecret === 'string' && diagnosticSecret.length >= 32
+        : diagnosticPort === undefined && diagnosticSecret === undefined)
+    if (type !== 'session-port' || !isHostMessagePort(port) ||
+        typeof protocolSecret !== 'string' || protocolSecret.length < 32 ||
         !validDiagnosticHandshake) {
       this.#fail(sessionError('Invalid worker handshake', 'ERR_UNTRUSTED_WORKER_PROTOCOL'))
       return
     }
 
-    secrets.port = message.port
-    secrets.protocolSecret = message.protocolSecret
+    secrets.port = port
+    secrets.protocolSecret = protocolSecret
     secrets.rawPortPost = (value) => hostReflectApply(
       hostMessagePortPostMessage,
       secrets.port,
       [value]
     )
     if (getSessionData(this).diagnostics.enabled) {
-      secrets.diagnosticPort = message.diagnosticPort
-      secrets.diagnosticSecret = message.diagnosticSecret
+      secrets.diagnosticPort = diagnosticPort
+      secrets.diagnosticSecret = diagnosticSecret
       hostReflectApply(hostMessagePortOn, secrets.diagnosticPort, ['message', (message) => {
         try {
           const record = this.#authenticateDiagnostic(message)
@@ -3148,37 +3452,40 @@ export class UntrustedWorkerSession extends EventEmitter {
   }
 
   #authenticateMessage (message) {
-    if (message === null || typeof message !== 'object' ||
-        !hostReflectApply(hostNumberIsSafeInteger, undefined, [message.sequence]) || message.sequence !== getSessionData(this).inboundSequence + 1 ||
-        message.payload === null || typeof message.payload !== 'object' ||
-        !hostReflectApply(safeArrayBufferIsView, undefined, [message.payload]) ||
-        typeof message.mac !== 'string') {
+    const sequence = hostOwnDataValue(message, 'sequence')
+    const payload = hostOwnDataValue(message, 'payload')
+    const mac = hostOwnDataValue(message, 'mac')
+    if (!hostReflectApply(hostNumberIsSafeInteger, undefined, [sequence]) ||
+        sequence !== getSessionData(this).inboundSequence + 1 ||
+        payload === null || typeof payload !== 'object' ||
+        !hostReflectApply(safeArrayBufferIsView, undefined, [payload]) ||
+        typeof mac !== 'string') {
       throw sessionError('Unauthenticated worker protocol message', 'ERR_UNTRUSTED_WORKER_PROTOCOL')
     }
 
     assertNoSharedMemory(
-      message.payload,
+      payload,
       'protocol payload',
       getSessionData(this).maxMessageBytes,
       'maxMessageBytes'
     )
-    const byteLength = hostReflectApply(hostTypedArrayByteLength, message.payload, [])
+    const byteLength = hostReflectApply(hostTypedArrayByteLength, payload, [])
     if (byteLength > getSessionData(this).maxMessageBytes) {
       throw sessionError('Worker protocol message is too large', 'ERR_UNTRUSTED_WORKER_PROTOCOL')
     }
     const expected = hostReflectApply(hostBufferFrom, undefined, [protocolMac(
       getSessionSecrets(this).protocolSecret,
       'worker-to-host',
-      message.sequence,
-      message.payload
+      sequence,
+      payload
     ), 'base64'])
-    const actual = hostReflectApply(hostBufferFrom, undefined, [message.mac, 'base64'])
+    const actual = hostReflectApply(hostBufferFrom, undefined, [mac, 'base64'])
     if (expected.length !== actual.length || !safeHostTimingSafeEqual(expected, actual)) {
       throw sessionError('Unauthenticated worker protocol message', 'ERR_UNTRUSTED_WORKER_PROTOCOL')
     }
     let body
     try {
-      body = safeHostV8Deserialize(message.payload)
+      body = safeHostV8Deserialize(payload)
       assertSupportedProtocolValue(
         body,
         'message',
@@ -3188,29 +3495,31 @@ export class UntrustedWorkerSession extends EventEmitter {
     } catch {
       throw sessionError('Invalid worker protocol payload', 'ERR_UNTRUSTED_WORKER_PROTOCOL')
     }
-    getSessionData(this).inboundSequence = message.sequence
+    getSessionData(this).inboundSequence = sequence
     return body
   }
 
   #authenticateDiagnostic (message) {
-    if (message === null || typeof message !== 'object' ||
-        !hostReflectApply(hostNumberIsSafeInteger, undefined, [message.sequence]) ||
-        message.sequence !== getSessionData(this).diagnosticSequence + 1 ||
-        message.payload === null || typeof message.payload !== 'object' ||
-        !hostReflectApply(safeArrayBufferIsView, undefined, [message.payload]) ||
-        typeof message.mac !== 'string') {
+    const sequence = hostOwnDataValue(message, 'sequence')
+    const payload = hostOwnDataValue(message, 'payload')
+    const mac = hostOwnDataValue(message, 'mac')
+    if (!hostReflectApply(hostNumberIsSafeInteger, undefined, [sequence]) ||
+        sequence !== getSessionData(this).diagnosticSequence + 1 ||
+        payload === null || typeof payload !== 'object' ||
+        !hostReflectApply(safeArrayBufferIsView, undefined, [payload]) ||
+        typeof mac !== 'string') {
       throw sessionError(
         'Unauthenticated worker diagnostic message',
         'ERR_UNTRUSTED_WORKER_DIAGNOSTIC_PROTOCOL'
       )
     }
     assertNoSharedMemory(
-      message.payload,
+      payload,
       'diagnostic payload',
       getSessionData(this).diagnostics.maxRecordBytes,
       'maxMessageBytes'
     )
-    const byteLength = hostReflectApply(hostTypedArrayByteLength, message.payload, [])
+    const byteLength = hostReflectApply(hostTypedArrayByteLength, payload, [])
     if (byteLength > getSessionData(this).diagnostics.maxRecordBytes ||
         getSessionData(this).diagnosticRecords >= getSessionData(this).diagnostics.maxRecords ||
         getSessionData(this).diagnosticBytes + byteLength > getSessionData(this).diagnostics.maxBytes) {
@@ -3222,10 +3531,10 @@ export class UntrustedWorkerSession extends EventEmitter {
     const expected = hostReflectApply(hostBufferFrom, undefined, [protocolMac(
       getSessionSecrets(this).diagnosticSecret,
       'worker-diagnostic-to-host',
-      message.sequence,
-      message.payload
+      sequence,
+      payload
     ), 'base64'])
-    const actual = hostReflectApply(hostBufferFrom, undefined, [message.mac, 'base64'])
+    const actual = hostReflectApply(hostBufferFrom, undefined, [mac, 'base64'])
     if (expected.length !== actual.length || !safeHostTimingSafeEqual(expected, actual)) {
       throw sessionError(
         'Unauthenticated worker diagnostic message',
@@ -3234,7 +3543,7 @@ export class UntrustedWorkerSession extends EventEmitter {
     }
     let record
     try {
-      record = safeHostV8Deserialize(message.payload)
+      record = safeHostV8Deserialize(payload)
       assertSupportedProtocolValue(
         record,
         'diagnostic payload',
@@ -3247,18 +3556,19 @@ export class UntrustedWorkerSession extends EventEmitter {
         'ERR_UNTRUSTED_WORKER_DIAGNOSTIC_PROTOCOL'
       )
     }
-    if (record === null || typeof record !== 'object' ||
-        !hostReflectApply(hostSetHas, DIAGNOSTIC_LEVELS, [record.level]) ||
-        typeof record.text !== 'string' || hostReflectOwnKeys(record).length !== 2) {
+    const level = hostOwnDataValue(record, 'level')
+    const text = hostOwnDataValue(record, 'text')
+    if (!hostReflectApply(hostSetHas, DIAGNOSTIC_LEVELS, [level]) ||
+        typeof text !== 'string' || hostReflectOwnKeys(record).length !== 2) {
       throw sessionError(
         'Invalid worker diagnostic payload',
         'ERR_UNTRUSTED_WORKER_DIAGNOSTIC_PROTOCOL'
       )
     }
-    getSessionData(this).diagnosticSequence = message.sequence
+    getSessionData(this).diagnosticSequence = sequence
     getSessionData(this).diagnosticRecords++
     getSessionData(this).diagnosticBytes += byteLength
-    return hostObjectFreeze({ level: record.level, text: record.text })
+    return hostObjectFreeze({ level, text })
   }
 
   async #handleDiagnostic (record, sequence) {
@@ -3286,42 +3596,64 @@ export class UntrustedWorkerSession extends EventEmitter {
     getSessionData(this).diagnosticsHandledSequence = sequence
     while (getSessionData(this).deferredDiagnosticEnvelopes.length > 0 &&
            getSessionData(this).deferredDiagnosticEnvelopes[0].diagnosticSequence <= sequence) {
+      const deferred = hostReflectApply(
+        hostArrayShift,
+        getSessionData(this).deferredDiagnosticEnvelopes,
+        []
+      )
       this.#handleMessage(
-        hostReflectApply(hostArrayShift, getSessionData(this).deferredDiagnosticEnvelopes, []),
-        true
+        deferred.envelope,
+        true,
+        deferred.type,
+        deferred.diagnosticSequence
       )
       if (getSessionData(this).state === 'closing' || getSessionData(this).state === 'closed') return
     }
   }
 
-  #handleMessage (envelope, diagnosticsReady = false) {
+  #handleMessage (
+    envelope,
+    diagnosticsReady = false,
+    inspectedType,
+    inspectedDiagnosticSequence
+  ) {
     if (getSessionData(this).state === 'closing' || getSessionData(this).state === 'closed') return
-    if (envelope === null || typeof envelope !== 'object' || typeof envelope.type !== 'string' ||
-        !hostReflectApply(hostNumberIsSafeInteger, undefined, [envelope.diagnosticSequence]) ||
-        envelope.diagnosticSequence < 0) {
+    const type = inspectedType === undefined
+      ? hostOwnDataValue(envelope, 'type')
+      : inspectedType
+    const diagnosticSequence = inspectedDiagnosticSequence === undefined
+      ? hostOwnDataValue(envelope, 'diagnosticSequence')
+      : inspectedDiagnosticSequence
+    if (typeof type !== 'string' ||
+        !hostReflectApply(hostNumberIsSafeInteger, undefined, [diagnosticSequence]) ||
+        diagnosticSequence < 0) {
       this.#fail(sessionError('Invalid worker protocol message', 'ERR_UNTRUSTED_WORKER_PROTOCOL'))
       return
     }
     if (!diagnosticsReady &&
         (getSessionData(this).deferredDiagnosticEnvelopes.length > 0 ||
-         envelope.diagnosticSequence > getSessionData(this).diagnosticsHandledSequence)) {
-      if (!getSessionData(this).diagnostics.enabled && envelope.diagnosticSequence !== 0) {
+         diagnosticSequence > getSessionData(this).diagnosticsHandledSequence)) {
+      if (!getSessionData(this).diagnostics.enabled && diagnosticSequence !== 0) {
         this.#fail(sessionError('Invalid worker protocol message', 'ERR_UNTRUSTED_WORKER_PROTOCOL'))
       } else {
-        hostReflectApply(hostArrayPush, getSessionData(this).deferredDiagnosticEnvelopes, [envelope])
+        hostReflectApply(hostArrayPush, getSessionData(this).deferredDiagnosticEnvelopes, [
+          createDeferredProtocolEnvelope(envelope, type, diagnosticSequence)
+        ])
       }
       return
     }
 
-    if (envelope.type === 'host-call') {
+    if (type === 'host-call') {
       this.#handleHostCall(envelope)
       return
     }
 
+    const valueDescriptor = hostOwnDataDescriptor(envelope, 'value')
+    const value = valueDescriptor?.value
     try {
-      if (hostReflectApply(hostObjectHasOwn, undefined, [envelope, 'value'])) {
+      if (valueDescriptor !== undefined) {
         assertNoSharedMemory(
-          envelope.value,
+          value,
           'message',
           getSessionData(this).maxMessageBytes,
           'maxMessageBytes'
@@ -3332,7 +3664,7 @@ export class UntrustedWorkerSession extends EventEmitter {
       return
     }
 
-    if (envelope.type === 'ready') {
+    if (type === 'ready') {
       if (getSessionData(this).state !== 'starting') {
         this.#fail(sessionError('Unexpected ready message', 'ERR_UNTRUSTED_WORKER_PROTOCOL'))
         return
@@ -3340,7 +3672,7 @@ export class UntrustedWorkerSession extends EventEmitter {
       hostClearTimeout(getSessionData(this).startupTimer)
       getSessionData(this).state = 'ready'
       getSessionData(this).readySettled = true
-      getSessionData(this).resolveReady(envelope.value)
+      getSessionData(this).resolveReady(value)
       getSessionData(this).lifetimeTimer = hostSetTimeout(() => {
         this.#fail(sessionError(
           `Session lifetime exceeded ${getSessionData(this).lifetimeTimeoutMs} ms`,
@@ -3352,25 +3684,29 @@ export class UntrustedWorkerSession extends EventEmitter {
       return
     }
 
-    if (envelope.type === 'message') {
-      emitHostEvent(this, 'message', envelope.value)
+    if (type === 'message') {
+      emitHostEvent(this, 'message', value)
       return
     }
-    if (envelope.type === 'runtime-error') {
-      this.#emitError(remoteError(envelope.error))
+    if (type === 'runtime-error') {
+      this.#emitError(remoteError(hostOwnDataValue(envelope, 'error')))
       return
     }
-    if (envelope.type === 'fatal') {
-      this.#fail(remoteError(envelope.error, 'ERR_UNTRUSTED_WORKER_BOOTSTRAP'))
+    if (type === 'fatal') {
+      this.#fail(remoteError(
+        hostOwnDataValue(envelope, 'error'),
+        'ERR_UNTRUSTED_WORKER_BOOTSTRAP'
+      ))
       return
     }
-    if (envelope.type === 'response' || envelope.type === 'request-error') {
-      const pending = hostReflectApply(hostMapGet, getSessionData(this).pending, [envelope.id])
+    if (type === 'response' || type === 'request-error') {
+      const id = hostOwnDataValue(envelope, 'id')
+      const pending = hostReflectApply(hostMapGet, getSessionData(this).pending, [id])
       if (!pending) {
         this.#fail(sessionError('Unknown request response', 'ERR_UNTRUSTED_WORKER_PROTOCOL'))
         return
       }
-      hostReflectApply(hostMapDelete, getSessionData(this).pending, [envelope.id])
+      hostReflectApply(hostMapDelete, getSessionData(this).pending, [id])
       hostClearTimeout(pending.timer)
       if (hostReflectApply(hostDateNow, undefined, []) >= pending.deadline) {
         const error = sessionError(
@@ -3379,10 +3715,10 @@ export class UntrustedWorkerSession extends EventEmitter {
         )
         pending.reject(error)
         this.#fail(error)
-      } else if (envelope.type === 'response') {
-        pending.resolve(envelope.value)
+      } else if (type === 'response') {
+        pending.resolve(value)
       } else {
-        pending.reject(remoteError(envelope.error))
+        pending.reject(remoteError(hostOwnDataValue(envelope, 'error')))
       }
       return
     }
@@ -3392,32 +3728,35 @@ export class UntrustedWorkerSession extends EventEmitter {
 
   #handleHostCall (envelope) {
     if (getSessionData(this).state !== 'starting' && getSessionData(this).state !== 'ready') return
-    if (!hostReflectApply(hostNumberIsSafeInteger, undefined, [envelope.id]) || envelope.id <= 0 ||
-        typeof envelope.name !== 'string' || !hostArrayIsArray(envelope.arguments)) {
+    const id = hostOwnDataValue(envelope, 'id')
+    const name = hostOwnDataValue(envelope, 'name')
+    const argumentsList = hostOwnDataValue(envelope, 'arguments')
+    if (!hostReflectApply(hostNumberIsSafeInteger, undefined, [id]) || id <= 0 ||
+        typeof name !== 'string' || !hostArrayIsArray(argumentsList)) {
       this.#fail(sessionError('Invalid host function request', 'ERR_UNTRUSTED_WORKER_PROTOCOL'))
       return
     }
 
     try {
       assertNoSharedMemory(
-        envelope.arguments,
+        argumentsList,
         'host function arguments',
         getSessionData(this).maxMessageBytes,
         'maxMessageBytes'
       )
     } catch (error) {
-      this.#sendHostFunctionError(envelope.id, error)
+      this.#sendHostFunctionError(id, error)
       return
     }
 
     const hostFunction = hostReflectApply(
       hostMapGet,
       getSessionData(this).hostFunctions,
-      [envelope.name]
+      [name]
     )
     if (!hostFunction) {
-      this.#sendHostFunctionError(envelope.id, sessionError(
-        `Unknown host function: ${envelope.name}`,
+      this.#sendHostFunctionError(id, sessionError(
+        `Unknown host function: ${name}`,
         'ERR_UNTRUSTED_WORKER_HOST_FUNCTION'
       ))
       return
@@ -3441,16 +3780,16 @@ export class UntrustedWorkerSession extends EventEmitter {
     getSessionData(this).inFlightHostFunctions++
     const requestIndex = getSessionData(this).hostFunctionCalls
     void catchHostPromise(
-      this.#invokeHostFunction(envelope, hostFunction, requestIndex),
+      this.#invokeHostFunction(id, name, argumentsList, hostFunction, requestIndex),
       () => {}
     )
   }
 
-  async #invokeHostFunction (envelope, hostFunction, requestIndex) {
+  async #invokeHostFunction (id, name, argumentsList, hostFunction, requestIndex) {
     try {
       const outcome = await invokeHostFunction(
         hostFunction,
-        envelope.arguments,
+        argumentsList,
         {
           abortSignal: hostReflectApply(
             hostAbortControllerSignal,
@@ -3458,9 +3797,9 @@ export class UntrustedWorkerSession extends EventEmitter {
             []
           ),
           sessionId: getSessionData(this).sessionId,
-          requestId: `${getSessionData(this).sessionId}:${envelope.id}`,
+          requestId: `${getSessionData(this).sessionId}:${id}`,
           requestIndex,
-          hostFunctionName: envelope.name
+          hostFunctionName: name
         }
       )
       const value = outcome.value
@@ -3479,11 +3818,11 @@ export class UntrustedWorkerSession extends EventEmitter {
       )
       assertProtocolSerializable(cloned, 'host function result')
       if (getSessionData(this).state === 'starting' || getSessionData(this).state === 'ready') {
-        this.#sendProtocol({ type: 'host-result', id: envelope.id, value: cloned })
+        this.#sendProtocol({ type: 'host-result', id, value: cloned })
       }
     } catch (error) {
       if (getSessionData(this).state === 'starting' || getSessionData(this).state === 'ready') {
-        this.#sendHostFunctionError(envelope.id, error)
+        this.#sendHostFunctionError(id, error)
       }
     } finally {
       getSessionData(this).inFlightHostFunctions--
