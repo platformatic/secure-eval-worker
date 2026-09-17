@@ -4,7 +4,11 @@ import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { Readable } from 'node:stream'
 import { deserialize as v8Deserialize, serialize as v8Serialize } from 'node:v8'
-import { isPromise as hostIsPromise, isProxy as hostIsProxy } from 'node:util/types'
+import {
+  isKeyObject as hostIsKeyObject,
+  isPromise as hostIsPromise,
+  isProxy as hostIsProxy
+} from 'node:util/types'
 import { MessagePort, Worker } from 'node:worker_threads'
 
 import {
@@ -39,6 +43,7 @@ import {
 
 // Snapshot builtin ESM bindings before caller-controlled option processing can
 // synchronize poisoned CommonJS builtin exports.
+const safeHostIsKeyObject = hostIsKeyObject
 const safeHostIsPromise = hostIsPromise
 const safeHostIsProxy = hostIsProxy
 const safeHostCreateHmac = createHmac
@@ -357,6 +362,16 @@ function isHostMessagePort (value) {
   }
 }
 
+function isHostProtocolKey (value) {
+  if (!safeHostIsKeyObject(value)) return false
+  try {
+    safeHostCreateHmac('sha256', value)
+    return true
+  } catch {
+    return false
+  }
+}
+
 function closeHostMessagePort (port) {
   if (port) hostReflectApply(hostMessagePortClose, port, [])
 }
@@ -434,7 +449,7 @@ const SESSION_BOOTSTRAP = String.raw`
 ;(function trustedBootstrap() {
 
 const cryptoBuiltin = require('node:crypto')
-const { createHmac, randomBytes } = cryptoBuiltin
+const { createHmac, generateKeySync } = cryptoBuiltin
 const asyncHooksBuiltin = require('node:async_hooks')
 const childProcessBuiltin = require('node:child_process')
 const eventEmitterPrototype = require('node:events').EventEmitter.prototype
@@ -446,6 +461,8 @@ const dnsPromisesBuiltin = require('node:dns/promises')
 const httpBuiltin = require('node:http')
 const http2Builtin = require('node:http2')
 const httpsBuiltin = require('node:https')
+const inspectorBuiltin = require('node:inspector')
+const inspectorPromisesBuiltin = require('node:inspector/promises')
 const httpGlobalAgent = httpBuiltin.globalAgent
 const httpsGlobalAgent = httpsBuiltin.globalAgent
 const moduleBuiltin = require('node:module')
@@ -1161,16 +1178,25 @@ function replaceAndVerifyDataProperty(target, name, value) {
   }
 }
 
-function denyFunctions(target, prefix, allowedNames) {
+function denyFunctions(target, prefix, allowedNames, verify = false) {
   for (const [name, descriptor] of Object.entries(objectGetOwnPropertyDescriptors(target))) {
     // Several security-sensitive builtins expose callable constructors through
     // configurable accessors rather than ordinary value properties.
     if ((!allowedNames || !reflectApply(setHas, allowedNames, [name])) &&
         (!reflectApply(objectHasOwn, undefined, [descriptor, 'value']) ||
          typeof descriptor.value === 'function')) {
-      replaceProperty(target, name, function deniedBuiltin() {
+      const denied = function deniedBuiltin() {
         return sandboxDenied(prefix + '.' + name)
-      })
+      }
+      replaceProperty(target, name, denied)
+      if (verify) {
+        const replacement = objectGetOwnPropertyDescriptor(target, name)
+        if (!replacement ||
+            !reflectApply(objectHasOwn, undefined, [replacement, 'value']) ||
+            replacement.value !== denied || replacement.writable || replacement.configurable) {
+          throw new SafeError('Failed to disable ' + prefix + '.' + name)
+        }
+      }
     }
   }
 }
@@ -1582,11 +1608,41 @@ function hardenDangerousBuiltins() {
     replaceAndVerifyDataProperty(globalThis, name, replacement)
   }
 
+  // Inspector sessions can take heap snapshots without filesystem access.
+  // Deny both APIs independently of the Permission Model, including callable
+  // nested namespaces, and fail closed if a supported runtime makes one of
+  // those properties impossible to replace.
+  const deniedInspectorNamespaces = new SafeWeakSet()
+  for (const [builtin, prefix] of [
+    [inspectorBuiltin, 'node:inspector'],
+    [inspectorPromisesBuiltin, 'node:inspector/promises']
+  ]) {
+    const descriptors = objectGetOwnPropertyDescriptors(builtin)
+    const names = reflectOwnKeys(descriptors)
+    for (let index = 0; index < names.length; index++) {
+      const name = names[index]
+      const descriptor = descriptors[name]
+      if (reflectApply(objectHasOwn, undefined, [descriptor, 'value']) &&
+          descriptor.value !== null && typeof descriptor.value === 'object' &&
+          !reflectApply(weakSetHas, deniedInspectorNamespaces, [descriptor.value])) {
+        reflectApply(weakSetAdd, deniedInspectorNamespaces, [descriptor.value])
+        denyFunctions(
+          descriptor.value,
+          prefix + '.' + SafeString(name),
+          undefined,
+          true
+        )
+      }
+    }
+    denyFunctions(builtin, prefix, undefined, true)
+  }
+
   // Keep the protocol's previously captured serializer functions private and
   // deny the complete guest-facing V8 module so new profiling, snapshot, or
   // object-query APIs cannot bypass an incomplete name list. V8 also exposes
   // callable APIs through nested namespaces such as promiseHooks and
-  // startupSnapshot, so deny every object-valued namespace generically.
+  // startupSnapshot, so deny every object-valued namespace generically and
+  // fail closed if a supported runtime makes one impossible to replace.
   const v8Descriptors = objectGetOwnPropertyDescriptors(v8Builtin)
   const v8Names = reflectOwnKeys(v8Descriptors)
   const startupSnapshotCompatibility = new Set(['isBuildingSnapshot'])
@@ -1598,11 +1654,12 @@ function hardenDangerousBuiltins() {
       denyFunctions(
         descriptor.value,
         'node:v8.' + name,
-        name === 'startupSnapshot' ? startupSnapshotCompatibility : undefined
+        name === 'startupSnapshot' ? startupSnapshotCompatibility : undefined,
+        true
       )
     }
   }
-  denyFunctions(v8Builtin, 'node:v8')
+  denyFunctions(v8Builtin, 'node:v8', undefined, true)
   denyFunctions(seaBuiltin, 'node:sea')
 
   replaceProperty(workerThreadsBuiltin, 'BroadcastChannel', function DeniedBroadcastChannel() {
@@ -2461,7 +2518,10 @@ async function initialize() {
     objectFreeze(portPrototype)
     portPrototype = objectGetPrototypeOf(portPrototype)
   }
-  protocolSecret = randomBytes(32).toString('base64')
+  // Keep authentication material in a native-backed KeyObject rather than a
+  // JavaScript bearer-token string that would be recoverable from a V8 heap
+  // snapshot. Guest code receives neither this key nor the private port.
+  protocolSecret = generateKeySync('hmac', { length: 256 })
   const handshake = {
     type: 'session-port',
     port: channel.port2,
@@ -2475,7 +2535,7 @@ async function initialize() {
     diagnosticPort = diagnosticChannel.port1
     rawPostDiagnostic = diagnosticPort.postMessage.bind(diagnosticPort)
     closeDiagnosticPort = diagnosticPort.close.bind(diagnosticPort)
-    diagnosticSecret = randomBytes(32).toString('base64')
+    diagnosticSecret = generateKeySync('hmac', { length: 256 })
     diagnosticPort.unref()
     handshake.diagnosticPort = diagnosticChannel.port2
     handshake.diagnosticSecret = diagnosticSecret
@@ -3387,12 +3447,10 @@ export class UntrustedWorkerSession extends EventEmitter {
     const validDiagnosticHandshake = diagnosticPortDescriptor !== undefined &&
       diagnosticSecretDescriptor !== undefined &&
       (getSessionData(this).diagnostics.enabled
-        ? isHostMessagePort(diagnosticPort) &&
-          typeof diagnosticSecret === 'string' && diagnosticSecret.length >= 32
+        ? isHostMessagePort(diagnosticPort) && isHostProtocolKey(diagnosticSecret)
         : diagnosticPort === undefined && diagnosticSecret === undefined)
     if (type !== 'session-port' || !isHostMessagePort(port) ||
-        typeof protocolSecret !== 'string' || protocolSecret.length < 32 ||
-        !validDiagnosticHandshake) {
+        !isHostProtocolKey(protocolSecret) || !validDiagnosticHandshake) {
       this.#fail(sessionError('Invalid worker handshake', 'ERR_UNTRUSTED_WORKER_PROTOCOL'))
       return
     }

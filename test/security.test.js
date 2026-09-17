@@ -631,6 +631,62 @@ for (const type of EXECUTION_TYPES) {
     }
   })
 
+  test(`${type} blocks Heapjack-style heap snapshots through every V8 alias`, async () => {
+    const result = await evaluateInGuest(type, `
+      const namespace = await import('node:v8')
+      const bareNamespace = await import('v8')
+      const module = await import('node:module')
+      const require = module.createRequire(process.execPath)
+      const aliases = [
+        namespace,
+        namespace.default,
+        bareNamespace,
+        bareNamespace.default,
+        require('node:v8'),
+        require('v8'),
+        module.Module._load('node:v8'),
+        module.Module._load('v8'),
+        process.getBuiltinModule('node:v8'),
+        process.getBuiltinModule('v8')
+      ]
+      const names = ['getHeapSnapshot', 'writeHeapSnapshot']
+      const immutable = names.map((name) => {
+        const target = require('node:v8')
+        const original = target[name]
+        try { target[name] = () => 'REPLACED' } catch {}
+        const assignmentRejected = target[name] === original
+        const deletionRejected = !Reflect.deleteProperty(target, name) && target[name] === original
+        const definitionRejected = !Reflect.defineProperty(target, name, {
+          configurable: true,
+          value: () => 'REPLACED',
+          writable: true
+        }) && target[name] === original
+        const descriptor = Object.getOwnPropertyDescriptor(target, name)
+        return assignmentRejected && deletionRejected && definitionRejected &&
+          descriptor.value === original && !descriptor.writable && !descriptor.configurable
+      })
+      const codes = []
+      let allowed = null
+      outer: for (let aliasIndex = 0; aliasIndex < aliases.length; aliasIndex++) {
+        for (const name of names) {
+          const call = aliases[aliasIndex][name]
+          try {
+            const snapshot = Reflect.apply(call, aliases[aliasIndex], [])
+            try { snapshot?.destroy?.() } catch {}
+            allowed = aliasIndex + ':' + name
+            break outer
+          } catch (error) {
+            codes.push(error.code)
+          }
+        }
+      }
+      return { allowed, codes, immutable }
+    `)
+    assert.equal(result.allowed, null)
+    assert.deepEqual(result.codes, Array(20).fill('ERR_ACCESS_DENIED'))
+    assert.deepEqual(result.immutable, [true, true])
+  })
+
   test(`${type} cannot inspect worker environment data through V8 aliases`, async () => {
     const key = `secure-eval-worker-query-${randomUUID()}`
     const secret = `query-secret-${randomUUID()}`
@@ -714,14 +770,15 @@ for (const type of EXECUTION_TYPES) {
       const results = []
       for (const Session of constructors) {
         for (const method of ['connect', 'connectToMainThread']) {
-          const session = new Session()
+          let session
           try {
+            session = new Session()
             session[method]()
             results.push('ALLOWED')
           } catch (error) {
             results.push(error.code)
           }
-          try { session.disconnect() } catch {}
+          try { session?.disconnect() } catch {}
         }
       }
       const openers = [
