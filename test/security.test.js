@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import { randomUUID, webcrypto } from 'node:crypto'
 import fs from 'node:fs'
+import { builtinModules } from 'node:module'
 import { tmpdir } from 'node:os'
 import { connect, createServer } from 'node:net'
 import { join } from 'node:path'
@@ -106,48 +107,144 @@ for (const type of EXECUTION_TYPES) {
     assert.equal(code, 'ERR_ACCESS_DENIED')
   })
 
-  test(`${type} denies WASI and unavailable native capability modules`, async () => {
+  test(`${type} denies WASI, FFI, and unavailable native capability modules`, async () => {
     const result = await evaluateInGuest(type, `
       const Module = await import('node:module')
       const require = Module.createRequire(process.execPath)
-      const wasiConstructors = [
-        (await import('node:wasi')).WASI,
-        process.getBuiltinModule('node:wasi').WASI,
-        require('node:wasi').WASI,
-        Module.default._load('node:wasi').WASI
-      ]
-      const wasi = wasiConstructors.map(WASI => {
+      const mutationResult = (module, name) => ({
+        set: Reflect.set(module, name, () => 'ALLOWED'),
+        delete: Reflect.deleteProperty(module, name),
+        define: Reflect.defineProperty(module, name, {
+          configurable: true,
+          value: () => 'ALLOWED'
+        })
+      })
+      const invoke = (module, name, construct = false) => {
         try {
-          new WASI({ version: 'preview1' })
+          if (construct) Reflect.construct(module[name], [])
+          else Reflect.apply(module[name], undefined, [])
           return 'ALLOWED'
         } catch (error) {
           return error.code
         }
-      })
-      const unavailable = []
-      for (const id of ['node:ffi', 'node:vfs']) {
-        let imported = false
-        let required = false
-        let loaded = false
-        try { await import(id); imported = true } catch {}
-        try { require(id); required = true } catch {}
-        try { Module.default._load(id); loaded = true } catch {}
-        unavailable.push({
-          imported,
-          required,
-          loaded,
-          builtin: process.getBuiltinModule(id) !== undefined
-        })
       }
-      return { wasi, unavailable }
+
+      const nodeWasi = await import('node:wasi')
+      const bareWasi = await import('wasi')
+      const wasiModules = [
+        nodeWasi,
+        nodeWasi.default,
+        bareWasi,
+        bareWasi.default,
+        process.getBuiltinModule('node:wasi'),
+        process.getBuiltinModule('wasi'),
+        require('node:wasi'),
+        require('wasi'),
+        Module._load('node:wasi'),
+        Module._load('wasi'),
+        Module.default._load('node:wasi'),
+        Module.default._load('wasi')
+      ]
+      const wasiMutations = wasiModules.map(module => mutationResult(module, 'WASI'))
+      Module.syncBuiltinESMExports()
+      Module.default.syncBuiltinESMExports()
+      Module.syncBuiltinESMExports()
+      const wasi = wasiModules.map(module => invoke(module, 'WASI', true))
+
+      let ffiNames = []
+      let ffiModules = []
+      try {
+        const nodeFfi = await import('node:ffi')
+        ffiNames = Reflect.ownKeys(nodeFfi.default).filter(name =>
+          typeof name === 'string' && typeof nodeFfi.default[name] === 'function')
+        ffiModules = [
+          nodeFfi,
+          nodeFfi.default,
+          process.getBuiltinModule('node:ffi'),
+          require('node:ffi'),
+          Module._load('node:ffi'),
+          Module.default._load('node:ffi')
+        ]
+      } catch {}
+      const ffiMutations = ffiModules.map(module =>
+        ffiNames.map(name => mutationResult(module, name)))
+      Module.syncBuiltinESMExports()
+      Module.default.syncBuiltinESMExports()
+      Module.syncBuiltinESMExports()
+      const ffi = ffiModules.map(module =>
+        ffiNames.map(name => invoke(module, name)))
+
+      let bareFfiImported = false
+      let bareFfiRequired = false
+      let bareFfiLoaded = false
+      try { await import('ffi'); bareFfiImported = true } catch {}
+      try { require('ffi'); bareFfiRequired = true } catch {}
+      try { Module._load('ffi'); bareFfiLoaded = true } catch {}
+      const ffiBare = {
+        imported: bareFfiImported,
+        required: bareFfiRequired,
+        loaded: bareFfiLoaded,
+        defaultLoaded: (() => {
+          try { Module.default._load('ffi'); return true } catch { return false }
+        })(),
+        builtin: process.getBuiltinModule('ffi') !== undefined
+      }
+
+      let vfsImported = false
+      let vfsRequired = false
+      let vfsLoaded = false
+      try { await import('node:vfs'); vfsImported = true } catch {}
+      try { require('node:vfs'); vfsRequired = true } catch {}
+      try { Module._load('node:vfs'); vfsLoaded = true } catch {}
+      const unavailable = {
+        imported: vfsImported,
+        required: vfsRequired,
+        loaded: vfsLoaded,
+        defaultLoaded: (() => {
+          try { Module.default._load('node:vfs'); return true } catch { return false }
+        })(),
+        builtin: process.getBuiltinModule('node:vfs') !== undefined
+      }
+      return {
+        wasi,
+        wasiMutations,
+        ffi,
+        ffiNames,
+        ffiMutations,
+        ffiBare,
+        unavailable
+      }
     `)
-    assert.deepEqual(result.wasi, Array(4).fill('ERR_ACCESS_DENIED'))
-    assert.deepEqual(result.unavailable, Array.from({ length: 2 }, () => ({
+    assert.deepEqual(result.wasi, Array(12).fill('ERR_ACCESS_DENIED'))
+    assert.deepEqual(result.wasiMutations, Array.from({ length: 12 }, () => ({
+      set: false,
+      delete: false,
+      define: false
+    })))
+    const ffiAvailable = builtinModules.some(id => id === 'ffi' || id === 'node:ffi')
+    assert.equal(result.ffiNames.length > 20, ffiAvailable)
+    assert.deepEqual(result.ffi, Array.from({ length: ffiAvailable ? 6 : 0 }, () =>
+      Array(result.ffiNames.length).fill('ERR_ACCESS_DENIED')))
+    assert.deepEqual(result.ffiMutations, Array.from({ length: ffiAvailable ? 6 : 0 }, () =>
+      Array.from({ length: result.ffiNames.length }, () => ({
+        set: false,
+        delete: false,
+        define: false
+      }))))
+    assert.deepEqual(result.ffiBare, {
       imported: false,
       required: false,
       loaded: false,
+      defaultLoaded: false,
       builtin: false
-    })))
+    })
+    assert.deepEqual(result.unavailable, {
+      imported: false,
+      required: false,
+      loaded: false,
+      defaultLoaded: false,
+      builtin: false
+    })
   })
 
   test(`${type} cannot use host file descriptors`, async (t) => {

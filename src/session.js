@@ -459,10 +459,13 @@ const sqliteBuiltin = require('node:sqlite')
 const tlsBuiltin = require('node:tls')
 const ttyBuiltin = require('node:tty')
 const v8Builtin = require('node:v8')
+const wasiBuiltin = require('node:wasi')
 const utilTypesBuiltin = require('node:util/types')
 const workerThreadsBuiltin = require('node:worker_threads')
+let ffiBuiltin
 let traceEventsBuiltin
 let quicBuiltin
+try { ffiBuiltin = require('node:ffi') } catch {}
 try { traceEventsBuiltin = require('node:trace_events') } catch {}
 try { quicBuiltin = require('node:quic') } catch {}
 const networkAliasBuiltins = [
@@ -1372,6 +1375,8 @@ function hardenDangerousBuiltins() {
   // needed by Node's loader; the permission root confines those reads.
   denyFunctions(asyncHooksBuiltin, 'node:async_hooks')
   denyFunctions(childProcessBuiltin, 'node:child_process')
+  denyFunctions(wasiBuiltin, 'node:wasi')
+  if (ffiBuiltin) denyFunctions(ffiBuiltin, 'node:ffi')
   if (workerData.localModule) hardenFileSystemForModuleLoading()
   else {
     denyFunctions(fsBuiltin, 'node:fs')
@@ -2945,6 +2950,7 @@ export class UntrustedWorkerSession extends EventEmitter {
     }
     workerExecArgv[workerExecArgv.length] = '--disable-warning=PERM0006'
     workerExecArgv[workerExecArgv.length] = '--disable-warning=DEP0192'
+    workerExecArgv[workerExecArgv.length] = '--disable-warning=ExperimentalWarning'
     try {
       getSessionSecrets(this).worker = new SafeWorker(SESSION_BOOTSTRAP, {
         eval: true,
