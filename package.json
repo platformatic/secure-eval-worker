@@ -1,6 +1,6 @@
 {
   "name": "secure-eval-worker",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Least-privilege worker-thread execution for untrusted JavaScript",
   "type": "module",
   "types": "./src/index.d.ts",
