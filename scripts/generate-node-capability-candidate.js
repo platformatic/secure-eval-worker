@@ -29,7 +29,7 @@ try {
   cpSync(sourceRoot, copiedSource, { recursive: true })
   writeFileSync(join(root, 'package.json'), '{"type":"module"}\n')
   const bootstrapPath = join(copiedSource, 'session-bootstrap.js')
-  let bootstrapSource = readFileSync(bootstrapPath, 'utf8')
+  let bootstrapSource = readFileSync(bootstrapPath, 'utf8').replace(/\r\n?/g, '\n')
   bootstrapSource = replaceExactly(
     bootstrapSource,
     '  await verifyNodeCapabilityPolicy()\n',

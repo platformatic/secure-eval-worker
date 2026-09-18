@@ -45,6 +45,9 @@ jobs:
       - name: Verify Node capability policy
         run: npm run test:node-capabilities
 
+      - name: Verify capability candidate generation
+        run: npm run generate:node-capability-candidate > capability-candidate.json
+
       - name: Test
         run: npm test
 
