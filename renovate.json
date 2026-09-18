@@ -4,15 +4,6 @@
     "config:recommended"
   ],
   "rangeStrategy": "update-lockfile",
-  "ignoreDeps": [
-    "camelcase",
-    "inquirer",
-    "mysql",
-    "swagger-ui-react",
-    "leven",
-    "ora",
-    "graphiql"
-  ],
   "prHourlyLimit": 1,
   "packageRules": [
     {
@@ -23,11 +14,6 @@
         "digest"
       ],
       "automerge": true
-    },
-    {
-      "matchPackageNames": ["@opentelemetry/**"],
-      "groupName": "opentelemetry packages",
-      "groupSlug": "opentelemetry"
     }
   ],
   "lockFileMaintenance": {
