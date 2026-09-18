@@ -411,7 +411,12 @@ test('frozen host promises fail closed under constructor poisoning', async (t) =
     lifetimeTimeoutMs: 5_000
   })
   await session.ready
-  await assert.rejects(session.request('value'), /Host function failed/)
+  try {
+    await assert.rejects(session.request('value'), /Host function failed/)
+  } finally {
+    // Do not create the flush promise while Promise.prototype is still poisoned.
+    restore()
+  }
   await new Promise(resolve => setImmediate(resolve))
   assert.deepEqual(unhandled, [])
   await session.terminate()
