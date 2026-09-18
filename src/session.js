@@ -41,6 +41,21 @@ import {
   isPublicHostFunctionError,
   validateHostFunctions
 } from './host-functions.js'
+import {
+  NODE_BUILTIN_POLICY,
+  NODE_BUILTIN_PROFILES
+} from './node-capability-policy.js'
+import {
+  NODE_BUILTIN_GRAPH_BASE,
+  NODE_BUILTIN_GRAPH_FROM_26_8,
+  NODE_BUILTIN_GRAPH_FROM_26_9,
+  NODE_BUILTIN_GRAPH_OPTIONAL_PATHS,
+  NODE_BUILTIN_GRAPH_PLATFORM,
+  NODE_BUILTIN_SURFACE_BASE,
+  NODE_BUILTIN_SURFACE_FROM_26_8,
+  NODE_BUILTIN_SURFACE_FROM_26_9,
+  NODE_BUILTIN_SURFACE_PLATFORM
+} from './node-capability-surfaces.js'
 
 // Snapshot builtin ESM bindings before caller-controlled option processing can
 // synchronize poisoned CommonJS builtin exports.
@@ -78,6 +93,7 @@ const SafePromise = Promise
 const safeArrayBufferIsView = ArrayBuffer.isView
 const hostArrayIsArray = Array.isArray
 const hostArrayPrototype = Array.prototype
+const hostArrayJoin = Array.prototype.join
 const hostArrayPush = Array.prototype.push
 const hostArrayShift = Array.prototype.shift
 const hostArraySplice = Array.prototype.splice
@@ -93,6 +109,7 @@ const hostObjectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor
 const hostObjectGetOwnPropertyDescriptors = Object.getOwnPropertyDescriptors
 const hostObjectGetPrototypeOf = Object.getPrototypeOf
 const hostObjectHasOwn = Object.hasOwn
+const hostJSONStringify = JSON.stringify
 const hostPromiseReject = Promise.reject
 const hostPromiseResolve = Promise.resolve
 const hostPromiseThen = Promise.prototype.then
@@ -141,6 +158,7 @@ const hostAsyncLocalStorageRun = AsyncLocalStorage.prototype.run
 const hostBufferFrom = Buffer.from
 const hostNumberIsSafeInteger = Number.isSafeInteger
 const hostProcessNextTick = process.nextTick
+const hostStringIndexOf = String.prototype.indexOf
 const hostStringSlice = String.prototype.slice
 
 function hostOwnDataDescriptor (value, key) {
@@ -153,6 +171,41 @@ function hostOwnDataDescriptor (value, key) {
     return undefined
   }
   return descriptor
+}
+
+function serializeTrustedBootstrapValue (value) {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean' ||
+      typeof value === 'number') {
+    return hostReflectApply(hostJSONStringify, undefined, [value])
+  }
+  if (value === null || typeof value !== 'object' || safeHostIsProxy(value)) {
+    throw new TypeError('Invalid trusted bootstrap value')
+  }
+  if (hostReflectApply(hostArrayIsArray, undefined, [value])) {
+    const lengthDescriptor = hostOwnDataDescriptor(value, 'length')
+    if (!lengthDescriptor || !hostNumberIsSafeInteger(lengthDescriptor.value) ||
+        lengthDescriptor.value < 0) {
+      throw new TypeError('Invalid trusted bootstrap array')
+    }
+    const entries = []
+    for (let index = 0; index < lengthDescriptor.value; index++) {
+      const descriptor = hostOwnDataDescriptor(value, index)
+      if (!descriptor) throw new TypeError('Sparse trusted bootstrap array')
+      entries[index] = serializeTrustedBootstrapValue(descriptor.value)
+    }
+    return `[${hostReflectApply(hostArrayJoin, entries, [','])}]`
+  }
+
+  const entries = []
+  const keys = hostReflectApply(hostReflectOwnKeys, undefined, [value])
+  for (let index = 0; index < keys.length; index++) {
+    const key = keys[index]
+    if (typeof key !== 'string') throw new TypeError('Invalid trusted bootstrap object key')
+    const descriptor = hostOwnDataDescriptor(value, key)
+    if (!descriptor) throw new TypeError('Invalid trusted bootstrap object property')
+    entries[index] = `${hostReflectApply(hostJSONStringify, undefined, [key])}:${serializeTrustedBootstrapValue(descriptor.value)}`
+  }
+  return `{${hostReflectApply(hostArrayJoin, entries, [','])}}`
 }
 
 function hostOwnDataValue (value, key) {
@@ -445,10 +498,44 @@ const DIAGNOSTIC_LEVELS = new Set([
 ])
 let trustedSessionMethods
 
-const SESSION_BOOTSTRAP = readFileSync(
+const NODE_CAPABILITY_BOOTSTRAP_SOURCE = serializeTrustedBootstrapValue({
+  graphBase: NODE_BUILTIN_GRAPH_BASE,
+  graphFrom26_8: NODE_BUILTIN_GRAPH_FROM_26_8,
+  graphFrom26_9: NODE_BUILTIN_GRAPH_FROM_26_9,
+  graphOptionalPaths: NODE_BUILTIN_GRAPH_OPTIONAL_PATHS,
+  graphPlatform: NODE_BUILTIN_GRAPH_PLATFORM,
+  policy: NODE_BUILTIN_POLICY,
+  profiles: NODE_BUILTIN_PROFILES,
+  surfaceBase: NODE_BUILTIN_SURFACE_BASE,
+  surfaceFrom26_8: NODE_BUILTIN_SURFACE_FROM_26_8,
+  surfaceFrom26_9: NODE_BUILTIN_SURFACE_FROM_26_9,
+  surfacePlatform: NODE_BUILTIN_SURFACE_PLATFORM
+})
+
+const NODE_CAPABILITY_BOOTSTRAP_MARKER = '__NODE_CAPABILITY_BOOTSTRAP_SOURCE__'
+const SESSION_BOOTSTRAP_TEMPLATE = readFileSync(
   `${import.meta.dirname}/session-bootstrap.js`,
   'utf8'
 )
+const nodeCapabilityBootstrapOffset = hostReflectApply(
+  hostStringIndexOf,
+  SESSION_BOOTSTRAP_TEMPLATE,
+  [NODE_CAPABILITY_BOOTSTRAP_MARKER]
+)
+if (nodeCapabilityBootstrapOffset < 0 || hostReflectApply(
+  hostStringIndexOf,
+  SESSION_BOOTSTRAP_TEMPLATE,
+  [NODE_CAPABILITY_BOOTSTRAP_MARKER, nodeCapabilityBootstrapOffset + 1]
+) >= 0) {
+  throw new Error('Invalid session bootstrap capability marker')
+}
+const SESSION_BOOTSTRAP =
+  hostReflectApply(hostStringSlice, SESSION_BOOTSTRAP_TEMPLATE, [0, nodeCapabilityBootstrapOffset]) +
+  NODE_CAPABILITY_BOOTSTRAP_SOURCE +
+  hostReflectApply(hostStringSlice, SESSION_BOOTSTRAP_TEMPLATE, [
+    nodeCapabilityBootstrapOffset + NODE_CAPABILITY_BOOTSTRAP_MARKER.length
+  ])
+
 
 function createInternalSessionOptions (releaseWorkerSlot) {
   const key = hostObjectFreeze({})

@@ -23,6 +23,7 @@ try {
     'docs/deferred-capabilities.md',
     'docs/error-values.md',
     'docs/module-dependencies.md',
+    'docs/node-capability-policy.md',
     'docs/one-shot-pooling.md',
     'docs/vercel-labs-run-comparison.md',
     'docs/worker-admission.md',
@@ -33,6 +34,8 @@ try {
     'src/index.js',
     'src/internal.js',
     'src/local-files.js',
+    'src/node-capability-policy.js',
+    'src/node-capability-surfaces.js',
     'src/session-bootstrap.js',
     'src/session.js'
   ]

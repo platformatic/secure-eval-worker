@@ -122,7 +122,11 @@ path and package authorization, graph limits, cancellation, and final output
 limits. Review bundler transformations and runtime helpers as executable guest
 code. Bundling does not make a dependency trusted.
 
-Do not implement either model with `module.register()`, `registerHooks()`,
-`--experimental-loader`, process-wide loader hooks, guest-provided resolvers,
-or another VM/worker execution context. Loader hooks can execute outside this
-worker's permission-drop and hardening sequence.
+Do not implement either model with guest-controlled `module.register()`,
+`registerHooks()`, `--experimental-loader`, process-wide loader hooks,
+guest-provided resolvers, or another VM/worker execution context. Asynchronous
+loader hooks can execute outside this worker's permission-drop and hardening
+sequence. The bootstrap installs one private synchronous resolve hook after
+permission drop and hardening solely to enforce the reviewed built-in-module
+policy; guest registration APIs remain disabled. See
+[`node-capability-policy.md`](node-capability-policy.md).

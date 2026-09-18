@@ -144,8 +144,10 @@ features.
 These remain intentionally open because they are release-by-release
 requirements rather than one-time deliverables.
 
-- [ ] Run the complete test suite on Node.js 26.5.1 and current 26.x for every
-  security-sensitive change.
+- [ ] Run the complete test suite and `npm run test:node-capabilities` on
+  Node.js 26.5.1, the reviewed 26.8 API boundary, and current 26.x for every security-sensitive change. Review
+  every identity/export diff before updating the manifest; never auto-accept a
+  new runtime surface.
 - [ ] Add exploit-focused regression coverage for callable accessors, aliases,
   prototype-reachable constructors, inherited descriptors, native bindings,
   runtime introspection, and alternate execution contexts.

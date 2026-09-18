@@ -2,7 +2,6 @@ import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import { randomUUID, webcrypto } from 'node:crypto'
 import fs from 'node:fs'
-import { builtinModules } from 'node:module'
 import { tmpdir } from 'node:os'
 import { connect, createServer } from 'node:net'
 import { join } from 'node:path'
@@ -11,6 +10,7 @@ import { test } from 'node:test'
 import { getEnvironmentData, setEnvironmentData } from 'node:worker_threads'
 
 import {
+  configureWorkerAdmission,
   createUntrustedWorker,
   createUntrustedWorkerFromFile,
   runUntrustedCode,
@@ -107,6 +107,98 @@ for (const type of EXECUTION_TYPES) {
     assert.equal(code, 'ERR_ACCESS_DENIED')
   })
 
+  test(`${type} denies unapproved builtins through every loading path`, async () => {
+    const result = await evaluateInGuest(type, `
+      const Module = await import('node:module')
+      const processModule = await import('node:process')
+      const vm = await import('node:vm')
+      const require = Module.createRequire(process.execPath)
+      const commonNodeModule = require('node:module')
+      const commonBareModule = require('module')
+      const loadedModule = Module.Module._load('node:module')
+      const builtinModule = process.getBuiltinModule('node:module')
+      const mutationResults = []
+      for (const [target, name] of [
+        [Module, '_load'],
+        [Module.default, '_load'],
+        [Module, 'registerHooks'],
+        [Module.default, 'registerHooks'],
+        [process, 'getBuiltinModule'],
+        [processModule.default, 'getBuiltinModule']
+      ]) {
+        mutationResults.push([
+          Reflect.set(target, name, () => 'ALLOWED'),
+          Reflect.deleteProperty(target, name),
+          Reflect.defineProperty(target, name, {
+            configurable: true,
+            value: () => 'ALLOWED'
+          })
+        ])
+      }
+      Module.syncBuiltinESMExports()
+      Module.default.syncBuiltinESMExports()
+      Module.syncBuiltinESMExports()
+
+      const loaderCodes = [
+        Module.registerHooks,
+        Module.default.registerHooks,
+        Module.Module.registerHooks,
+        commonNodeModule.registerHooks,
+        commonBareModule.registerHooks,
+        loadedModule.registerHooks,
+        builtinModule.registerHooks
+      ].map(registerHooks => {
+        try {
+          Reflect.apply(registerHooks, undefined, [{ resolve () { return 'ALLOWED' } }])
+          return 'ALLOWED'
+        } catch (error) {
+          return error.code
+        }
+      })
+
+      const attempts = [
+        () => import('node:diagnostics_channel'),
+        () => import('diagnostics_channel'),
+        () => require('node:diagnostics_channel'),
+        () => require('diagnostics_channel'),
+        () => Module._load('node:diagnostics_channel'),
+        () => Module.Module._load('diagnostics_channel'),
+        () => Module.default._load('node:diagnostics_channel'),
+        () => process.getBuiltinModule('node:diagnostics_channel'),
+        () => processModule.getBuiltinModule('node:diagnostics_channel'),
+        () => processModule.default.getBuiltinModule('diagnostics_channel'),
+        () => process.getBuiltinModule('node:module')._load('node:diagnostics_channel'),
+        () => process.getBuiltinModule('module')._load('diagnostics_channel'),
+        () => new vm.Script("import('node:diagnostics_channel')", {
+          importModuleDynamically: vm.constants.USE_MAIN_CONTEXT_DEFAULT_LOADER
+        }).runInThisContext(),
+        () => vm.compileFunction("return import('diagnostics_channel')", [], {
+          importModuleDynamically: vm.constants.USE_MAIN_CONTEXT_DEFAULT_LOADER
+        })()
+      ]
+      const codes = []
+      for (const attempt of attempts) {
+        try {
+          await attempt()
+          codes.push('ALLOWED')
+        } catch (error) {
+          codes.push(error.code)
+        }
+      }
+      return {
+        codes,
+        loaderCodes,
+        mutationResults,
+        approved: (await import('node:path')).join('a', 'b')
+      }
+    `)
+    assert.deepEqual(result.codes, Array(14).fill('ERR_ACCESS_DENIED'))
+    assert.deepEqual(result.loaderCodes, Array(7).fill('ERR_ACCESS_DENIED'))
+    assert.deepEqual(result.mutationResults, Array.from({ length: 6 }, () =>
+      [false, false, false]))
+    assert.equal(result.approved, join('a', 'b'))
+  })
+
   test(`${type} denies WASI, FFI, and unavailable native capability modules`, async () => {
     const result = await evaluateInGuest(type, `
       const Module = await import('node:module')
@@ -151,28 +243,22 @@ for (const type of EXECUTION_TYPES) {
       Module.syncBuiltinESMExports()
       const wasi = wasiModules.map(module => invoke(module, 'WASI', true))
 
-      let ffiNames = []
-      let ffiModules = []
-      try {
-        const nodeFfi = await import('node:ffi')
-        ffiNames = Reflect.ownKeys(nodeFfi.default).filter(name =>
-          typeof name === 'string' && typeof nodeFfi.default[name] === 'function')
-        ffiModules = [
-          nodeFfi,
-          nodeFfi.default,
-          process.getBuiltinModule('node:ffi'),
-          require('node:ffi'),
-          Module._load('node:ffi'),
-          Module.default._load('node:ffi')
-        ]
-      } catch {}
-      const ffiMutations = ffiModules.map(module =>
-        ffiNames.map(name => mutationResult(module, name)))
-      Module.syncBuiltinESMExports()
-      Module.default.syncBuiltinESMExports()
-      Module.syncBuiltinESMExports()
-      const ffi = ffiModules.map(module =>
-        ffiNames.map(name => invoke(module, name)))
+      const ffi = []
+      for (const load of [
+        () => import('node:ffi'),
+        () => process.getBuiltinModule('node:ffi'),
+        () => require('node:ffi'),
+        () => Module._load('node:ffi'),
+        () => Module.Module._load('node:ffi'),
+        () => Module.default._load('node:ffi')
+      ]) {
+        try {
+          await load()
+          ffi.push('ALLOWED')
+        } catch (error) {
+          ffi.push(error.code)
+        }
+      }
 
       let bareFfiImported = false
       let bareFfiRequired = false
@@ -209,8 +295,6 @@ for (const type of EXECUTION_TYPES) {
         wasi,
         wasiMutations,
         ffi,
-        ffiNames,
-        ffiMutations,
         ffiBare,
         unavailable
       }
@@ -221,16 +305,7 @@ for (const type of EXECUTION_TYPES) {
       delete: false,
       define: false
     })))
-    const ffiAvailable = builtinModules.some(id => id === 'ffi' || id === 'node:ffi')
-    assert.equal(result.ffiNames.length > 20, ffiAvailable)
-    assert.deepEqual(result.ffi, Array.from({ length: ffiAvailable ? 6 : 0 }, () =>
-      Array(result.ffiNames.length).fill('ERR_ACCESS_DENIED')))
-    assert.deepEqual(result.ffiMutations, Array.from({ length: ffiAvailable ? 6 : 0 }, () =>
-      Array.from({ length: result.ffiNames.length }, () => ({
-        set: false,
-        delete: false,
-        define: false
-      }))))
+    assert.deepEqual(result.ffi, Array(6).fill('ERR_ACCESS_DENIED'))
     assert.deepEqual(result.ffiBare, {
       imported: false,
       required: false,
@@ -245,6 +320,63 @@ for (const type of EXECUTION_TYPES) {
       defaultLoaded: false,
       builtin: false
     })
+  })
+
+  test(`${type} denies Node 26.8 ZIP filesystem APIs through every alias`, async () => {
+    const result = await evaluateInGuest(type, `
+      const Module = await import('node:module')
+      const require = Module.createRequire(process.execPath)
+      const nodeNamespace = await import('node:zlib')
+      const bareNamespace = await import('zlib')
+      const aliases = [
+        nodeNamespace,
+        nodeNamespace.default,
+        bareNamespace,
+        bareNamespace.default,
+        require('node:zlib'),
+        require('zlib'),
+        Module._load('node:zlib'),
+        Module.default._load('zlib'),
+        process.getBuiltinModule('node:zlib'),
+        process.getBuiltinModule('zlib')
+      ]
+      const names = [
+        'ZipBuffer',
+        'ZipEntry',
+        'ZipFile',
+        'createZipArchive',
+        'createZipArchiveSync',
+        'getMaxZipContentSize',
+        'setMaxZipContentSize',
+        'zipFiles'
+      ].filter(name => typeof aliases[0][name] === 'function')
+      const mutations = aliases.map(alias => names.map(name => [
+        Reflect.set(alias, name, () => 'ALLOWED'),
+        Reflect.deleteProperty(alias, name),
+        Reflect.defineProperty(alias, name, {
+          configurable: true,
+          value: () => 'ALLOWED'
+        })
+      ]))
+      Module.syncBuiltinESMExports()
+      Module.default.syncBuiltinESMExports()
+      Module.syncBuiltinESMExports()
+      const codes = aliases.map(alias => names.map(name => {
+        try {
+          Reflect.apply(alias[name], undefined, [])
+          return 'ALLOWED'
+        } catch (error) {
+          return error.code
+        }
+      }))
+      return { names, mutations, codes }
+    `)
+    const expectedNames = Number(process.versions.node.split('.')[1]) >= 8 ? 8 : 0
+    assert.equal(result.names.length, expectedNames)
+    assert.deepEqual(result.codes, Array.from({ length: 10 }, () =>
+      Array(expectedNames).fill('ERR_ACCESS_DENIED')))
+    assert.deepEqual(result.mutations, Array.from({ length: 10 }, () =>
+      Array.from({ length: expectedNames }, () => [false, false, false])))
   })
 
   test(`${type} cannot use host file descriptors`, async (t) => {
@@ -1216,6 +1348,43 @@ test('sanitizes host process metadata in every execution mode', async () => {
   }
 })
 
+test('static ESM policy failures are bounded and release admission', async (t) => {
+  configureWorkerAdmission({ maxConcurrentWorkers: 1 })
+  t.after(() => configureWorkerAdmission({ maxConcurrentWorkers: 8 }))
+  const startedAt = Date.now()
+  const sourceSession = createUntrustedWorker(`
+    import 'node:diagnostics_channel'
+    export default () => {}
+  `, {
+    type: 'module',
+    startupTimeoutMs: 5_000,
+    lifetimeTimeoutMs: 5_000
+  })
+  await assert.rejects(sourceSession.ready, (error) => {
+    assert.equal(error.remoteCode, 'ERR_ACCESS_DENIED')
+    return true
+  })
+  await sourceSession.closed
+  assert.equal(await runUntrustedCode('return 41', { timeoutMs: 5_000 }), 41)
+
+  const root = fs.mkdtempSync(join(tmpdir(), 'secure-eval-static-policy-'))
+  t.after(() => fs.rmSync(root, { force: true, recursive: true }))
+  const entry = join(root, 'entry.mjs')
+  fs.writeFileSync(entry, `
+    import 'node:diagnostics_channel'
+    export default () => 'ALLOWED'
+  `)
+  await assert.rejects(runUntrustedFile(entry, {
+    rootDirectory: root,
+    timeoutMs: 5_000
+  }), (error) => {
+    assert.equal(error.remoteCode, 'ERR_ACCESS_DENIED')
+    return true
+  })
+  assert.equal(await runUntrustedCode('return 42', { timeoutMs: 5_000 }), 42)
+  assert.equal(Date.now() - startedAt < 5_000, true)
+})
+
 test('does not inherit host command-line arguments', () => {
   const moduleUrl = new URL('../src/index.js', import.meta.url).href
   const marker = `CLI_SECRET_${randomUUID()}`
@@ -1282,7 +1451,7 @@ test('cannot wrap an existing host socket descriptor', async (t) => {
       }
     }))
   `, { timeoutMs: 5_000 })
-  assert.deepEqual(results, ['ERR_ACCESS_DENIED', 'BLOCKED', 'BLOCKED'])
+  assert.deepEqual(results, ['ERR_ACCESS_DENIED', 'ERR_ACCESS_DENIED', 'BLOCKED'])
   assert.equal(socket.destroyed, false)
 })
 
