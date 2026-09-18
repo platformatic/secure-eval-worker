@@ -33,13 +33,13 @@ try {
   bootstrapSource = replaceExactly(
     bootstrapSource,
     '  await verifyNodeCapabilityPolicy()\n',
-    `  // Candidate generation: preload reviewed built-ins but intentionally skip comparisons.\n` +
-    `  for (const candidateId of preparedNodeCapabilityPolicy.surfacedIds) {\n` +
-    `    const candidateSpecifier = candidateId.startsWith('node:')\n` +
-    `      ? candidateId\n` +
-    `      : 'node:' + candidateId\n` +
-    `    reflectApply(moduleLoad, moduleBuiltin, [candidateSpecifier])\n` +
-    `  }\n`
+    '  // Candidate generation: preload reviewed built-ins but intentionally skip comparisons.\n' +
+    '  for (const candidateId of preparedNodeCapabilityPolicy.surfacedIds) {\n' +
+    '    const candidateSpecifier = candidateId.startsWith(\'node:\')\n' +
+    '      ? candidateId\n' +
+    '      : \'node:\' + candidateId\n' +
+    '    reflectApply(moduleLoad, moduleBuiltin, [candidateSpecifier])\n' +
+    '  }\n'
   )
   bootstrapSource = replaceExactly(
     bootstrapSource,

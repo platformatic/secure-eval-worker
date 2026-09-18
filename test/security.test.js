@@ -1459,9 +1459,9 @@ test('blocks process-wide and cross-thread escape APIs in an isolated process', 
   const moduleUrl = new URL('../src/index.js', import.meta.url).href
   const attacks = [
     "process.kill(process.pid, 'SIGKILL')",
-    "process._kill(process.pid, 0)",
-    "process._debugProcess(process.pid)",
-    "process.report.getReport()",
+    'process._kill(process.pid, 0)',
+    'process._debugProcess(process.pid)',
+    'process.report.getReport()',
     "(await import('node:os')).setPriority(process.pid, 19)",
     "(await import('node:v8')).setFlagsFromString('--jitless')",
     "(await import('node:v8')).writeHeapSnapshot()",
@@ -1469,7 +1469,7 @@ test('blocks process-wide and cross-thread escape APIs in an isolated process', 
     "new (await import('node:worker_threads')).BroadcastChannel('escape')",
     "await (await import('node:worker_threads')).postMessageToThread(0, new SharedArrayBuffer(8))",
     "await (await import('node:worker_threads')).locks.query()",
-    "await navigator.locks.query()"
+    'await navigator.locks.query()'
   ]
   const childSource = `
     import { runUntrustedCode } from ${JSON.stringify(moduleUrl)}
@@ -1904,8 +1904,8 @@ test('worker traversal uses captured size and reflection intrinsics', async () =
 test('enforces one-shot output string and graph budgets', async () => {
   for (const source of [
     "return 'x'.repeat(129)",
-    `const shared = {}; return Array.from({ length: 129 }, () => shared)`,
-    `let value = {}; for (let index = 0; index < 128; index++) value = { next: value }; return value`
+    'const shared = {}; return Array.from({ length: 129 }, () => shared)',
+    'let value = {}; for (let index = 0; index < 128; index++) value = { next: value }; return value'
   ]) {
     await assert.rejects(
       runUntrustedCode(source, { timeoutMs: 5_000, maxMessageBytes: 128 }),

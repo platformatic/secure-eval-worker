@@ -324,12 +324,13 @@ export function invokeHostFunction (hostFunction, argumentsList, context) {
     ])
     adopted = adoptValue(invocation)
   } catch (error) {
+    let rejection = error
     try {
       finish()
     } catch (cleanupError) {
-      error = cleanupError
+      rejection = cleanupError
     }
-    return bridgeControlPromise(createControlPromise((resolve, reject) => reject(error)))
+    return bridgeControlPromise(createControlPromise((resolve, reject) => reject(rejection)))
   }
 
   const settled = createControlPromise((resolve, reject) => {

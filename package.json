@@ -24,6 +24,8 @@
     "test:coverage": "node --test --experimental-test-coverage",
     "test:node-capabilities": "node --no-warnings scripts/check-node-capabilities.js",
     "generate:node-capability-candidate": "node --no-warnings scripts/generate-node-capability-candidate.js",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
     "test:types": "node scripts/check-package-types.js",
     "test:package": "node scripts/check-package-contents.js",
     "measure:workers": "node --expose-gc scripts/measure-worker-overhead.js"
@@ -35,6 +37,8 @@
   },
   "devDependencies": {
     "@types/node": "26.4.1",
+    "eslint": "9.39.5",
+    "neostandard": "0.13.0",
     "typescript": "7.0.2"
   }
 }
