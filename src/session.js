@@ -496,7 +496,6 @@ const REQUEST_OPTION_NAMES = new Set(['timeoutMs'])
 const DIAGNOSTIC_LEVELS = new Set([
   'assert', 'debug', 'dir', 'error', 'info', 'log', 'table', 'trace', 'warn'
 ])
-let trustedSessionMethods
 
 const NODE_CAPABILITY_BOOTSTRAP_SOURCE = serializeTrustedBootstrapValue({
   graphBase: NODE_BUILTIN_GRAPH_BASE,
@@ -535,7 +534,6 @@ const SESSION_BOOTSTRAP =
   hostReflectApply(hostStringSlice, SESSION_BOOTSTRAP_TEMPLATE, [
     nodeCapabilityBootstrapOffset + NODE_CAPABILITY_BOOTSTRAP_MARKER.length
   ])
-
 
 function createInternalSessionOptions (releaseWorkerSlot) {
   const key = hostObjectFreeze({})
@@ -1954,7 +1952,7 @@ function serializeHostError (error) {
   }
 }
 
-trustedSessionMethods = Object.freeze(Object.entries(
+const trustedSessionMethods = Object.freeze(Object.entries(
   Object.getOwnPropertyDescriptors(UntrustedWorkerSession.prototype)
 ).filter(([name, descriptor]) => {
   return name !== 'constructor' &&

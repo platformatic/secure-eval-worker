@@ -574,7 +574,7 @@ test('malformed process-global admission controllers fail closed before caller m
     },
     {
       worker: validWorkerState,
-      preparation: `({ acquire () { return () => {} }, configure () {} })`
+      preparation: '({ acquire () { return () => {} }, configure () {} })'
     }
   ]
 

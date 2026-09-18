@@ -356,9 +356,8 @@ test('request responses wait for earlier asynchronous diagnostics', async () => 
 })
 
 test('diagnostic callbacks reject same-session reentrant requests', async () => {
-  let session
   let observedCode
-  session = createUntrustedWorker(`
+  const session = createUntrustedWorker(`
     onMessage(() => {
       console.log('diagnostic')
       return 42

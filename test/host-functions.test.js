@@ -196,7 +196,7 @@ for (const type of ['script', 'module']) {
       ? body
       : `${body}\nexport default ({ send, onMessage }) => { send(initial); onMessage(async values => math.add(...values)) }`
     const effectiveSource = type === 'module'
-      ? `const initial = await math.add(20, 22); export default ({ send, onMessage }) => { send(initial); onMessage(async values => math.add(...values)) }`
+      ? 'const initial = await math.add(20, 22); export default ({ send, onMessage }) => { send(initial); onMessage(async values => math.add(...values)) }'
       : source
     const session = createUntrustedWorker(effectiveSource, {
       type,
@@ -244,8 +244,7 @@ test('module setup receives the same host function object', async () => {
 })
 
 test('rejects same-session reentrant requests from host functions', async () => {
-  let session
-  session = createUntrustedWorker(`onMessage(() => tools.reenter())`, {
+  const session = createUntrustedWorker('onMessage(() => tools.reenter())', {
     hostFunctions: {
       tools: {
         reenter () {
@@ -268,8 +267,7 @@ test('rejects same-session reentrant requests from host functions', async () => 
 })
 
 test('host function context uses captured AsyncLocalStorage operations', async () => {
-  let session
-  session = createUntrustedWorker(`onMessage(() => tools.reenter())`, {
+  const session = createUntrustedWorker('onMessage(() => tools.reenter())', {
     hostFunctions: {
       tools: {
         reenter () {
@@ -773,7 +771,6 @@ test('HostFunctionError serialization rejects accessor-backed disclosure without
   t.after(() => process.off('unhandledRejection', onUnhandled))
 
   let reads = 0
-  let session
   const hostile = new HostFunctionError('Safe text', { code: 'SAFE_CODE' })
   for (const name of ['message', 'code']) {
     Object.defineProperty(hostile, name, {
@@ -786,7 +783,7 @@ test('HostFunctionError serialization rejects accessor-backed disclosure without
     })
   }
 
-  session = createUntrustedWorker(`
+  const session = createUntrustedWorker(`
     onMessage(async value => {
       if (value === 'fail') {
         try { await tools.fail() } catch (error) {
@@ -1076,7 +1073,7 @@ test('decorated branded host-function values fail closed', async () => {
 })
 
 test('oversized host errors fail the session without an unhandled rejection', async () => {
-  const session = createUntrustedWorker(`onMessage(() => tools.fail())`, {
+  const session = createUntrustedWorker('onMessage(() => tools.fail())', {
     hostFunctions: {
       tools: {
         fail: () => {
@@ -1288,7 +1285,7 @@ test('cancellation deactivates host context and skips late result cloning', asyn
   let detachedContext
   let resultGetterCalls = 0
   const detached = new Promise((resolve) => { detachedContext = resolve })
-  const session = createUntrustedWorker(`await tools.wait()`, {
+  const session = createUntrustedWorker('await tools.wait()', {
     hostFunctions: {
       tools: {
         wait () {
