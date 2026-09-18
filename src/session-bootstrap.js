@@ -1,5 +1,5 @@
 'use strict'
-;(function trustedBootstrap() {
+;(function trustedBootstrap(nodeCapabilityPolicy) {
 
 const cryptoBuiltin = require('node:crypto')
 const { createHmac, generateKeySync } = cryptoBuiltin
@@ -30,6 +30,7 @@ const tlsBuiltin = require('node:tls')
 const ttyBuiltin = require('node:tty')
 const v8Builtin = require('node:v8')
 const wasiBuiltin = require('node:wasi')
+const zlibBuiltin = require('node:zlib')
 const utilTypesBuiltin = require('node:util/types')
 const workerThreadsBuiltin = require('node:worker_threads')
 let ffiBuiltin
@@ -49,8 +50,11 @@ const networkAliasBuiltins = [
   require('_tls_wrap')
 ]
 const { deserialize: v8Deserialize, serialize: v8Serialize } = v8Builtin
+const moduleBuiltinModules = moduleBuiltin.builtinModules
+const moduleIsBuiltin = moduleBuiltin.isBuiltin
 const moduleLoad = moduleBuiltin._load
 const moduleNodeModulePaths = moduleBuiltin._nodeModulePaths
+const moduleRegisterHooks = moduleBuiltin.registerHooks
 const moduleResolveLookupPaths = moduleBuiltin._resolveLookupPaths
 const processGetBuiltinModule = processBuiltin.getBuiltinModule
 const { stripTypeScriptTypes } = moduleBuiltin
@@ -98,6 +102,7 @@ const weakSetDelete = WeakSet.prototype.delete
 const arrayPush = Array.prototype.push
 const arrayPop = Array.prototype.pop
 const arrayJoin = Array.prototype.join
+const arraySort = Array.prototype.sort
 const arraySplice = Array.prototype.splice
 const mapGet = Map.prototype.get
 const mapSet = Map.prototype.set
@@ -115,14 +120,15 @@ const regexpSource = Object.getOwnPropertyDescriptor(RegExp.prototype, 'source')
 const sharedByteLength = typeof SharedArrayBuffer === 'undefined'
   ? undefined
   : Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, 'byteLength').get
+const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype)
 const typedArrayBuffer = Object.getOwnPropertyDescriptor(
-  Object.getPrototypeOf(Uint8Array.prototype),
+  typedArrayPrototype,
   'buffer'
 ).get
 const dataViewPrototype = DataView.prototype
 const dataViewBuffer = Object.getOwnPropertyDescriptor(dataViewPrototype, 'buffer').get
 const typedArrayLength = Object.getOwnPropertyDescriptor(
-  Object.getPrototypeOf(Uint8Array.prototype),
+  typedArrayPrototype,
   'length'
 ).get
 const typedArrayByteLength = Object.getOwnPropertyDescriptor(
@@ -140,6 +146,14 @@ const objectGetPrototypeOf = Object.getPrototypeOf
 const objectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor
 const objectGetOwnPropertyDescriptors = Object.getOwnPropertyDescriptors
 const objectHasOwn = Object.hasOwn
+// Node's synchronous module hooks use async-context internals that read the
+// inherited typed-array length. Keep guest mutation from poisoning the trusted
+// resolver after it has been installed.
+objectDefineProperty(typedArrayPrototype, 'length', {
+  configurable: false,
+  enumerable: false,
+  get: typedArrayLength
+})
 const objectIsExtensible = Object.isExtensible
 const objectPrototype = Object.prototype
 const nativeErrorStackDescriptor = objectGetOwnPropertyDescriptor(new SafeError(), 'stack')
@@ -263,6 +277,7 @@ const AWAIT_PROMISE_CONSTRUCTOR_DESCRIPTOR = objectFreeze({
 })
 const arrayPrototype = Array.prototype
 const arrayBufferPrototype = ArrayBuffer.prototype
+const functionPrototype = Function.prototype
 const datePrototype = Date.prototype
 const regexpPrototype = RegExp.prototype
 const errorPrototype = SafeError.prototype
@@ -282,6 +297,11 @@ const nativeErrorPrototypeNames = new Map([
 ])
 const mapPrototype = Map.prototype
 const setPrototype = Set.prototype
+const weakMapPrototype = WeakMap.prototype
+const weakSetPrototype = WeakSet.prototype
+const sharedArrayBufferPrototype = typeof SharedArrayBuffer === 'undefined'
+  ? undefined
+  : SharedArrayBuffer.prototype
 const allowedViewPrototypes = new Set([
   dataViewPrototype,
   Int8Array.prototype,
@@ -300,8 +320,11 @@ const allowedViewPrototypes = new Set([
 const stringSlice = String.prototype.slice
 const stringSplit = String.prototype.split
 const stringIndexOf = String.prototype.indexOf
+const stringLastIndexOf = String.prototype.lastIndexOf
 const stringCharCodeAt = String.prototype.charCodeAt
 const stringPadStart = String.prototype.padStart
+const symbolDescription = Object.getOwnPropertyDescriptor(Symbol.prototype, 'description').get
+const symbolKeyFor = Symbol.keyFor
 const numberToString = Number.prototype.toString
 const bufferByteLength = Buffer.byteLength
 const bufferFrom = Buffer.from
@@ -341,6 +364,124 @@ function ownDataValue(value, key) {
   return descriptor?.value
 }
 
+function freezeTrustedCapabilityPolicy(value) {
+  if (value === null || typeof value !== 'object' ||
+      reflectApply(isProxy, utilTypesBuiltin, [value])) {
+    throw new SafeError('Invalid Node capability policy')
+  }
+  const keys = reflectOwnKeys(value)
+  for (let index = 0; index < keys.length; index++) {
+    const descriptor = ownDataDescriptor(value, keys[index])
+    if (!descriptor) throw new SafeError('Invalid Node capability policy property')
+    const entry = descriptor.value
+    if (entry === null) continue
+    if (typeof entry === 'object') freezeTrustedCapabilityPolicy(entry)
+    else if (typeof entry !== 'string' && typeof entry !== 'number' &&
+             typeof entry !== 'boolean') {
+      throw new SafeError('Invalid Node capability policy value')
+    }
+  }
+  return objectFreeze(value)
+}
+
+function policyArray(value, label) {
+  if (!reflectApply(arrayIsArray, undefined, [value])) {
+    throw new SafeError('Invalid Node capability policy ' + label)
+  }
+  let previous
+  for (let index = 0; index < value.length; index++) {
+    const descriptor = ownDataDescriptor(value, index)
+    if (!descriptor || typeof descriptor.value !== 'string' ||
+        (previous !== undefined && previous >= descriptor.value)) {
+      throw new SafeError('Invalid Node capability policy ' + label)
+    }
+    previous = descriptor.value
+  }
+  return value
+}
+
+function prepareNodeCapabilityPolicy() {
+  freezeTrustedCapabilityPolicy(nodeCapabilityPolicy)
+  const graphBase = ownDataValue(nodeCapabilityPolicy, 'graphBase')
+  const graphFrom26_8 = ownDataValue(nodeCapabilityPolicy, 'graphFrom26_8')
+  const graphFrom26_9 = ownDataValue(nodeCapabilityPolicy, 'graphFrom26_9')
+  const graphOptionalPaths = ownDataValue(nodeCapabilityPolicy, 'graphOptionalPaths')
+  const graphPlatforms = ownDataValue(nodeCapabilityPolicy, 'graphPlatform')
+  const policy = ownDataValue(nodeCapabilityPolicy, 'policy')
+  const profiles = ownDataValue(nodeCapabilityPolicy, 'profiles')
+  const surfaceBase = ownDataValue(nodeCapabilityPolicy, 'surfaceBase')
+  const surfaceFrom26_8 = ownDataValue(nodeCapabilityPolicy, 'surfaceFrom26_8')
+  const surfaceFrom26_9 = ownDataValue(nodeCapabilityPolicy, 'surfaceFrom26_9')
+  const surfacePlatforms = ownDataValue(nodeCapabilityPolicy, 'surfacePlatform')
+  if (!graphBase || !graphFrom26_8 || !graphFrom26_9 || !graphOptionalPaths ||
+      !graphPlatforms || !policy || !profiles ||
+      !surfaceBase || !surfaceFrom26_8 || !surfaceFrom26_9 || !surfacePlatforms) {
+    throw new SafeError('Incomplete Node capability policy')
+  }
+
+  const dispositions = new Map()
+  const surfacedIds = []
+  for (const disposition of ['allowed', 'attenuated', 'modeDependent', 'denied']) {
+    const ids = policyArray(ownDataValue(policy, disposition), disposition)
+    for (let index = 0; index < ids.length; index++) {
+      const id = ids[index]
+      if (reflectApply(mapGet, dispositions, [id]) !== undefined) {
+        throw new SafeError('Duplicate Node capability policy entry')
+      }
+      reflectApply(mapSet, dispositions, [id, disposition])
+      if (disposition !== 'denied') reflectApply(arrayPush, surfacedIds, [id])
+    }
+  }
+  const optionalDenied = policyArray(
+    ownDataValue(policy, 'optionalDenied'),
+    'optionalDenied'
+  )
+  for (let index = 0; index < optionalDenied.length; index++) {
+    const id = optionalDenied[index]
+    if (reflectApply(mapGet, dispositions, [id]) !== undefined) {
+      throw new SafeError('Duplicate optional Node capability policy entry')
+    }
+    reflectApply(mapSet, dispositions, [id, 'denied'])
+  }
+  reflectApply(arraySort, surfacedIds, [])
+
+  const versions = ownDataValue(processBuiltin, 'versions')
+  const nodeVersion = ownDataValue(versions, 'node')
+  if (typeof nodeVersion !== 'string') throw new SafeError('Invalid Node version metadata')
+  const versionParts = reflectApply(stringSplit, nodeVersion, ['.'])
+  const minor = SafeNumber(versionParts[1])
+  if (!numberIsSafeInteger(minor)) throw new SafeError('Invalid Node version metadata')
+  const platform = ownDataValue(processBuiltin, 'platform')
+  const graphPlatform = ownDataValue(graphPlatforms, platform)
+  const surfacePlatform = ownDataValue(surfacePlatforms, platform)
+  if (!graphPlatform || !surfacePlatform) {
+    throw new SafeError('Unsupported Node capability platform')
+  }
+  const profile = policyArray(
+    ownDataValue(profiles, minor >= 9 ? 'from26_9' : 'before26_9'),
+    'runtime profile'
+  )
+
+  return objectFreeze({
+    dispositions,
+    graphBase,
+    graphFrom26_8,
+    graphFrom26_9,
+    graphOptionalPaths: policyArray(graphOptionalPaths, 'optional graph paths'),
+    graphPlatform,
+    profile,
+    surfacedIds: objectFreeze(surfacedIds),
+    surfaceBase,
+    surfaceFrom26_8,
+    surfaceFrom26_9,
+    surfacePlatform,
+    use26_8Surface: minor >= 8,
+    use26_9Surface: minor >= 9
+  })
+}
+
+const preparedNodeCapabilityPolicy = prepareNodeCapabilityPolicy()
+
 function hasOriginalOwnDescriptor(value, key, originalDescriptor) {
   const descriptor = ownPropertyDescriptor(value, key)
   if (descriptor === undefined || originalDescriptor === undefined) {
@@ -372,6 +513,7 @@ let diagnosticSequence = 0
 let diagnosticRecords = 0
 let diagnosticBytes = 0
 let handler
+let nodeCapabilityHook
 const controlPromises = new SafeWeakSet()
 const promiseSettlementGuardedValues = new SafeWeakSet()
 let processing = SafePromise.resolve()
@@ -720,6 +862,12 @@ function replaceProperty(target, name, value) {
       writable: false
     })
   }
+  const replacement = objectGetOwnPropertyDescriptor(target, name)
+  if (!replacement ||
+      !reflectApply(objectHasOwn, undefined, [replacement, 'value']) ||
+      replacement.value !== value || replacement.writable || replacement.configurable) {
+    throw new SafeError('Failed to replace ' + name)
+  }
 }
 
 function replaceAndVerifyDataProperty(target, name, value) {
@@ -947,6 +1095,403 @@ function hardenFileSystemForModuleLoading() {
   denyFunctions(fsPromisesBuiltin, 'node:fs/promises')
 }
 
+function builtinDisposition(request) {
+  if (typeof request !== 'string') return undefined
+  let disposition = reflectApply(mapGet, preparedNodeCapabilityPolicy.dispositions, [request])
+  if (disposition === undefined && reflectApply(stringIndexOf, request, ['node:']) === 0) {
+    disposition = reflectApply(
+      mapGet,
+      preparedNodeCapabilityPolicy.dispositions,
+      [reflectApply(stringSlice, request, [5])]
+    )
+  }
+  return disposition
+}
+
+function enforceBuiltinPolicy(request) {
+  if (typeof request !== 'string') return
+  const recognized = reflectApply(moduleIsBuiltin, moduleBuiltin, [request])
+  const disposition = builtinDisposition(request)
+  if (!recognized && disposition === undefined) return
+  if (disposition === undefined || disposition === 'denied' ||
+      (disposition === 'modeDependent' && !workerData.localModule)) {
+    return sandboxDenied(request)
+  }
+}
+
+function signatureKind(value) {
+  if (value === null) return 'l'
+  if (typeof value === 'bigint') return 'i'
+  if (typeof value === 'boolean') return 'b'
+  if (typeof value === 'function') return 'f'
+  if (typeof value === 'number') return 'n'
+  if (typeof value === 'object') return 'o'
+  if (typeof value === 'string') return 's'
+  if (typeof value === 'symbol') return 'y'
+  if (typeof value === 'undefined') return 'u'
+  throw new SafeError('Unsupported Node capability descriptor')
+}
+
+function capabilityKeyName(key) {
+  if (typeof key === 'string') return key
+  const globalName = reflectApply(symbolKeyFor, undefined, [key])
+  const description = globalName === undefined
+    ? reflectApply(symbolDescription, key, [])
+    : globalName
+  return '@@' + (description === undefined ? '' : description)
+}
+
+function capabilitySurfaceSignature(value, omitNumericConstants = false) {
+  if (value === null || (typeof value !== 'object' && typeof value !== 'function') ||
+      reflectApply(isProxy, utilTypesBuiltin, [value])) {
+    throw new SafeError('Invalid Node capability export')
+  }
+  const descriptors = objectGetOwnPropertyDescriptors(value)
+  const keys = reflectOwnKeys(value)
+  const result = []
+  for (let index = 0; index < keys.length; index++) {
+    const key = keys[index]
+    const name = capabilityKeyName(key)
+    const descriptor = ownDataValue(descriptors, key)
+    if (!descriptor) throw new SafeError('Invalid Node capability descriptor')
+    const hasValue = reflectApply(objectHasOwn, undefined, [descriptor, 'value'])
+    if (omitNumericConstants && hasValue && typeof descriptor.value === 'number') continue
+    const kind = hasValue ? signatureKind(descriptor.value) : 'a'
+    reflectApply(arrayPush, result, [name + ':' + kind])
+  }
+  reflectApply(arraySort, result, [])
+  return result
+}
+
+function capabilitySignatureMatches(expected, actual) {
+  if (expected === actual) return true
+  const expectedSeparator = reflectApply(stringLastIndexOf, expected, [':'])
+  const actualSeparator = reflectApply(stringLastIndexOf, actual, [':'])
+  if (expectedSeparator < 0 || actualSeparator < 0 ||
+      reflectApply(stringSlice, expected, [0, expectedSeparator]) !==
+        reflectApply(stringSlice, actual, [0, actualSeparator])) {
+    return false
+  }
+  const expectedKinds = reflectApply(
+    stringSplit,
+    reflectApply(stringSlice, expected, [expectedSeparator + 1]),
+    ['|']
+  )
+  const actualKind = reflectApply(stringSlice, actual, [actualSeparator + 1])
+  for (let index = 0; index < expectedKinds.length; index++) {
+    if (expectedKinds[index] === actualKind) return true
+  }
+  return false
+}
+
+function verifyCapabilitySurface(id, side, value) {
+  const platformPair = ownDataValue(preparedNodeCapabilityPolicy.surfacePlatform, id)
+  const expectedPair = platformPair === undefined
+    ? ownDataValue(preparedNodeCapabilityPolicy.surfaceBase, id)
+    : platformPair
+  if (!reflectApply(arrayIsArray, undefined, [expectedPair])) {
+    throw new SafeError('Missing Node capability surface policy')
+  }
+  const expectedBase = ownDataValue(expectedPair, side)
+  if (!reflectApply(arrayIsArray, undefined, [expectedBase])) {
+    throw new SafeError('Invalid Node capability surface policy')
+  }
+  const expected = []
+  for (let index = 0; index < expectedBase.length; index++) {
+    reflectApply(arrayPush, expected, [ownDataValue(expectedBase, index)])
+  }
+  for (const additionsPolicy of [
+    preparedNodeCapabilityPolicy.use26_8Surface
+      ? preparedNodeCapabilityPolicy.surfaceFrom26_8
+      : undefined,
+    preparedNodeCapabilityPolicy.use26_9Surface
+      ? preparedNodeCapabilityPolicy.surfaceFrom26_9
+      : undefined
+  ]) {
+    if (additionsPolicy === undefined) continue
+    const additionPair = ownDataValue(additionsPolicy, id)
+    if (additionPair === undefined) continue
+    const additions = ownDataValue(additionPair, side)
+    if (!reflectApply(arrayIsArray, undefined, [additions])) {
+      throw new SafeError('Invalid Node capability surface addition')
+    }
+    for (let index = 0; index < additions.length; index++) {
+      reflectApply(arrayPush, expected, [ownDataValue(additions, index)])
+    }
+  }
+  reflectApply(arraySort, expected, [])
+  const actual = capabilitySurfaceSignature(value, id === 'constants')
+  if (actual.length !== expected.length) {
+    throw new SafeError('Unreviewed Node capability surface: ' + id)
+  }
+  for (let index = 0; index < actual.length; index++) {
+    if (!capabilitySignatureMatches(expected[index], actual[index])) {
+      throw new SafeError('Unreviewed Node capability surface: ' + id)
+    }
+  }
+}
+
+async function verifyNodeCapabilityPolicy() {
+  if (!reflectApply(arrayIsArray, undefined, [moduleBuiltinModules])) {
+    throw new SafeError('Node builtin inventory is unavailable')
+  }
+  const actualIds = []
+  for (let index = 0; index < moduleBuiltinModules.length; index++) {
+    const descriptor = ownDataDescriptor(moduleBuiltinModules, index)
+    if (!descriptor || typeof descriptor.value !== 'string' ||
+        builtinDisposition(descriptor.value) === undefined) {
+      throw new SafeError('Unreviewed Node builtin module')
+    }
+    reflectApply(arrayPush, actualIds, [descriptor.value])
+  }
+  reflectApply(arraySort, actualIds, [])
+  const expectedIds = preparedNodeCapabilityPolicy.profile
+  if (actualIds.length !== expectedIds.length) {
+    throw new SafeError('Unreviewed Node builtin module inventory')
+  }
+  for (let index = 0; index < actualIds.length; index++) {
+    if (actualIds[index] !== expectedIds[index]) {
+      throw new SafeError('Unreviewed Node builtin module inventory')
+    }
+  }
+
+  const ids = preparedNodeCapabilityPolicy.surfacedIds
+  for (let index = 0; index < ids.length; index++) {
+    const id = ids[index]
+    const specifier = reflectApply(stringIndexOf, id, ['node:']) === 0
+      ? id
+      : 'node:' + id
+    const commonjs = reflectApply(moduleLoad, moduleBuiltin, [specifier])
+    verifyCapabilitySurface(id, 0, commonjs)
+  }
+}
+
+async function verifyNodeCapabilityNamespaces() {
+  const ids = preparedNodeCapabilityPolicy.surfacedIds
+  for (let index = 0; index < ids.length; index++) {
+    const id = ids[index]
+    const specifier = reflectApply(stringIndexOf, id, ['node:']) === 0
+      ? id
+      : 'node:' + id
+    const namespace = await import(specifier)
+    verifyCapabilitySurface(id, 1, namespace)
+  }
+}
+
+function isCapabilityGraphExcludedObject(value) {
+  if (reflectApply(arrayIsArray, undefined, [value]) ||
+      reflectApply(arrayBufferIsView, undefined, [value])) return true
+  const prototype = objectGetPrototypeOf(value)
+  return prototype === mapPrototype || prototype === setPrototype ||
+    prototype === weakMapPrototype || prototype === weakSetPrototype ||
+    prototype === datePrototype || prototype === regexpPrototype ||
+    prototype === arrayBufferPrototype || prototype === sharedArrayBufferPrototype ||
+    prototype === dataViewPrototype
+}
+
+function isCapabilityGraphStopPrototype(value) {
+  if (value === objectPrototype || value === functionPrototype ||
+      value === arrayPrototype || value === mapPrototype || value === setPrototype ||
+      value === weakMapPrototype || value === weakSetPrototype ||
+      value === promisePrototype || value === datePrototype || value === regexpPrototype ||
+      value === errorPrototype || value === arrayBufferPrototype ||
+      value === sharedArrayBufferPrototype || value === dataViewPrototype) return true
+  return reflectApply(setHas, allowedViewPrototypes, [value])
+}
+
+function defineCapabilityGraphEntry(graph, path, value, budget) {
+  budget.nodes++
+  if (budget.nodes > 4096) throw new SafeError('Node capability graph exceeds node budget')
+  const signature = capabilitySurfaceSignature(
+    value,
+    reflectApply(stringSlice, path, [-10]) === '.constants'
+  )
+  budget.properties += signature.length
+  if (budget.properties > 50_000) {
+    throw new SafeError('Node capability graph exceeds property budget')
+  }
+  objectDefineProperty(graph, path, {
+    configurable: false,
+    enumerable: true,
+    value: signature,
+    writable: false
+  })
+}
+
+function inspectCapabilityGraphObject(value, path, graph, budget) {
+  if (path === 'process.env') return
+  if (value === null || typeof value !== 'object' ||
+      isCapabilityGraphExcludedObject(value) ||
+      reflectApply(isProxy, utilTypesBuiltin, [value])) return
+  defineCapabilityGraphEntry(graph, path, value, budget)
+  let prototype = objectGetPrototypeOf(value)
+  let level = 0
+  while (prototype && !isCapabilityGraphStopPrototype(prototype)) {
+    if (level >= 12) throw new SafeError('Node capability prototype chain is too deep')
+    defineCapabilityGraphEntry(
+      graph,
+      path + '[[Prototype]]' + reflectApply(numberToString, level, []),
+      prototype,
+      budget
+    )
+    prototype = objectGetPrototypeOf(prototype)
+    level++
+  }
+}
+
+function inspectCapabilityGraphFunction(value, path, graph, budget) {
+  if (typeof value !== 'function' || reflectApply(isProxy, utilTypesBuiltin, [value])) return
+  defineCapabilityGraphEntry(graph, path + '[[Function]]', value, budget)
+  const prototypeDescriptor = ownDataDescriptor(value, 'prototype')
+  if (prototypeDescriptor && prototypeDescriptor.value !== null &&
+      typeof prototypeDescriptor.value === 'object') {
+    inspectCapabilityGraphObject(
+      prototypeDescriptor.value,
+      path + '.prototype',
+      graph,
+      budget
+    )
+  }
+}
+
+function capabilityGraphFor(value, id) {
+  const graph = objectCreate(null)
+  const budget = { nodes: 0, properties: 0 }
+  const descriptors = objectGetOwnPropertyDescriptors(value)
+  const keys = reflectOwnKeys(value)
+  for (let index = 0; index < keys.length; index++) {
+    const key = keys[index]
+    const descriptor = ownDataValue(descriptors, key)
+    if (!descriptor || !reflectApply(objectHasOwn, undefined, [descriptor, 'value']) ||
+        descriptor.value === null) continue
+    const path = id + '.' + capabilityKeyName(key)
+    if (typeof descriptor.value === 'object') {
+      inspectCapabilityGraphObject(descriptor.value, path, graph, budget)
+    } else if (typeof descriptor.value === 'function') {
+      inspectCapabilityGraphFunction(descriptor.value, path, graph, budget)
+    }
+  }
+  return graph
+}
+
+function applyCapabilityGraphPolicy(target, policy, id) {
+  const entries = ownDataValue(policy, id)
+  if (entries === undefined) return
+  const paths = reflectOwnKeys(entries)
+  for (let index = 0; index < paths.length; index++) {
+    const path = paths[index]
+    const signature = ownDataValue(entries, path)
+    if (signature === null) {
+      reflectDeleteProperty(target, path)
+    } else if (reflectApply(arrayIsArray, undefined, [signature])) {
+      objectDefineProperty(target, path, {
+        configurable: true,
+        enumerable: true,
+        value: signature,
+        writable: true
+      })
+    } else {
+      throw new SafeError('Invalid Node capability graph policy')
+    }
+  }
+}
+
+function verifyCapabilityGraph(id, value) {
+  const expected = objectCreate(null)
+  applyCapabilityGraphPolicy(expected, preparedNodeCapabilityPolicy.graphBase, id)
+  if (preparedNodeCapabilityPolicy.use26_8Surface) {
+    applyCapabilityGraphPolicy(expected, preparedNodeCapabilityPolicy.graphFrom26_8, id)
+  }
+  if (preparedNodeCapabilityPolicy.use26_9Surface) {
+    applyCapabilityGraphPolicy(expected, preparedNodeCapabilityPolicy.graphFrom26_9, id)
+  }
+  applyCapabilityGraphPolicy(expected, preparedNodeCapabilityPolicy.graphPlatform, id)
+  const actual = capabilityGraphFor(value, id)
+  const optionalPaths = preparedNodeCapabilityPolicy.graphOptionalPaths
+  for (let index = 0; index < optionalPaths.length; index++) {
+    const path = optionalPaths[index]
+    if (ownDataDescriptor(expected, path) && !ownDataDescriptor(actual, path)) {
+      reflectDeleteProperty(expected, path)
+    }
+  }
+  const expectedPaths = reflectOwnKeys(expected)
+  const actualPaths = reflectOwnKeys(actual)
+  reflectApply(arraySort, expectedPaths, [])
+  reflectApply(arraySort, actualPaths, [])
+  if (expectedPaths.length !== actualPaths.length) {
+    const missing = []
+    const unexpected = []
+    let expectedIndex = 0
+    let actualIndex = 0
+    while (expectedIndex < expectedPaths.length || actualIndex < actualPaths.length) {
+      const expectedPath = expectedPaths[expectedIndex]
+      const actualPath = actualPaths[actualIndex]
+      if (expectedPath === actualPath) {
+        expectedIndex++
+        actualIndex++
+      } else if (actualPath === undefined ||
+                 (expectedPath !== undefined && expectedPath < actualPath)) {
+        if (missing.length < 20) reflectApply(arrayPush, missing, [expectedPath])
+        expectedIndex++
+      } else {
+        if (unexpected.length < 20) reflectApply(arrayPush, unexpected, [actualPath])
+        actualIndex++
+      }
+    }
+    throw new SafeError(
+      'Unreviewed nested Node capability surface: ' + id +
+      ' (missing [' + reflectApply(arrayJoin, missing, [',']) +
+      '], unexpected [' + reflectApply(arrayJoin, unexpected, [',']) + '])'
+    )
+  }
+  for (let index = 0; index < actualPaths.length; index++) {
+    if (actualPaths[index] !== expectedPaths[index]) {
+      throw new SafeError('Unreviewed nested Node capability surface: ' + id)
+    }
+    const expectedSignature = ownDataValue(expected, expectedPaths[index])
+    const actualSignature = ownDataValue(actual, actualPaths[index])
+    if (expectedSignature.length !== actualSignature.length) {
+      throw new SafeError(
+        'Unreviewed nested Node capability surface: ' + id +
+        ' at ' + actualPaths[index] + ' (expected ' + expectedSignature.length +
+        ' properties, observed ' + actualSignature.length + ')'
+      )
+    }
+    for (let entry = 0; entry < actualSignature.length; entry++) {
+      if (!capabilitySignatureMatches(expectedSignature[entry], actualSignature[entry])) {
+        throw new SafeError(
+          'Unreviewed nested Node capability surface: ' + id +
+          ' at ' + actualPaths[index] + ' (expected ' + expectedSignature[entry] +
+          ', observed ' + actualSignature[entry] + ')'
+        )
+      }
+    }
+  }
+}
+
+function verifyNodeCapabilityGraphs() {
+  const ids = preparedNodeCapabilityPolicy.surfacedIds
+  for (let index = 0; index < ids.length; index++) {
+    const id = ids[index]
+    const specifier = reflectApply(stringIndexOf, id, ['node:']) === 0
+      ? id
+      : 'node:' + id
+    verifyCapabilityGraph(id, reflectApply(moduleLoad, moduleBuiltin, [specifier]))
+  }
+}
+
+function installNodeCapabilityHook() {
+  nodeCapabilityHook = reflectApply(moduleRegisterHooks, moduleBuiltin, [objectFreeze({
+    resolve(specifier, context, nextResolve) {
+      enforceBuiltinPolicy(specifier)
+      return reflectApply(nextResolve, undefined, [specifier, context])
+    }
+  })])
+  if (nodeCapabilityHook === null || typeof nodeCapabilityHook !== 'object') {
+    throw new SafeError('Failed to install Node capability policy')
+  }
+}
+
 function hardenDangerousBuiltins() {
   // Existing numeric file descriptors bypass Node's Permission Model and are
   // shared by every thread. Source-string workers disable the complete fs
@@ -963,7 +1508,10 @@ function hardenDangerousBuiltins() {
   }
   denyFunctions(ttyBuiltin, 'node:tty')
   denyFunctions(netBuiltin, 'node:net')
-  denyFunctions(tlsBuiltin, 'node:tls')
+  // rootCertificates is a non-configurable data accessor on supported Node
+  // releases. It exposes public certificate data rather than a callable
+  // capability, so retain it while denying every callable TLS export.
+  denyFunctions(tlsBuiltin, 'node:tls', new Set(['rootCertificates']))
   denyFunctions(dgramBuiltin, 'node:dgram')
   denyFunctions(dnsBuiltin, 'node:dns')
   denyFunctions(dnsPromisesBuiltin, 'node:dns/promises')
@@ -977,6 +1525,20 @@ function hardenDangerousBuiltins() {
   replaceProperty(cryptoBuiltin, 'setEngine', () => sandboxDenied('node:crypto.setEngine'))
   replaceProperty(cryptoBuiltin, 'setFips', () => sandboxDenied('node:crypto.setFips'))
   replaceProperty(cryptoBuiltin, 'secureHeapUsed', () => sandboxDenied('node:crypto.secureHeapUsed'))
+  for (const name of [
+    'ZipBuffer',
+    'ZipEntry',
+    'ZipFile',
+    'createZipArchive',
+    'createZipArchiveSync',
+    'getMaxZipContentSize',
+    'setMaxZipContentSize',
+    'zipFiles'
+  ]) {
+    if (ownPropertyDescriptor(zlibBuiltin, name)) {
+      replaceProperty(zlibBuiltin, name, () => sandboxDenied('node:zlib.' + name))
+    }
+  }
   for (const builtin of networkAliasBuiltins) {
     denyFunctions(builtin, 'internal network builtin')
   }
@@ -1016,17 +1578,11 @@ function hardenDangerousBuiltins() {
     )
   })
   replaceProperty(moduleBuiltin, '_load', function restrictedModuleLoad(request, parent, isMain) {
-    if (request === 'trace_events' || request === 'node:trace_events' ||
-        request === 'quic' || request === 'node:quic') {
-      return sandboxDenied(request)
-    }
+    enforceBuiltinPolicy(request)
     return reflectApply(moduleLoad, moduleBuiltin, [request, parent, isMain])
   })
   replaceProperty(processBuiltin, 'getBuiltinModule', function restrictedGetBuiltinModule(request) {
-    if (request === 'trace_events' || request === 'node:trace_events' ||
-        request === 'quic' || request === 'node:quic') {
-      return sandboxDenied(request)
-    }
+    enforceBuiltinPolicy(request)
     return reflectApply(processGetBuiltinModule, processBuiltin, [request])
   })
   for (const name of [
@@ -1064,6 +1620,7 @@ function hardenDangerousBuiltins() {
     'availableMemory',
     'constrainedMemory',
     'cpuUsage',
+    'getActiveResourcesInfo',
     'getegid',
     'geteuid',
     'getgid',
@@ -1076,6 +1633,9 @@ function hardenDangerousBuiltins() {
   ]) {
     replaceProperty(processBuiltin, name, () => sandboxDenied('process.' + name))
   }
+  const noActiveResources = () => objectFreeze([])
+  replaceProperty(processBuiltin, '_getActiveHandles', noActiveResources)
+  replaceProperty(processBuiltin, '_getActiveRequests', noActiveResources)
   // Undocumented native bindings bypass public-module taming and can operate
   // directly on the process-wide descriptor table.
   for (const name of ['binding', '_linkedBinding', 'dlopen']) {
@@ -2061,6 +2621,7 @@ async function initialize() {
   }
   process.permission.drop('worker')
   if (process.permission.has('worker')) throw new Error('Failed to drop the worker permission')
+  await verifyNodeCapabilityPolicy()
 
   const channel = new MessageChannel()
   port = channel.port1
@@ -2097,6 +2658,9 @@ async function initialize() {
   parentPort.postMessage(handshake, transferList)
   parentPort.close()
   hardenDangerousBuiltins()
+  await verifyNodeCapabilityNamespaces()
+  verifyNodeCapabilityGraphs()
+  installNodeCapabilityHook()
 
   port.on('messageerror', () => {
     reportFatal(new Error('The protocol message could not be deserialized'))
@@ -2209,4 +2773,4 @@ thenPromise(initialize(), undefined, (error) => {
     parentPort.close()
   }
 })
-})()
+})(__NODE_CAPABILITY_BOOTSTRAP_SOURCE__)

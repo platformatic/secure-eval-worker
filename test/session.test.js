@@ -1167,7 +1167,7 @@ test('persistent runtime errors preserve complete stacks with stable guest filen
       `const value = 1
 throw new Error('script location')`,
       /secure-eval-worker-component\.js:2:7/,
-      /at trustedBootstrap \(\[worker eval\]:\d+:\d+\)/
+      /at (?:trustedBootstrap|initialize) \(\[worker eval\]:\d+:\d+\)/
     ],
     [
       'module',

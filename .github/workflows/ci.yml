@@ -27,6 +27,7 @@ jobs:
           - windows-latest
         node-version:
           - 26.5.1
+          - 26.8.1
           - 26.x
 
     steps:
@@ -40,6 +41,12 @@ jobs:
 
       - name: Install development dependencies
         run: npm ci
+
+      - name: Verify Node capability policy
+        run: npm run test:node-capabilities
+
+      - name: Verify capability candidate generation
+        run: npm run generate:node-capability-candidate > capability-candidate.json
 
       - name: Test
         run: npm test

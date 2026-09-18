@@ -1258,8 +1258,8 @@ throw new Error('located')`, { timeoutMs: 5_000 }),
     (error) => {
       assert.match(error.remoteStack, /^Error: located\n/)
       assert.match(error.remoteStack, /at eval \(secure-eval-worker-one-shot\.js:3:7\)/)
-      assert.match(error.remoteStack, /at trustedBootstrap \(\[worker eval\]:\d+:\d+\)/)
-      assert.match(error.remoteStack, /node:internal\/process\/execution/)
+      assert.match(error.remoteStack, /at (?:trustedBootstrap|initialize) \(\[worker eval\]:\d+:\d+\)/)
+      assert.match(error.remoteStack, /node:internal\/process\//)
       assert.doesNotMatch(error.remoteStack, /hostile\.js/)
       return true
     }

@@ -644,34 +644,35 @@ test('bounds guest-opened descriptors across every filesystem alias', async (t) 
   }), 'ERR_UNTRUSTED_FILE_DESCRIPTOR_LIMIT')
 })
 
-test('descriptor accounting uses the captured typed-array length getter', async (t) => {
+test('module hooks lock the inherited typed-array length getter', async (t) => {
   const files = await fixture({
     'entry.mjs': `
       import fs from 'node:fs'
       export default () => {
-        let reads = 0
         const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype)
         const descriptor = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'length')
-        Object.defineProperty(typedArrayPrototype, 'length', {
-          ...descriptor,
-          get () {
-            reads++
-            throw new Error('poisoned typed-array length')
-          }
-        })
+        let mutationError
+        try {
+          Object.defineProperty(typedArrayPrototype, 'length', {
+            ...descriptor,
+            get () { throw new Error('poisoned typed-array length') }
+          })
+        } catch (error) {
+          mutationError = error.name
+        }
         const descriptorNumber = fs.openSync(new URL('./value.txt', import.meta.url), 'r')
         fs.closeSync(descriptorNumber)
-        return reads
+        return { configurable: descriptor.configurable, mutationError }
       }
     `,
     'value.txt': 'captured length'
   })
   t.after(() => files.cleanup())
 
-  assert.equal(await runUntrustedFile(files.path('entry.mjs'), {
+  assert.deepEqual(await runUntrustedFile(files.path('entry.mjs'), {
     rootDirectory: files.directory,
     timeoutMs: 5_000
-  }), 0)
+  }), { configurable: false, mutationError: 'TypeError' })
 })
 
 test('physical package copies share the descriptor quota and release it on exit', async (t) => {
