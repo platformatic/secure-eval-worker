@@ -33,6 +33,7 @@ try {
     'src/index.js',
     'src/internal.js',
     'src/local-files.js',
+    'src/session-bootstrap.js',
     'src/session.js'
   ]
   assert.deepEqual(actual, expected)
