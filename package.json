@@ -36,7 +36,7 @@
     "url": "git+https://github.com/platformatic/secure-eval-worker.git"
   },
   "devDependencies": {
-    "@types/node": "26.4.1",
+    "@types/node": "26.6.3",
     "eslint": "9.39.5",
     "neostandard": "0.13.0",
     "typescript": "7.0.2"
